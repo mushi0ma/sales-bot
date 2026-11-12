@@ -1,0 +1,48 @@
+diff --git a/.env.example b/.env.example
+index 0acaea3..5139720 100644
+--- a/.env.example
++++ b/.env.example
+@@ -492,3 +492,6 @@ AGENTS_UPDATE_CHECK_URL=
+ 
+ # NOTE: Cache TTL (ms) for the hub announcements/version fetch on the backend. Default 3600000 (1h).
+ HUB_UPDATES_TTL_MS=3600000
++
++# Send `dimensions: 1536` with every embedding request (Matryoshka models with another native width).
++# EMBEDDING_SEND_DIMENSIONS=true
+diff --git a/src/modules/rag/embeddings.ts b/src/modules/rag/embeddings.ts
+index 04500e1..11b8ec8 100644
+--- a/src/modules/rag/embeddings.ts
++++ b/src/modules/rag/embeddings.ts
+@@ -17,6 +17,11 @@ import { clipText } from "@/lib/text";
+ // endpoint can answer with any model at all, at the network boundary too (`assertWidth`).
+ export const EMBEDDING_DIM = 1536;
+ 
++// Ask the endpoint for EMBEDDING_DIM-wide vectors (`dimensions` in the OpenAI request). Off by default:
++// a model with a fixed width rejects the field. On for Matryoshka models whose native width differs
++// (nemotron-embed 2048/4096, gemini-embedding 3072), which would otherwise fail `assertWidth`.
++export const SEND_DIMENSIONS = process.env.EMBEDDING_SEND_DIMENSIONS === "true";
++
+ export interface EmbeddingConfig {
+   model: string;
+   apiKey: string;
+@@ -134,6 +139,7 @@ function client(
+   return new OpenAIEmbeddings({
+     model: cfg.model,
+     apiKey: cfg.apiKey,
++    ...(SEND_DIMENSIONS ? { dimensions: EMBEDDING_DIM } : {}),
+     ...(Object.keys(configuration).length ? { configuration } : {}),
+     ...(query ? { maxRetries: 0 } : {}),
+   });
+@@ -181,7 +187,11 @@ async function embedCompatibleBatch(
+       "content-type": "application/json",
+       authorization: `Bearer ${cfg.apiKey}`,
+     },
+-    body: JSON.stringify({ model: cfg.model, input: texts }),
++    body: JSON.stringify({
++      model: cfg.model,
++      input: texts,
++      ...(SEND_DIMENSIONS ? { dimensions: EMBEDDING_DIM } : {}),
++    }),
+     redirect: "error",
+     signal,
+   });

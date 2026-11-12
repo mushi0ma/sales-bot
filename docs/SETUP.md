@@ -235,9 +235,20 @@ kind `bearer_token`). В agents он разрешён через `SSRF_INTERNAL_
 услуги («розетка», «домофон» → оператор). Не в тестовом режиме (`AGENT_MODE != test`) bootstrap откажется ставить
 справочник с тестовыми заглушками (`000-00-0`, `.example`, «Тестовая»).
 
-Почему не RAG agents: колонка векторов жёстко 1536, а agents не передаёт `dimensions` — бесплатные
-`nvidia/nemotron-3.5-embed-*:free` без него отдают 2048/4096. RAG понадобится для длинных регламентов
-(> ~5–8 тыс. токенов); цены и тарифы лучше отдавать инструментом с точным совпадением, а не поиском похожего.
+**RAG (векторный поиск) agents** настроен, но к агенту не подключён: тот же текст уже в промпте. База пригодится для
+длинных регламентов (> ~5–8 тыс. токенов); цены и тарифы лучше отдавать инструментом с точным совпадением.
+- Колонка векторов в agents жёстко 1536, а бесплатные `nvidia/nemotron-3.5-embed-*:free` по умолчанию отдают
+  2048/4096. Патч `stack/patches/agents-embedding-dimensions.patch` добавляет `dimensions: 1536` в запрос при
+  `EMBEDDING_SEND_DIMENSIONS=true` (задано в compose). vendor/ не в git, поэтому после `git pull` в vendor/agents:
+  `stack/patches/apply.sh`, затем `docker compose build agents`.
+- `python3 -I bootstrap.py knowledge`: эмбеддинги `nvidia/nemotron-3.5-embed-8b:free`, база «Справочник УК (тест)»
+  из `agent/knowledge.md` (пересоздаётся из файла), проверочный поиск.
+- ⚠️ `PUT /v1/tenant-settings/embedding` сохраняет **только** `credentialRef` (provider/model/baseURL молча
+  отбрасываются), а адрес берётся из записи vault, **только если её kind `openai_compatible`**. С записью kind
+  `openrouter` agents отправляет ключ на `api.openai.com` (так и случилось 2026-11-12: 2 запроса, ответ 401).
+  Поэтому для эмбеддингов отдельная запись «OpenRouter (embeddings)» kind `openai_compatible`, baseUrl
+  `https://openrouter.ai/api/v1`; bootstrap проверяет kind и адрес и иначе отказывается. Модель задаётся на базе
+  (`embeddingModel`), не в настройках.
 Guard-кейсы: `kbprice`, `kbnear`, `kbhours`, `gas`; `emergdone` — после аварийной заявки ответ жильцу содержит её
 номер (в WhatsApp-тесте номер оставался только в заметке оператору). Форматирование: `**жирный**` Chatwoot сам
 переводит в WhatsApp-разметку, а строка `---` уходила отдельным сообщением — guard такие строки запрещает.
@@ -248,5 +259,5 @@ Guard-кейсы: `kbprice`, `kbnear`, `kbhours`, `gas`; `emergdone` — пос�
 - [ ] При запахе газа handoff происходит только после адреса (номера 104/112 бот теперь берёт из справочника).
 - [ ] Перепроверить фото из WhatsApp после `reasoningEffort: none` (до этого — таймаут). Голосовое — проверено.
 - [ ] Окно приёма показаний 20–25 инструмент не проверяет (бот может «принять» 3-го числа).
-- [ ] RAG для длинных документов: патч `dimensions` в agents (+ upstream PR), см. «Справочник УК».
+- [ ] Upstream (fazer-ai/agents): issue/PR на `dimensions` и на молчаливый fallback эмбеддингов к api.openai.com.
 - [ ] Dev-режим Chatwoot с горячей перезагрузкой для правок админ-панели (сейчас — полная пересборка образа).

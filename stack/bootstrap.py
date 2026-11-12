@@ -8,6 +8,7 @@ Steps (idempotent where possible; secrets go to ~/secrets/*.env with mode 600 an
   agent      create/update the "ЖКХ ассистент" agent (OpenRouter model, system prompt, test mode)
   connect    connect agents to Chatwoot (private docker network) and select the account
   stt        local speech-to-text (whisper in the VM) for voice notes: vault entry + agent stt settings
+  knowledge  RAG: OpenRouter embeddings + knowledge base from agent/knowledge.md, search smoke test
   vision     image/document reading for incoming photos (OpenRouter free VL model, Russian extraction prompt)
   tickets    ticket HTTP tools (create_ticket, get_my_tickets) on the mock dispatcher + least-privilege grants
   bind INBOX_ID   bind a Chatwoot inbox (mirror id from `inboxes`) to the agent
@@ -15,7 +16,7 @@ Steps (idempotent where possible; secrets go to ~/secrets/*.env with mode 600 an
   playground smoke test of the agent through the playground (no WhatsApp)
   all        chatwoot agents vault agent connect tickets stt vision
 """
-import json, os, pathlib, re, secrets, string, subprocess, sys, urllib.error, urllib.request
+import json, os, pathlib, re, secrets, string, subprocess, sys, time, urllib.error, urllib.request
 
 HOME = pathlib.Path.home()
 STACK = pathlib.Path(__file__).resolve().parent
@@ -184,6 +185,13 @@ def as_list(b):
     if isinstance(b, list):
         return b
     return next((v for v in (b or {}).values() if isinstance(v, list)), [])
+
+
+def one(b):
+    """Single-object endpoints answer {instance, <name>: {...}}: take the object that has an id."""
+    if isinstance(b, dict) and "id" not in b:
+        return next((v for v in b.values() if isinstance(v, dict) and "id" in v), b)
+    return b
 
 
 def find_vault(a):
@@ -554,6 +562,67 @@ def step_bind(inbox_id):
             print(f"  chatwoot inbox {cw_inbox}: auto-assignment off (HTTP {resp.status})")
 
 
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "nvidia/nemotron-3.5-embed-8b:free")
+KB_NAME = "Справочник УК (тест)"
+EMBED_VAULT = "OpenRouter (embeddings)"
+OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+
+
+def step_knowledge():
+    """RAG: OpenRouter embeddings (needs stack/patches/agents-embedding-dimensions.patch + EMBEDDING_SEND_DIMENSIONS)
+    and a knowledge base holding agent/knowledge.md, then a search smoke test. The base is NOT attached to the
+    agent: the same text already sits in the system prompt; the base is the place for long documents."""
+    a = Agents().login()
+    # PUT /v1/tenant-settings/embedding stores ONLY credentialRef (provider/model/baseURL are dropped), and the
+    # endpoint then comes from the vault entry — but only for kind openai_compatible. With the "openrouter" kind
+    # the SDK falls back to api.openai.com and sends it the OpenRouter key. Hence a dedicated entry, checked.
+    key = read_env("openrouter.env").get("OPENROUTER_API_KEY") or die("no OPENROUTER_API_KEY in ~/secrets/openrouter.env")
+    st, b = a.req("GET", "/v1/vault")
+    v = next((x for x in as_list(b) if x.get("name") == EMBED_VAULT), None)
+    if v:
+        st, r = a.req("PUT", f"/v1/vault/{v['id']}", {"value": key, "baseUrl": OPENROUTER_BASE})
+    else:
+        st, v = a.req("POST", "/v1/vault", {"name": EMBED_VAULT, "kind": "openai_compatible", "value": key,
+                                            "baseUrl": OPENROUTER_BASE})
+        v = one(v)
+    st, b = a.req("GET", "/v1/vault")
+    v = next((x for x in as_list(b) if x.get("name") == EMBED_VAULT), {})
+    if v.get("kind") != "openai_compatible" or (v.get("baseUrl") or "").rstrip("/") != OPENROUTER_BASE:
+        die(f"vault '{EMBED_VAULT}' must be kind openai_compatible with baseUrl {OPENROUTER_BASE}; "
+            f"got kind={v.get('kind')} baseUrl={v.get('baseUrl')} — refusing (the key would go to api.openai.com)")
+    print(f"  vault: '{EMBED_VAULT}' kind=openai_compatible baseUrl={OPENROUTER_BASE}")
+    st, b = a.req("PUT", "/v1/tenant-settings/embedding", {"credentialRef": f"vault:{v['id']}"})
+    print(f"  embedding credential -> vault:{v['id']}: HTTP {st} {'' if st < 300 else str(b)[:300]}")
+    st, b = a.req("GET", "/v1/knowledge/bases")
+    kb = next((k for k in as_list(b) if k.get("name") == KB_NAME), None)
+    if not kb:
+        st, kb = a.req("POST", "/v1/knowledge/bases", {"name": KB_NAME, "description": "agent/knowledge.md",
+                                                       "embeddingModel": EMBED_MODEL})
+        kb = one(kb)
+        print(f"  knowledge base: HTTP {st} id={kb.get('id')}")
+    elif kb.get("embeddingModel") != EMBED_MODEL:  # each base names its own model; the default is OpenAI's
+        st, _ = a.req("PATCH", f"/v1/knowledge/bases/{kb['id']}", {"embeddingModel": EMBED_MODEL})
+        print(f"  knowledge base {kb['id']}: embeddingModel -> {EMBED_MODEL} HTTP {st}")
+    text = (STACK / "agent" / "knowledge.md").read_text(encoding="utf-8")
+    st, b = a.req("GET", f"/v1/knowledge/bases/{kb['id']}/documents")
+    for d in as_list(b):  # replace, so the base always mirrors the file
+        a.req("DELETE", f"/v1/knowledge/documents/{d['id']}")
+    st, doc = a.req("POST", f"/v1/knowledge/bases/{kb['id']}/documents", {"title": "Справочник УК", "text": text})
+    doc = one(doc)
+    print(f"  document: HTTP {st} status={doc.get('status') if isinstance(doc, dict) else doc}")
+    for _ in range(30):
+        st, d = a.req("GET", f"/v1/knowledge/documents/{doc['id']}")
+        d = one(d)
+        if d.get("status") not in ("PENDING", "PROCESSING", "INDEXING"):
+            break
+        time.sleep(2)
+    print(f"  indexed: status={d.get('status')} chunks={d.get('chunkCount', d.get('chunks'))} {str(d.get('error') or '')[:200]}")
+    for q in ("куда звонить если пахнет газом", "сколько стоит сантехник", "когда сдавать показания воды"):
+        st, r = a.req("POST", "/v1/knowledge/search", {"query": q, "knowledgeBaseIds": [str(kb["id"])], "limit": 1})
+        hit = (as_list(r) or [{}])[0]
+        print(f"  search {q!r}: HTTP {st} score={hit.get('score')} | {(hit.get('content') or hit.get('text') or str(r))[:90]!r}")
+
+
 def step_playground():
     a = Agents().login()
     ag = find_agent(a) or die("agent missing")
@@ -576,6 +645,7 @@ def step_playground():
 
 STEPS = {"chatwoot": step_chatwoot, "agents": step_agents, "vault": step_vault, "agent": step_agent,
          "connect": step_connect, "tickets": step_tickets, "stt": step_stt, "vision": step_vision, "inboxes": step_inboxes,
+         "knowledge": step_knowledge,
          "playground": step_playground}
 
 if __name__ == "__main__":

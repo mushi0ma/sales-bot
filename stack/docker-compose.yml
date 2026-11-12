@@ -123,6 +123,8 @@ services:
       # Internal services reachable over http with the SSRF guard ON (host:port only):
       # Chatwoot, and the mock dispatcher used by the ticket HTTP tools (tool allowedHosts must name it).
       SSRF_INTERNAL_TARGETS: cw-rails:3000,tickets:8080
+      # stack/patches/agents-embedding-dimensions.patch: ask Matryoshka embedders for 1536-wide vectors.
+      EMBEDDING_SEND_DIMENSIONS: "true"
       # No calls to app.fazer.ai (announcements / update check).
       FAZER_AI_HUB_URL: ""
       SIGNUP_ENABLED: "false"
