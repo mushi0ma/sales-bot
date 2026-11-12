@@ -1,0 +1,161 @@
+# sales-bot test stack: Chatwoot fork (+ embedded native WhatsApp connector) + fazer.ai agents.
+# Built from ../vendor sources INSIDE the VM. Secrets come from ./.env (gen-env.sh), never from this file.
+# All published ports bind to 127.0.0.1 of the VM; the host reaches them via `infra/vm.sh tunnel`.
+name: salesbot
+
+x-cw-env: &cw-env
+  RAILS_ENV: production
+  NODE_ENV: production
+  INSTALLATION_ENV: docker
+  RAILS_LOG_TO_STDOUT: "true"
+  LOG_LEVEL: info
+  DEFAULT_LOCALE: ru
+  # Browser address (through the SSH tunnel) and the in-network address the connector fetches media from.
+  FRONTEND_URL: http://localhost:3000
+  INTERNAL_HOST_URL: http://cw-rails:3000
+  SECRET_KEY_BASE: ${SECRET_KEY_BASE:?run gen-env.sh}
+  POSTGRES_HOST: cw-postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_USERNAME: postgres
+  POSTGRES_PASSWORD: ${CW_POSTGRES_PASSWORD:?}
+  POSTGRES_DATABASE: chatwoot_production
+  REDIS_URL: redis://redis:6379
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+  ENABLE_ACCOUNT_SIGNUP: "false"
+  DISABLE_TELEMETRY: "true"
+  # Agent Bot webhooks to the agents service on the private docker network.
+  SAFE_FETCH_PRIVATE_TARGETS: agents:3000
+  # Native WhatsApp connector (whatsmeow), embedded in Sidekiq. Calls/UDP stay off.
+  WHATSAPP_CONNECTOR_ENABLED: "true"
+  WHATSAPP_CONNECTOR_EMBEDDED: "true"
+  WAC_MEDIA_ROOT: /app/wac-media
+  # Legacy Baileys/Z-API providers not offered.
+  WHATSAPP_LEGACY_PROVIDERS_CREATABLE: "false"
+
+services:
+  cw-rails:
+    build:
+      context: ../vendor/chatwoot
+      dockerfile: docker/Dockerfile
+    image: salesbot/chatwoot:local
+    environment: *cw-env
+    entrypoint: docker/entrypoints/rails.sh
+    command: [bundle, exec, rails, s, -p, "3000", -b, 0.0.0.0]
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - cw_storage:/app/storage
+    depends_on:
+      cw-postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+
+  cw-sidekiq:
+    image: salesbot/chatwoot:local
+    pull_policy: never
+    environment: *cw-env
+    command: [bundle, exec, sidekiq, -C, config/sidekiq.yml]
+    volumes:
+      - cw_storage:/app/storage
+      - wac_media:/app/wac-media
+    depends_on:
+      cw-rails: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep [s]idekiq | grep -qv entrypoints"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  cw-postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: chatwoot_production
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${CW_POSTGRES_PASSWORD:?}
+    volumes:
+      - cw_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d chatwoot_production"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  agents:
+    build:
+      context: ../vendor/agents
+    image: salesbot/agents:local
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      PUBLIC_URL: http://localhost:3100
+      CDN_URL: http://localhost:3100
+      CORS_ORIGIN: http://localhost:3100
+      LOG_LEVEL: info
+      JWT_SECRET: ${JWT_SECRET:?}
+      MCP_JWT_SECRET: ${MCP_JWT_SECRET:?}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?}
+      MIGRATION_DATABASE_URL: postgres://postgres:${AGENTS_POSTGRES_PASSWORD:?}@agents-postgres:5432/fazerai_agents_db
+      DATABASE_URL: postgres://fazerai_app:${AGENTS_APP_DB_PASSWORD:?}@agents-postgres:5432/fazerai_agents_db
+      LANGGRAPH_DATABASE_URL: postgres://fazerai_app:${AGENTS_APP_DB_PASSWORD:?}@agents-postgres:5432/fazerai_agents_db
+      # Chatwoot on the private docker network (http allowed only for this host:port).
+      SSRF_INTERNAL_TARGETS: cw-rails:3000
+      # No calls to app.fazer.ai (announcements / update check).
+      FAZER_AI_HUB_URL: ""
+      SIGNUP_ENABLED: "false"
+      SETUP_TOKEN_REQUIRED: "true"
+      MCP_STDIO_ENABLED: "false"
+      BRANDING_STORAGE_DIR: /app/storage/branding
+      DOCUMENTS_STORAGE_DIR: /app/storage/documents
+    ports:
+      - "127.0.0.1:3100:3000"
+    volumes:
+      - agents_storage:/app/storage
+    depends_on:
+      agents-postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  agents-postgres:
+    image: pgvector/pgvector:pg17
+    command: [postgres, -c, shared_preload_libraries=pg_stat_statements, -c, pg_stat_statements.track=top, -c, pg_stat_statements.track_utility=off]
+    environment:
+      POSTGRES_DB: fazerai_agents_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${AGENTS_POSTGRES_PASSWORD:?}
+    volumes:
+      - agents_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d fazerai_agents_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  cw_storage:
+  wac_media:
+  cw_postgres:
+  redis_data:
+  agents_storage:
+  agents_postgres:

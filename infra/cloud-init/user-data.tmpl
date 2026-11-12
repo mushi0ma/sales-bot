@@ -1,0 +1,83 @@
+#cloud-config
+# Template rendered by infra/vm.sh (placeholders @...@). Contains NO secrets: only the VM's public SSH key.
+hostname: @VM_NAME@
+users:
+  - name: @VM_USER@
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+      - @SSH_PUBKEY@
+disable_root: true
+ssh_pwauth: false
+
+swap:
+  filename: /swapfile
+  size: 4G
+
+apt:
+  sources:
+    docker.list:
+      source: "deb [arch=amd64 signed-by=$KEY_FILE] https://download.docker.com/linux/ubuntu $RELEASE stable"
+      keyid: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+
+package_update: true
+package_upgrade: true
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - rsync
+  - jq
+  - ufw
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/10-sales-bot.conf
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin no
+  - path: /etc/docker/daemon.json
+    content: |
+      {
+        "log-driver": "json-file",
+        "log-opts": { "max-size": "10m", "max-file": "3" }
+      }
+  - path: /usr/local/sbin/sales-bot-egress-fw
+    permissions: "0755"
+    encoding: b64
+    content: @EGRESS_B64@
+  - path: /etc/systemd/system/sales-bot-egress-fw.service
+    content: |
+      [Unit]
+      Description=sales-bot egress firewall (block LAN/host/Tailscale)
+      After=network-online.target docker.service ufw.service
+      Wants=network-online.target
+      PartOf=docker.service
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/sales-bot-egress-fw
+      [Install]
+      WantedBy=multi-user.target docker.service
+
+runcmd:
+  - [usermod, -aG, docker, @VM_USER@]
+  - [ufw, default, deny, incoming]
+  - [ufw, default, allow, outgoing]
+  - [ufw, allow, 22/tcp]
+  - [ufw, --force, enable]
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, docker]
+  - [systemctl, restart, docker]
+  - [systemctl, enable, --now, sales-bot-egress-fw.service]
+  - [systemctl, restart, ssh]
+  - [sh, -c, "echo cloud-init-done > /var/lib/sales-bot-ready"]
+
+final_message: "sales-bot VM ready after $UPTIME seconds"

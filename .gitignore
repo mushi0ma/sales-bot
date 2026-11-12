@@ -11,10 +11,7 @@ id_*
 .claude/settings.local.json
 
 # Артефакты ВМ (диски, образы, cloud-init seed с ключами)
-infra/vm/*.qcow2
-infra/vm/*.img
-infra/vm/*.iso
-infra/vm/ssh/
+infra/vm/
 
 # Клонированные upstream-репозитории (если окажутся внутри)
 vendor/
@@ -23,3 +20,5 @@ vendor/
 .DS_Store
 *.log
 node_modules/
+__pycache__/
+*.pyc
