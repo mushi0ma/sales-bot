@@ -148,4 +148,4 @@
 - Если Vertex — прокси (OpenAI-совместимый эндпоинт Vertex + обновление OAuth-токена). Его адрес нужно разрешить через `SSRF_INTERNAL_TARGETS`.
 - RAG на Gemini — патч agents: передавать `dimensions` (1536) в `/embeddings`.
 - TTS на Google — у agents нет такого провайдера: нужен патч или OpenAI-совместимая обёртка.
-- Перед переходом прогнать `stack/tests/model_guard.py` на `gemini-3.8-flash`. В скрипте сейчас только OpenRouter — добавить провайдера.
+- Перед переходом переключить агента на `gemini-3.8-flash` и прогнать `stack/tests/scenarios.py` (идёт через сам agents, провайдер не важен).

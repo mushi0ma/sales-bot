@@ -131,9 +131,6 @@ def view(r, duplicate=False):
         "created_at": r["created_at"],
         "sla_text": SLA[r["urgency"]] if r["status"] in OPEN else "",
         "duplicate": duplicate,
-        # Instruction for the bot, not for the resident: an emergency always reaches a human too.
-        "next_step": ("аварийная заявка: в ответе жильцу назови номер заявки " + r["number"] + " и номер "
-                      "аварийно-диспетчерской службы, затем вызови handoff_to_human") if r["urgency"] == "emergency" and r["status"] in OPEN else "",
     }
 
 
@@ -183,7 +180,7 @@ def create(body):
                 if norm(dup["address"]) != norm(address) or norm(dup["apartment"]) != norm(apartment):
                     continue
                 if urgency == "emergency" and dup["urgency"] != "emergency":
-                    # The problem escalated: the open ticket becomes an emergency (and gets its next_step).
+                    # The problem escalated: the open ticket becomes an emergency.
                     c.execute("UPDATE tickets SET urgency='emergency', description=?, updated_at=? WHERE id=?",
                               (f"{dup['description']} | ЭСКАЛАЦИЯ: {description}"[:1000], t.isoformat(),
                                dup["id"]))
