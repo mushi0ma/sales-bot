@@ -1,0 +1,25 @@
+# Секреты — никогда не коммитить
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+id_*
+!id_*.pub
+
+# Локальные настройки Claude Code
+.claude/settings.local.json
+
+# Артефакты ВМ (диски, образы, cloud-init seed с ключами)
+infra/vm/*.qcow2
+infra/vm/*.img
+infra/vm/*.iso
+infra/vm/ssh/
+
+# Клонированные upstream-репозитории (если окажутся внутри)
+vendor/
+
+# Прочее
+.DS_Store
+*.log
+node_modules/
