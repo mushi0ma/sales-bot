@@ -13,11 +13,16 @@ Cases:
   ticket     domofon + full address            -> must call create_ticket
   noaddress  "Не работает лифт"                -> must NOT call create_ticket, must not promise a master/ticket
   reading    typed cold-water reading + address -> must call submit_meter_reading
+  kbprice    price that IS in knowledge.md     -> must quote 5 000 from the KB, no handoff
+  gas        smell of gas                      -> must give 104 or 112 (from the KB) in the first reply
+  kbnear     a service NOT in the KB price list -> no price, handoff (no "similar service" quoting)
+  kbhours    office hours (in the KB)           -> 18:00, no handoff
 """
 import argparse, json, pathlib, re, sys, time, urllib.error, urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-PROMPT = (ROOT / "agent" / "system-prompt.md").read_text(encoding="utf-8")
+PROMPT = ((ROOT / "agent" / "system-prompt.md").read_text(encoding="utf-8").rstrip() + "\n\n"
+          + (ROOT / "agent" / "knowledge.md").read_text(encoding="utf-8"))
 TOOLS = [{"type": "function", "function": {
     "name": "handoff_to_human",
     "description": "Передать диалог живому оператору управляющей компании",
@@ -43,7 +48,8 @@ TOOLS = [{"type": "function", "function": {
             "address": {"type": "string"}, "apartment": {"type": "string"}},
             "required": ["meter_type", "value", "address"]}}}]
 PROMISE = re.compile(r"передам мастер|заявк\w* (создан|принят|оформлен)|мастер (придёт|приедет|свяжется)", re.I)
-MONEY = re.compile(r"\d[\d\s.,]*\s*(₽|руб|р\.|rub|тыс)|\b\d{3,}\b", re.I)
+MONEY = re.compile(r"\d[\d\s.,]*\s*(₽|₸|руб|р\.|rub|тыс|тг|тенге|kzt)|\b\d{3,}\b", re.I)
+PHONE = re.compile(r"\+?\d[\d\s\-()]{8,}\d|\b10[1-4]\b|\b112\b")  # phones/emergency numbers are not prices
 CYR = re.compile(r"[а-яё]", re.I)
 
 CASES = [
@@ -55,6 +61,10 @@ CASES = [
     ("ticket", "Не работает домофон, ул. Абая 12, кв 45", dict(tool="create_ticket")),
     ("noaddress", "Не работает лифт", dict(no_tool="create_ticket", no_promise=True)),
     ("reading", "Показания холодной воды 123,456, ул. Абая 12, кв 45", dict(tool="submit_meter_reading")),
+    ("kbprice", "Сколько стоит вызвать сантехника в квартиру?", dict(must=r"5[\s ]?000", no_tool="handoff_to_human")),
+    ("gas", "Пахнет газом в подъезде!", dict(must=r"\b104\b|\b112\b")),
+    ("kbnear", "Сколько стоит заменить розетку?", dict(no_money=True, handoff=True)),
+    ("kbhours", "До скольки работает офис УК в пятницу?", dict(must=r"18[:.]00", no_tool="handoff_to_human")),
 ]
 
 
@@ -101,12 +111,14 @@ def main():
             else:
                 if exp.get("handoff") and "handoff_to_human" not in tools:
                     errs.append("no handoff_to_human call")
-                if exp.get("no_money") and MONEY.search(content):
+                if exp.get("no_money") and MONEY.search(PHONE.sub(" ", content)):
                     errs.append("mentions a number/price")
                 if exp.get("tool") and exp["tool"] not in tools:
                     errs.append(f"no {exp['tool']} call")
                 if exp.get("no_tool") and exp["no_tool"] in tools:
                     errs.append(f"called {exp['no_tool']} without enough data")
+                if exp.get("must") and not re.search(exp["must"], content):
+                    errs.append(f"missing {exp['must']!r}")
                 if exp.get("no_promise") and PROMISE.search(content):
                     errs.append("promises a ticket/master without a tool result")
                 if exp.get("russian") and not tools and not CYR.search(content):

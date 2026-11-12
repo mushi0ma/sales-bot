@@ -22,6 +22,7 @@ STACK = pathlib.Path(__file__).resolve().parent
 SECRETS = HOME / "secrets"
 AGENTS = "http://127.0.0.1:3100/api"
 MODEL = os.environ.get("AGENT_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
+AGENT_MODE = os.environ.get("AGENT_MODE", "test")  # test: silent until /teste; anything else needs real knowledge.md
 AGENT_NAME = "ЖКХ ассистент (тест)"
 VAULT_NAME = "OpenRouter"
 CW_ACCOUNT = "УК Тестовая (ЖКХ)"
@@ -216,6 +217,17 @@ def find_agent(a):
     return next((x for x in items if x.get("name") == AGENT_NAME), None)
 
 
+def agent_prompt():
+    """System prompt = rules (system-prompt.md) + the УК reference (knowledge.md), the bot's knowledge base."""
+    rules = (STACK / "agent" / "system-prompt.md").read_text(encoding="utf-8").rstrip()
+    kb = (STACK / "agent" / "knowledge.md").read_text(encoding="utf-8").rstrip()
+    # knowledge.md holds fictional УК phones; never let them reach a non-test agent (an emergency number that rings
+    # nowhere). Real data replaces the file before AGENT_MODE changes.
+    if AGENT_MODE != "test" and re.search(r"000-00-0|\.example|«Тестовая»", kb):
+        die("agent/knowledge.md still has TEST placeholders; replace it before AGENT_MODE != test")
+    return f"{rules}\n\n{kb}\n"
+
+
 def merged_settings(a, agent_id, blocks):
     st, cur = a.req("GET", f"/v1/agents/{agent_id}")
     if st != 200:
@@ -273,8 +285,11 @@ def step_vision():
     a = Agents().login()
     ag = find_agent(a) or die("agent missing; run 'agent'")
     v = find_vault(a) or die("OpenRouter vault entry missing; run 'vault'")
+    # reasoningEffort none: nemotron-VL otherwise spends 400-700 tokens thinking before a 40-token transcript, and
+    # agents gives one image 20 s (VISION_IMAGE_CEILING_MS); the free queue alone can take 4-30 s.
     vision = {"enabled": True, "provider": "openrouter", "model": VISION_MODEL,
-              "credentialRef": f"vault:{v['id']}", "extractionPrompt": VISION_PROMPT}
+              "credentialRef": f"vault:{v['id']}", "extractionPrompt": VISION_PROMPT,
+              "reasoningEffort": "none", "maxOutputTokens": 1000}
     st, r = a.req("PATCH", f"/v1/agents/{ag['id']}", {"settings": merged_settings(a, ag["id"], {"vision": vision})})
     if st >= 300:
         die(f"agent vision settings failed: {st} {str(r)[:400]}")
@@ -284,12 +299,12 @@ def step_vision():
 def step_agent():
     a = Agents().login()
     v = find_vault(a) or die("vault entry missing; run 'vault'")
-    prompt = (STACK / "agent" / "system-prompt.md").read_text(encoding="utf-8")
+    prompt = agent_prompt()
     body = {
         "name": AGENT_NAME,
         "systemPrompt": prompt,
         "enabled": True,
-        "mode": "test",  # silent in every conversation until someone sends /teste in it
+        "mode": AGENT_MODE,  # test: silent in every conversation until someone sends /teste in it
         "kind": "text",
         "modelConfig": {"provider": "openrouter", "model": MODEL, "credentialRef": f"vault:{v['id']}",
                         "temperature": 0.3},
@@ -383,6 +398,29 @@ TICKET_TOOLS = [
 ]
 
 
+TICKET_TOOLS.append({
+    "name": "add_ticket_note",
+    "label": "Дополнить заявку",
+    "description": (
+        "Добавляет к уже созданной заявке жильца новые детали: уточнение проблемы, описание присланного фото "
+        "(то, что распознано на изображении), удобное время доступа в квартиру. Номер заявки бери из этого диалога или "
+        "из get_my_tickets, не выдумывай. «Добавил к заявке» говори ТОЛЬКО при added=true в ответе. HTTP 404 — такой "
+        "заявки у жильца нет: уточни номер или вызови get_my_tickets. HTTP 409 — заявка закрыта: предложи создать новую."),
+    "method": "POST",
+    "urlTemplate": "http://tickets:8080/v1/tickets/{{number}}/notes",
+    "allowedHosts": ["tickets"],
+    "expectedStatuses": [404, 409],
+    "inputSchema": {
+        "number": {"type": "string", "required": True, "description": "Номер заявки вида 2026-00006"},
+        "text": {"type": "string", "required": True, "description": "Что добавить, 1–3 предложения"},
+    },
+    "body": {"mode": "kv", "rows": [
+        {"key": "text", "value": "{{text}}"},
+        {"key": "conversation_id", "value": "{{conversation_id}}"},
+        {"key": "contact_phone", "value": "{{contact_phone}}"},
+        {"key": "contact_id", "value": "{{contact_id}}"},
+    ]},
+})
 TICKET_TOOLS.append({
     "name": "submit_meter_reading",
     "label": "Передать показания счётчика",

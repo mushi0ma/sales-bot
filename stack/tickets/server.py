@@ -8,12 +8,14 @@ HTTP (internal docker network only, Bearer TICKETS_API_TOKEN on every /v1 route)
   POST  /v1/tickets                 create (dedupes an open ticket: same conversation, category, address)
   GET   /v1/tickets?phone=&contact_id=   the caller's latest tickets (both come from conversation context)
   PATCH /v1/tickets/<number>        operator: {"status": new|in_progress|done|cancelled}
+  POST  /v1/tickets/<number>/notes  add a resident's detail to THEIR ticket (404 when not theirs)
   POST  /v1/readings                meter reading (409 when lower than the previous one of the same meter)
   GET   /healthz                    no auth
 CLI (operator, inside the container):
   python3 -I /app/server.py list [N]
   python3 -I /app/server.py set-status <number> <status>
   python3 -I /app/server.py readings [N]
+  python3 -I /app/server.py notes <number>
 Logs carry method, path and status only, never bodies (they hold addresses and phones).
 """
 import hmac, json, os, re, sqlite3, sys, threading
@@ -104,6 +106,12 @@ def init_db():
             contact_phone TEXT,
             contact_id TEXT,
             contact_name TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS ticket_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id INTEGER NOT NULL REFERENCES tickets(id),
+            created_at TEXT NOT NULL,
+            text TEXT NOT NULL,
+            conversation_id TEXT)""")
         c.execute("CREATE INDEX IF NOT EXISTS r_meter ON readings(meter_type, address, apartment, serial)")
 
 
@@ -251,6 +259,28 @@ def submit_reading(body):
     return 201, dict(out, accepted=True, duplicate=False, number=number, accepted_at=t.isoformat())
 
 
+def add_note(number, body):
+    text = text_field(body, "text", 3, 2000)
+    conv = str(body.get("conversation_id") or "").strip()
+    phone = str(body.get("contact_phone") or "").strip()
+    contact = str(body.get("contact_id") or "").strip()
+    with _lock, db() as c:
+        r = c.execute("SELECT * FROM tickets WHERE number=?", (number,)).fetchone()
+        # Only the resident who owns the ticket may add to it; anything else reads as "not found".
+        owner = r is not None and (
+            (conv and r["conversation_id"] == conv) or (len(phone) >= 3 and r["contact_phone"] == phone)
+            or (contact and r["contact_id"] == contact))
+        if not owner:
+            return 404, {"error": "заявка с таким номером у этого жильца не найдена", "added": False}
+        if r["status"] not in OPEN:
+            return 409, {"error": f"заявка {number} уже {STATUS[r['status']]}, дополнить нельзя", "added": False}
+        c.execute("INSERT INTO ticket_notes (ticket_id, created_at, text, conversation_id) VALUES (?,?,?,?)",
+                  (r["id"], now().isoformat(), text, conv or None))
+        c.execute("UPDATE tickets SET updated_at=? WHERE id=?", (now().isoformat(), r["id"]))
+        n = c.execute("SELECT count(*) FROM ticket_notes WHERE ticket_id=?", (r["id"],)).fetchone()[0]
+    return 201, {"added": True, "number": number, "notes_count": n, "status_text": STATUS[r["status"]]}
+
+
 def list_mine(phone, contact):
     phone = (phone or "").strip()
     contact = (contact or "").strip()
@@ -328,6 +358,9 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET" and u.path == "/v1/tickets":
                 q = parse_qs(u.query)
                 return self.send(*list_mine(q.get("phone", [""])[0], q.get("contact_id", [""])[0]))
+            m = re.fullmatch(r"/v1/tickets/(\d{4}-\d{5,})/notes", u.path)
+            if method == "POST" and m:
+                return self.send(*add_note(m.group(1), self.body()))
             m = re.fullmatch(r"/v1/tickets/(\d{4}-\d{5,})", u.path)
             if method == "PATCH" and m:
                 return self.send(*set_status(m.group(1), str(self.body().get("status", ""))))
@@ -356,6 +389,11 @@ def cli(argv):
         for r in rows:
             print(f"{r['number']}  {r['status']:11} {r['urgency']:9} {CATEGORIES[r['category']]:26} "
                   f"{r['address']}, кв. {r['apartment'] or '-'} | {r['description'][:60]} | conv={r['conversation_id']}")
+    elif argv[0] == "notes" and len(argv) == 2:
+        with db() as c:
+            for r in c.execute("SELECT n.* FROM ticket_notes n JOIN tickets t ON t.id=n.ticket_id WHERE t.number=? "
+                               "ORDER BY n.id", (argv[1],)):
+                print(f"{r['created_at']}  {r['text']}")
     elif argv[0] == "readings":
         with db() as c:
             rows = c.execute("SELECT * FROM readings ORDER BY id DESC LIMIT ?",
