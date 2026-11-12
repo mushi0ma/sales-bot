@@ -78,6 +78,12 @@ infra/vm.sh ssh 'cd work/stack && python3 -I bootstrap.py playground'   # smoke-
 **После `handoff_to_human` бот молчит в этом диалоге** (лог agents: `bot silent by gate … reason=taken_over`):
 диалог становится `open` и назначен оператору, а бот отвечает только в `pending`. Вернуть диалог боту:
 в Chatwoot «Завершить» (resolve) — следующее сообщение жильца переоткроет его как `pending`.
+Автоназначение в inbox должно быть **выключено** (`bootstrap.py bind` делает это сам): иначе Chatwoot сразу
+назначает каждый новый диалог оператору, и бот молчит с первого сообщения (`taken_over`).
+
+Ротация токена/секрета бота (если засветились): удалить Agent Bot в Chatwoot (Settings → Bots или
+`DELETE /api/v1/accounts/1/agent_bots/<id>`), затем `POST /api/v1/chatwoot/inboxes/<id>/reconnect` в agents —
+он создаст нового бота с новыми токеном, HMAC-секретом и route-токеном.
 
 ### Снапшоты
 

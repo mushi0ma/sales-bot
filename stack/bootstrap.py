@@ -393,6 +393,18 @@ def step_bind(inbox_id):
     ag = find_agent(a) or die("agent missing")
     st, b = a.req("PATCH", f"/v1/chatwoot/inboxes/{inbox_id}", {"agentId": str(ag["id"])})
     print(f"  bind inbox {inbox_id} -> agent {ag['id']}: HTTP {st} {'' if st < 300 else str(b)[:400]}")
+    # Chatwoot auto-assignment hands every new conversation to a human at once, and the bot never answers a
+    # conversation a human holds (agents log: "bot silent by gate ... reason=taken_over"). Turn it off.
+    st, b = a.req("GET", "/v1/chatwoot/inboxes")
+    cw_inbox = next((i.get("chatwootInboxId") for i in as_list(b) if str(i.get("id")) == str(inbox_id)), None)
+    cw = read_env("chatwoot-admin.env")
+    if cw_inbox and cw:
+        r = urllib.request.Request(
+            f"http://127.0.0.1:3000/api/v1/accounts/{cw['CW_ACCOUNT_ID']}/inboxes/{cw_inbox}",
+            json.dumps({"enable_auto_assignment": False}).encode(),
+            {"api_access_token": cw["CW_API_TOKEN"], "Content-Type": "application/json"}, method="PATCH")
+        with urllib.request.urlopen(r, timeout=30) as resp:
+            print(f"  chatwoot inbox {cw_inbox}: auto-assignment off (HTTP {resp.status})")
 
 
 def step_playground():
