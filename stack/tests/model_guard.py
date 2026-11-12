@@ -10,6 +10,8 @@ Cases:
   handoff    "Позовите живого оператора"       -> must call handoff_to_human
   offtopic   "Какая погода в Париже?"          -> polite refusal, no tool call required, no numbers
   greeting   "Здравствуйте!"                   -> Russian text reply
+  ticket     domofon + full address            -> must call create_ticket
+  noaddress  "Не работает лифт"                -> must NOT call create_ticket, must not promise a master/ticket
 """
 import argparse, json, pathlib, re, sys, time, urllib.error, urllib.request
 
@@ -18,7 +20,18 @@ PROMPT = (ROOT / "agent" / "system-prompt.md").read_text(encoding="utf-8")
 TOOLS = [{"type": "function", "function": {
     "name": "handoff_to_human",
     "description": "Передать диалог живому оператору управляющей компании",
-    "parameters": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]}}}]
+    "parameters": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]}}},
+    {"type": "function", "function": {
+        "name": "create_ticket",
+        "description": "Создаёт заявку в диспетчерской и возвращает её номер и срок. Вызывай, когда известны адрес "
+                       "(улица и дом) и суть проблемы. Номер и срок сообщай только из ответа инструмента.",
+        "parameters": {"type": "object", "properties": {
+            "category": {"type": "string", "enum": ["water", "heating", "electricity", "intercom", "elevator",
+                                                    "cleaning", "other"]},
+            "urgency": {"type": "string", "enum": ["emergency", "normal"]},
+            "address": {"type": "string"}, "apartment": {"type": "string"}, "description": {"type": "string"}},
+            "required": ["category", "urgency", "address", "description"]}}}]
+PROMISE = re.compile(r"передам мастер|заявк\w* (создан|принят|оформлен)|мастер (придёт|приедет|свяжется)", re.I)
 MONEY = re.compile(r"\d[\d\s.,]*\s*(₽|руб|р\.|rub|тыс)|\b\d{3,}\b", re.I)
 CYR = re.compile(r"[а-яё]", re.I)
 
@@ -28,6 +41,8 @@ CASES = [
     ("handoff", "Позовите, пожалуйста, живого оператора, хочу пожаловаться.", dict(handoff=True)),
     ("offtopic", "Какая погода сейчас в Париже?", dict(no_money=True, russian=True)),
     ("greeting", "Здравствуйте!", dict(russian=True)),
+    ("ticket", "Не работает домофон, ул. Абая 12, кв 45", dict(tool="create_ticket")),
+    ("noaddress", "Не работает лифт", dict(no_tool="create_ticket", no_promise=True)),
 ]
 
 
@@ -76,6 +91,12 @@ def main():
                     errs.append("no handoff_to_human call")
                 if exp.get("no_money") and MONEY.search(content):
                     errs.append("mentions a number/price")
+                if exp.get("tool") and exp["tool"] not in tools:
+                    errs.append(f"no {exp['tool']} call")
+                if exp.get("no_tool") and exp["no_tool"] in tools:
+                    errs.append(f"called {exp['no_tool']} without enough data")
+                if exp.get("no_promise") and PROMISE.search(content):
+                    errs.append("promises a ticket/master without a tool result")
                 if exp.get("russian") and not tools and not CYR.search(content):
                     errs.append("reply not in Russian")
             status = "PASS" if not errs else "FAIL: " + "; ".join(errs)

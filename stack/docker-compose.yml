@@ -119,8 +119,9 @@ services:
       MIGRATION_DATABASE_URL: postgres://postgres:${AGENTS_POSTGRES_PASSWORD:?}@agents-postgres:5432/fazerai_agents_db
       DATABASE_URL: postgres://fazerai_app:${AGENTS_APP_DB_PASSWORD:?}@agents-postgres:5432/fazerai_agents_db
       LANGGRAPH_DATABASE_URL: postgres://fazerai_app:${AGENTS_APP_DB_PASSWORD:?}@agents-postgres:5432/fazerai_agents_db
-      # Chatwoot on the private docker network (http allowed only for this host:port).
-      SSRF_INTERNAL_TARGETS: cw-rails:3000
+      # Internal services reachable over http with the SSRF guard ON (host:port only):
+      # Chatwoot, and the mock dispatcher used by the ticket HTTP tools (tool allowedHosts must name it).
+      SSRF_INTERNAL_TARGETS: cw-rails:3000,tickets:8080
       # No calls to app.fazer.ai (announcements / update check).
       FAZER_AI_HUB_URL: ""
       SIGNUP_ENABLED: "false"
@@ -134,6 +135,27 @@ services:
       - agents_storage:/app/storage
     depends_on:
       agents-postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  # Mock dispatcher (ticket) service: stdlib Python + SQLite, internal network only (no published port).
+  tickets:
+    image: python:3.13-alpine@sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e
+    command: [python3, -I, -u, /app/server.py]
+    environment:
+      TICKETS_API_TOKEN: ${TICKETS_API_TOKEN:?run gen-env.sh}
+      TICKETS_DB: /data/tickets.db
+    volumes:
+      - ./tickets/server.py:/app/server.py:ro
+      - tickets_data:/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   agents-postgres:
@@ -159,3 +181,4 @@ volumes:
   redis_data:
   agents_storage:
   agents_postgres:
+  tickets_data:
