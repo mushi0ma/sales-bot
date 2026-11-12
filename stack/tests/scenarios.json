@@ -23,5 +23,7 @@
   {"name": "ticket", "say": "Не работает домофон, ул. Абая 12, кв 45",
    "calls": ["create_ticket"], "reply_has_from_tool": "create_ticket"},
   {"name": "reading", "say": "Показания холодной воды 123,456, ул. Абая 12, кв 45",
-   "calls": ["submit_meter_reading"]}
+   "calls": ["submit_meter_reading"], "reply_has_from_tool": "submit_meter_reading"},
+  {"name": "reading-when", "say": "Когда можно сдавать показания счётчиков?",
+   "calls": ["search_knowledge"], "not_calls": ["submit_meter_reading"], "reply_has_from_tool": "search_knowledge"}
 ]

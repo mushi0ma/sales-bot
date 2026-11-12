@@ -9,7 +9,8 @@ HTTP (internal docker network only, Bearer TICKETS_API_TOKEN on every /v1 route)
   GET   /v1/tickets?phone=&contact_id=   the caller's latest tickets (both come from conversation context)
   PATCH /v1/tickets/<number>        operator: {"status": new|in_progress|done|cancelled}
   POST  /v1/tickets/<number>/notes  add a resident's detail to THEIR ticket (404 when not theirs)
-  POST  /v1/readings                meter reading (409 when lower than the previous one of the same meter)
+  POST  /v1/readings                meter reading (422 outside the monthly window READINGS_WINDOW in the УК's
+                                    local time UK_UTC_OFFSET; 409 when lower than the previous one of the same meter)
   GET   /healthz                    no auth
 CLI (operator, inside the container):
   python3 -I /app/server.py list [N]
@@ -60,6 +61,33 @@ METERS = {
     "heat": ("Тепло", "Гкал"),
 }
 DIGITS = re.compile(r"^\d{1,20}$")
+MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября",
+          "ноября", "декабря")
+
+
+def reading_window():
+    """(first, last) day of the month when readings are accepted, from READINGS_WINDOW ("20-25")."""
+    m = re.fullmatch(r"\s*(\d{1,2})\s*-\s*(\d{1,2})\s*", os.environ.get("READINGS_WINDOW", "20-25"))
+    lo, hi = (int(m[1]), int(m[2])) if m else (0, 0)
+    if not 1 <= lo <= hi <= 28:
+        sys.exit("READINGS_WINDOW must be 'D1-D2' with 1 <= D1 <= D2 <= 28")
+    return lo, hi
+
+
+WINDOW = reading_window()
+# The УК's local time decides the day (Kazakhstan: UTC+5 since 2024-03-01). A fixed offset, so no tzdata needed.
+LOCAL = timezone(timedelta(hours=float(os.environ.get("UK_UTC_OFFSET", "5"))))
+
+
+def window_state(t):
+    """None when t falls inside the window; else what the resident needs to hear: the window and its next start."""
+    d = t.astimezone(LOCAL).date()
+    lo, hi = WINDOW
+    if lo <= d.day <= hi:
+        return None
+    nxt = d.replace(day=lo) if d.day < lo else (d.replace(day=1) + timedelta(days=32)).replace(day=lo)
+    return {"window": f"с {lo} по {hi} число каждого месяца", "today": d.isoformat(),
+            "next_window_from": nxt.isoformat(), "next_window_text": f"{nxt.day} {MONTHS[nxt.month - 1]}"}
 _lock = threading.Lock()
 
 
@@ -225,6 +253,9 @@ def submit_reading(body):
     name = text_field(body, "contact_name", 1, 120, required=False)
     title, unit = METERS[meter]
     t = now()
+    closed = window_state(t)
+    if closed:
+        return 422, dict(closed, accepted=False, error="outside_window", meter=title, value=str(value))
     with _lock, db() as c:
         # The same meter: type + address/apartment (+ serial when both readings carry one).
         prev = None

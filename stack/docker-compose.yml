@@ -148,6 +148,9 @@ services:
     environment:
       TICKETS_API_TOKEN: ${TICKETS_API_TOKEN:?run gen-env.sh}
       TICKETS_DB: /data/tickets.db
+      # Monthly window for meter readings (days, inclusive) in the УК's local time; keep agent/knowledge.md in step.
+      READINGS_WINDOW: ${READINGS_WINDOW:-20-25}
+      UK_UTC_OFFSET: ${UK_UTC_OFFSET:-5}
     volumes:
       - ./tickets/server.py:/app/server.py:ro
       - tickets_data:/data

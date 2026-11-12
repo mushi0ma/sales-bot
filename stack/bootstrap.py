@@ -472,11 +472,13 @@ TICKET_TOOLS.append({
         "жилец её назвал. Если цифры прочитаны с фото, сначала назови их жильцу и дождись подтверждения. Принятыми "
         "показания считаются ТОЛЬКО при accepted=true в ответе; номер приёма называй из ответа. HTTP 409 значит, что "
         "показание меньше предыдущего: попроси жильца перепроверить цифры, не передавай повторно без исправления. "
+        "HTTP 422 (error=outside_window) значит, что сейчас приём показаний закрыт: показания НЕ приняты; скажи жильцу "
+        "окно приёма (window) и дату следующего приёма (next_window_text) из ответа и попроси прислать показания тогда. "
         "HTTP 400 — исправь аргументы и повтори один раз; другая ошибка — передай оператору (handoff_to_human)."),
     "method": "POST",
     "urlTemplate": "http://tickets:8080/v1/readings",
     "allowedHosts": ["tickets"],
-    "expectedStatuses": [409],
+    "expectedStatuses": [409, 422],
     "inputSchema": {
         "meter_type": {"type": "enum", "required": True,
                        "enumValues": ["cold_water", "hot_water", "electricity", "electricity_day",
