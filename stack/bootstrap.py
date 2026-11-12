@@ -689,6 +689,16 @@ def step_operator():
     body = {"name": MACRO_NAME, "visibility": "global", "actions": actions}
     st, r = cw_api("PATCH" if m else "POST", f"/macros/{m['id']}" if m else "/macros", body)
     print(f"  macro '{MACRO_NAME}': HTTP {st} {'' if st < 300 else r}")
+    # Chatwoot's conversation list opens on "Open", but a conversation the bot is handling is "pending": with the
+    # bot answering by itself the default view looks empty. Show every status to the admin.
+    cw = read_env("chatwoot-admin.env")
+    h = {"api_access_token": cw["CW_API_TOKEN"], "Content-Type": "application/json"}
+    with urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:3000/api/v1/profile", headers=h)) as r:
+        ui = json.load(r).get("ui_settings") or {}
+    ui["conversations_filter_by"] = {**(ui.get("conversations_filter_by") or {}), "status": "all"}
+    urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:3000/api/v1/profile", json.dumps(
+        {"profile": {"ui_settings": ui}}).encode(), h, method="PUT")).close()
+    print("  admin conversation list: status filter = all")
     st, b = cw_api("GET", "/custom_attribute_definitions?attribute_model=1")
     defs = b if isinstance(b, list) else []
     if not any(d.get("attribute_key") == TESTER_ATTR for d in defs):
