@@ -8,6 +8,9 @@ Steps (idempotent where possible; secrets go to ~/secrets/*.env with mode 600 an
   agent      create/update the "ЖКХ ассистент" agent (OpenRouter model, system prompt, test mode)
   connect    connect agents to Chatwoot (private docker network) and select the account
   stt        local speech-to-text (whisper in the VM) for voice notes: vault entry + agent stt settings
+  operator   Chatwoot: macro «🤖 Вернуть боту» + contact attribute «Тестировщик бота»
+  testers    testers all | <contact_id>...: tick «Тестировщик бота» (the bot answers only them)
+  telegram   Telegram inbox from TELEGRAM_BOT_TOKEN (stack/.env) + bind to the agent; needs the tg-bridge profile
   knowledge  RAG: OpenRouter embeddings + knowledge base from agent/knowledge.md, search smoke test
   vision     image/document reading for incoming photos (OpenRouter free VL model, Russian extraction prompt)
   tickets    ticket HTTP tools (create_ticket, get_my_tickets) on the mock dispatcher + least-privilege grants
@@ -23,7 +26,12 @@ STACK = pathlib.Path(__file__).resolve().parent
 SECRETS = HOME / "secrets"
 AGENTS = "http://127.0.0.1:3100/api"
 MODEL = os.environ.get("AGENT_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
-AGENT_MODE = os.environ.get("AGENT_MODE", "test")  # test: silent until /teste; anything else needs real knowledge.md
+# production: the bot answers by itself (no /teste). Who it answers is BOT_AUDIENCE:
+#   testers  (default) only contacts whose Chatwoot attribute "Тестировщик бота" (salesbot_tester) is ticked;
+#   everyone no gate at all — refused while agent/knowledge.md still holds test placeholders.
+AGENT_MODE = os.environ.get("AGENT_MODE", "production")
+BOT_AUDIENCE = os.environ.get("BOT_AUDIENCE", "testers")
+TESTER_ATTR = "salesbot_tester"
 AGENT_NAME = "ЖКХ ассистент (тест)"
 VAULT_NAME = "OpenRouter"
 CW_ACCOUNT = "УК Тестовая (ЖКХ)"
@@ -229,10 +237,10 @@ def agent_prompt():
     """System prompt = rules (system-prompt.md) + the УК reference (knowledge.md), the bot's knowledge base."""
     rules = (STACK / "agent" / "system-prompt.md").read_text(encoding="utf-8").rstrip()
     kb = (STACK / "agent" / "knowledge.md").read_text(encoding="utf-8").rstrip()
-    # knowledge.md holds fictional УК phones; never let them reach a non-test agent (an emergency number that rings
-    # nowhere). Real data replaces the file before AGENT_MODE changes.
-    if AGENT_MODE != "test" and re.search(r"000-00-0|\.example|«Тестовая»", kb):
-        die("agent/knowledge.md still has TEST placeholders; replace it before AGENT_MODE != test")
+    # knowledge.md holds fictional УК phones; never let them reach real residents (an emergency number that rings
+    # nowhere). Real data replaces the file before the bot answers everyone.
+    if AGENT_MODE == "production" and BOT_AUDIENCE != "testers" and re.search(r"000-00-0|\.example|«Тестовая»", kb):
+        die("agent/knowledge.md still has TEST placeholders; keep BOT_AUDIENCE=testers until it is replaced")
     return f"{rules}\n\n{kb}\n"
 
 
@@ -312,7 +320,7 @@ def step_agent():
         "name": AGENT_NAME,
         "systemPrompt": prompt,
         "enabled": True,
-        "mode": AGENT_MODE,  # test: silent in every conversation until someone sends /teste in it
+        "mode": AGENT_MODE,  # test: silent until /teste in each conversation; production: answers by itself
         "kind": "text",
         "modelConfig": {"provider": "openrouter", "model": MODEL, "credentialRef": f"vault:{v['id']}",
                         "temperature": 0.3},
@@ -321,6 +329,12 @@ def step_agent():
                         "Передай оператору, если клиент просит человека, жалуется, нужна точная сумма/тариф/дата/"
                         "юридическая формулировка, которой нет в инструментах, или аварийная ситуация."},
             "debounce": {"enabled": True, "windowSeconds": 4, "maxWindowSeconds": 30, "maxMessagesPerBurst": 10},
+            # Contact gate: the WhatsApp number is a real SIM and the Telegram bot is findable by anyone, so a
+            # stranger's message must not reach the model (test data only). The rule refusal is silent.
+            "contactAuth": ({"enabled": True, "rule": {"kind": "attribute", "scope": "contact", "key": TESTER_ATTR,
+                                                       "equals": "true"},
+                             "denyMessage": None, "handoffEnabled": False, "operatorNoteEnabled": False}
+                            if BOT_AUDIENCE == "testers" else {"enabled": False}),
         },
     }
     cur = find_agent(a)
@@ -328,7 +342,8 @@ def step_agent():
         # PATCH refuses a settings bag that drops configured blocks (stt, ...): overlay ours on what is stored.
         body["settings"] = merged_settings(a, cur["id"], body["settings"])
         st, b = a.req("PATCH", f"/v1/agents/{cur['id']}", body)
-        print(f"  agent: updated id={cur['id']} HTTP {st} {'' if st < 300 else str(b)[:300]}")
+        print(f"  agent: updated id={cur['id']} mode={AGENT_MODE} audience={BOT_AUDIENCE} HTTP {st} "
+              f"{'' if st < 300 else str(b)[:300]}")
     else:
         st, b = a.req("POST", "/v1/agents", body)
         if st not in (200, 201):
@@ -623,6 +638,101 @@ def step_knowledge():
         print(f"  search {q!r}: HTTP {st} score={hit.get('score')} | {(hit.get('content') or hit.get('text') or str(r))[:90]!r}")
 
 
+# ---------------------------------------------------------------- Chatwoot operator side
+def cw_api(method, path, body=None):
+    cw = read_env("chatwoot-admin.env") or die("run 'chatwoot' first")
+    r = urllib.request.Request(f"http://127.0.0.1:3000/api/v1/accounts/{cw['CW_ACCOUNT_ID']}{path}",
+                               json.dumps(body).encode() if body is not None else None,
+                               {"api_access_token": cw["CW_API_TOKEN"], "Content-Type": "application/json"},
+                               method=method)
+    try:
+        with urllib.request.urlopen(r, timeout=30) as resp:
+            raw = resp.read()
+            return resp.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace")[:400]
+
+
+MACRO_NAME = "🤖 Вернуть боту"
+
+
+def step_operator():
+    """Chatwoot side of the hand-back: the 'Вернуть боту' macro (unassign + pending: the bot answers the next message,
+    with the operator's replies in its memory) and the contact attribute that admits testers to the bot."""
+    st, b = cw_api("GET", "/macros")
+    macros = b.get("payload", b) if isinstance(b, dict) else (b if isinstance(b, list) else [])
+    actions = [{"action_name": "remove_assigned_agent", "action_params": []},
+               {"action_name": "change_status", "action_params": ["pending"]},
+               {"action_name": "add_private_note", "action_params": [
+                   "Диалог возвращён боту: он ответит на следующее сообщение жильца и помнит переписку с оператором."]}]
+    m = next((x for x in macros if x.get("name") == MACRO_NAME), None)
+    body = {"name": MACRO_NAME, "visibility": "global", "actions": actions}
+    st, r = cw_api("PATCH" if m else "POST", f"/macros/{m['id']}" if m else "/macros", body)
+    print(f"  macro '{MACRO_NAME}': HTTP {st} {'' if st < 300 else r}")
+    st, b = cw_api("GET", "/custom_attribute_definitions?attribute_model=1")
+    defs = b if isinstance(b, list) else []
+    if not any(d.get("attribute_key") == TESTER_ATTR for d in defs):
+        st, r = cw_api("POST", "/custom_attribute_definitions", {
+            "attribute_display_name": "Тестировщик бота", "attribute_key": TESTER_ATTR,
+            "attribute_display_type": "checkbox", "attribute_model": "contact_attribute",
+            "attribute_description": "Бот отвечает только контактам с этой галочкой (тестовая среда)"})
+        print(f"  contact attribute '{TESTER_ATTR}': HTTP {st} {'' if st < 300 else r}")
+    else:
+        print(f"  contact attribute '{TESTER_ATTR}': exists")
+
+
+def step_testers(ids):
+    """Tick 'Тестировщик бота' on contacts: given ids, or `all` = every contact that exists now (test env: only the
+    owner's own numbers/accounts have written in). Prints ids only, never names or phones."""
+    if ids == ["all"]:
+        st, b = cw_api("GET", "/contacts?page=1")
+        ids = [str(c["id"]) for c in (b or {}).get("payload", [])]
+    for cid in ids:
+        st, r = cw_api("PATCH", f"/contacts/{cid}", {"custom_attributes": {TESTER_ATTR: True}})
+        print(f"  contact {cid}: tester HTTP {st}")
+
+
+TG_RUBY = r'''
+require 'json'
+token = ENV.fetch('TG_TOKEN'); acc = Account.find(ENV.fetch('CW_ACCOUNT_ID').to_i)
+ch = Channel::Telegram.find_by(bot_token: token)
+created = false
+unless ch
+  # The webhook callback would register FRONTEND_URL (http://localhost) with Telegram and fail; tg-bridge polls.
+  Channel::Telegram.skip_callback(:save, :before, :setup_telegram_webhook)
+  ch = Channel::Telegram.create!(account: acc, bot_token: token)
+  Inbox.create!(account: acc, channel: ch, name: ENV.fetch('TG_INBOX_NAME'), enable_auto_assignment: false)
+  created = true
+end
+puts 'TG_JSON:' + JSON.generate({ inbox_id: ch.inbox.id, bot: ch.bot_name, created: created })
+'''
+
+
+def step_telegram():
+    token = stack_env("TELEGRAM_BOT_TOKEN") or die("no TELEGRAM_BOT_TOKEN in stack/.env (see docs/SETUP.md, Telegram)")
+    cw = read_env("chatwoot-admin.env") or die("run 'chatwoot' first")
+    env = dict(os.environ, TG_TOKEN=token, CW_ACCOUNT_ID=cw["CW_ACCOUNT_ID"], TG_INBOX_NAME="Telegram")
+    r = subprocess.run(["docker", "compose", "exec", "-T", "-e", "TG_TOKEN", "-e", "CW_ACCOUNT_ID", "-e",
+                        "TG_INBOX_NAME", "cw-rails", "sh", "-c",
+                        "umask 077; cat > /tmp/tg.rb && bundle exec rails runner /tmp/tg.rb; rc=$?; rm -f /tmp/tg.rb; "
+                        "exit $rc"], cwd=STACK, input=TG_RUBY, capture_output=True, text=True, env=env)
+    m = re.search(r"^TG_JSON:(.*)$", r.stdout, re.M)
+    if r.returncode != 0 or not m:
+        die("telegram inbox failed:\n" + (r.stderr or r.stdout).replace(token, "<token>")[-1500:])
+    res = json.loads(m.group(1))
+    print(f"  chatwoot: Telegram inbox {res['inbox_id']} for @{res['bot']} (created={res['created']})")
+    a = Agents().login()
+    for _ in range(10):
+        st, b = a.req("GET", "/v1/chatwoot/inboxes")
+        mine = next((i for i in as_list(b) if str(i.get("chatwootInboxId")) == str(res["inbox_id"])), None)
+        if mine:
+            break
+        time.sleep(3)
+    if not mine:
+        die("agents does not list the new inbox yet; run 'connect', then 'bind <id>' (ids: 'inboxes')")
+    step_bind(mine["id"])
+
+
 def step_playground():
     a = Agents().login()
     ag = find_agent(a) or die("agent missing")
@@ -645,6 +755,7 @@ def step_playground():
 
 STEPS = {"chatwoot": step_chatwoot, "agents": step_agents, "vault": step_vault, "agent": step_agent,
          "connect": step_connect, "tickets": step_tickets, "stt": step_stt, "vision": step_vision, "inboxes": step_inboxes,
+         "operator": step_operator, "telegram": step_telegram,
          "knowledge": step_knowledge,
          "playground": step_playground}
 
@@ -653,10 +764,12 @@ if __name__ == "__main__":
         die(__doc__)
     cmd = sys.argv[1]
     if cmd == "all":
-        for s in ("chatwoot", "agents", "vault", "agent", "connect", "tickets", "stt", "vision"):
+        for s in ("chatwoot", "agents", "vault", "agent", "connect", "tickets", "stt", "vision", "operator"):
             print(f"== {s}"); STEPS[s]()
     elif cmd == "bind":
         step_bind(sys.argv[2])
+    elif cmd == "testers":
+        step_testers(sys.argv[2:] or die("usage: testers all | <contact_id>..."))
     elif cmd in STEPS:
         STEPS[cmd]()
     else:

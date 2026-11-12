@@ -162,6 +162,26 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Telegram inbox: long polling -> Chatwoot's own webhook route (Telegram only calls public HTTPS webhooks and
+  # the VM has none). Off until a BotFather token is in stack/.env: `docker compose --profile telegram up -d`.
+  tg-bridge:
+    image: python:3.13-alpine@sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e
+    profiles: [telegram]
+    command: [python3, -I, -u, /app/bridge.py]
+    networks: [default]
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?put the BotFather token into stack/.env}
+      CHATWOOT_URL: http://cw-rails:3000
+    volumes:
+      - ./tg-bridge/bridge.py:/app/bridge.py:ro
+    read_only: true
+    user: "65534:65534"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    depends_on: [cw-rails]
+    restart: unless-stopped
+
   # Local speech-to-text (faster-whisper, model baked in at build). Voice notes stay inside the VM.
   stt:
     build:
