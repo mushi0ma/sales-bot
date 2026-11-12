@@ -12,6 +12,7 @@ Cases:
   greeting   "Здравствуйте!"                   -> Russian text reply
   ticket     domofon + full address            -> must call create_ticket
   noaddress  "Не работает лифт"                -> must NOT call create_ticket, must not promise a master/ticket
+  reading    typed cold-water reading + address -> must call submit_meter_reading
 """
 import argparse, json, pathlib, re, sys, time, urllib.error, urllib.request
 
@@ -30,7 +31,17 @@ TOOLS = [{"type": "function", "function": {
                                                     "cleaning", "other"]},
             "urgency": {"type": "string", "enum": ["emergency", "normal"]},
             "address": {"type": "string"}, "apartment": {"type": "string"}, "description": {"type": "string"}},
-            "required": ["category", "urgency", "address", "description"]}}}]
+            "required": ["category", "urgency", "address", "description"]}}},
+    {"type": "function", "function": {
+        "name": "submit_meter_reading",
+        "description": "Передаёт показания одного счётчика и возвращает номер приёма. Вызывай, когда известны тип "
+                       "счётчика, показание и адрес. Цифры с фото сначала подтверди у жильца.",
+        "parameters": {"type": "object", "properties": {
+            "meter_type": {"type": "string", "enum": ["cold_water", "hot_water", "electricity", "electricity_day",
+                                                      "electricity_night", "gas", "heat"]},
+            "value": {"type": "string"}, "serial": {"type": "string"},
+            "address": {"type": "string"}, "apartment": {"type": "string"}},
+            "required": ["meter_type", "value", "address"]}}}]
 PROMISE = re.compile(r"передам мастер|заявк\w* (создан|принят|оформлен)|мастер (придёт|приедет|свяжется)", re.I)
 MONEY = re.compile(r"\d[\d\s.,]*\s*(₽|руб|р\.|rub|тыс)|\b\d{3,}\b", re.I)
 CYR = re.compile(r"[а-яё]", re.I)
@@ -43,6 +54,7 @@ CASES = [
     ("greeting", "Здравствуйте!", dict(russian=True)),
     ("ticket", "Не работает домофон, ул. Абая 12, кв 45", dict(tool="create_ticket")),
     ("noaddress", "Не работает лифт", dict(no_tool="create_ticket", no_promise=True)),
+    ("reading", "Показания холодной воды 123,456, ул. Абая 12, кв 45", dict(tool="submit_meter_reading")),
 ]
 
 

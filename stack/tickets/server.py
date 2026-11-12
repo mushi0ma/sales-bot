@@ -8,13 +8,16 @@ HTTP (internal docker network only, Bearer TICKETS_API_TOKEN on every /v1 route)
   POST  /v1/tickets                 create (dedupes an open ticket: same conversation, category, address)
   GET   /v1/tickets?phone=&contact_id=   the caller's latest tickets (both come from conversation context)
   PATCH /v1/tickets/<number>        operator: {"status": new|in_progress|done|cancelled}
+  POST  /v1/readings                meter reading (409 when lower than the previous one of the same meter)
   GET   /healthz                    no auth
 CLI (operator, inside the container):
   python3 -I /app/server.py list [N]
   python3 -I /app/server.py set-status <number> <status>
+  python3 -I /app/server.py readings [N]
 Logs carry method, path and status only, never bodies (they hold addresses and phones).
 """
 import hmac, json, os, re, sqlite3, sys, threading
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -44,6 +47,15 @@ OPEN = ("new", "in_progress")
 SLA = {
     "emergency": "аварийная бригада выезжает в течение 2 часов",
     "normal": "мастер свяжется с вами в течение 1 рабочего дня",
+}
+METERS = {
+    "cold_water": ("ХВС (холодная вода)", "м³"),
+    "hot_water": ("ГВС (горячая вода)", "м³"),
+    "electricity": ("Электроэнергия", "кВт·ч"),
+    "electricity_day": ("Электроэнергия, день (T1)", "кВт·ч"),
+    "electricity_night": ("Электроэнергия, ночь (T2)", "кВт·ч"),
+    "gas": ("Газ", "м³"),
+    "heat": ("Тепло", "Гкал"),
 }
 DIGITS = re.compile(r"^\d{1,20}$")
 _lock = threading.Lock()
@@ -79,6 +91,20 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS t_phone ON tickets(contact_phone)")
         c.execute("CREATE INDEX IF NOT EXISTS t_conv ON tickets(conversation_id)")
         c.execute("CREATE INDEX IF NOT EXISTS t_contact ON tickets(contact_id)")
+        c.execute("""CREATE TABLE IF NOT EXISTS readings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            number TEXT UNIQUE,
+            created_at TEXT NOT NULL,
+            meter_type TEXT NOT NULL,
+            value TEXT NOT NULL,
+            serial TEXT NOT NULL,
+            address TEXT NOT NULL,
+            apartment TEXT NOT NULL,
+            conversation_id TEXT,
+            contact_phone TEXT,
+            contact_id TEXT,
+            contact_name TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS r_meter ON readings(meter_type, address, apartment, serial)")
 
 
 def now():
@@ -167,6 +193,64 @@ def create(body):
     return 201, view(row)
 
 
+def parse_value(raw):
+    v = str(raw if raw is not None else "").strip().replace(" ", "").replace(",", ".")
+    try:
+        d = Decimal(v)
+    except InvalidOperation:
+        raise ValueError("value must be a number, e.g. 123.456")
+    if not d.is_finite() or d < 0 or d >= Decimal(10) ** 9:
+        raise ValueError("value must be between 0 and 999999999")
+    return d.normalize() if d != d.to_integral() else d.quantize(Decimal(1))
+
+
+def submit_reading(body):
+    meter = str(body.get("meter_type", "")).strip().lower()
+    if meter not in METERS:
+        raise ValueError(f"meter_type must be one of {sorted(METERS)}")
+    value = parse_value(body.get("value"))
+    serial = text_field(body, "serial", 1, 32, required=False)
+    address = text_field(body, "address", 3, 200)
+    apartment = text_field(body, "apartment", 1, 20, required=False)
+    conv = str(body.get("conversation_id") or "").strip()
+    conv = conv if DIGITS.match(conv) else ""
+    phone = text_field(body, "contact_phone", 3, 32, required=False)
+    contact = str(body.get("contact_id") or "").strip()
+    contact = contact if DIGITS.match(contact) else ""
+    name = text_field(body, "contact_name", 1, 120, required=False)
+    title, unit = METERS[meter]
+    t = now()
+    with _lock, db() as c:
+        # The same meter: type + address/apartment (+ serial when both readings carry one).
+        prev = None
+        for r in c.execute("SELECT * FROM readings WHERE meter_type=? ORDER BY id DESC", (meter,)).fetchall():
+            if norm(r["address"]) != norm(address) or norm(r["apartment"]) != norm(apartment):
+                continue
+            if serial and r["serial"] and norm(r["serial"]) != norm(serial):
+                continue
+            prev = r
+            break
+        out = {"meter": title, "unit": unit, "value": str(value), "serial": serial,
+               "previous_value": prev["value"] if prev else "", "consumption": ""}
+        if prev:
+            pv = Decimal(prev["value"])
+            if value < pv:
+                return 409, dict(out, accepted=False, error=(
+                    f"показание {value} меньше предыдущего {pv} {unit}: попроси жильца перепроверить цифры"))
+            if value == pv and prev["created_at"] >= (t - timedelta(hours=24)).isoformat():
+                return 200, dict(out, accepted=True, duplicate=True, number=prev["number"],
+                                 accepted_at=prev["created_at"])
+            out["consumption"] = str(value - pv)
+        cur = c.execute(
+            "INSERT INTO readings (created_at, meter_type, value, serial, address, apartment, conversation_id, "
+            "contact_phone, contact_id, contact_name) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (t.isoformat(), meter, str(value), serial, address, apartment, conv or None, phone or None,
+             contact or None, name or None))
+        number = f"П-{t.year}-{cur.lastrowid:05d}"
+        c.execute("UPDATE readings SET number=? WHERE id=?", (number, cur.lastrowid))
+    return 201, dict(out, accepted=True, duplicate=False, number=number, accepted_at=t.isoformat())
+
+
 def list_mine(phone, contact):
     phone = (phone or "").strip()
     contact = (contact or "").strip()
@@ -237,6 +321,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authed():
             return
         try:
+            if method == "POST" and u.path == "/v1/readings":
+                return self.send(*submit_reading(self.body()))
             if method == "POST" and u.path == "/v1/tickets":
                 return self.send(*create(self.body()))
             if method == "GET" and u.path == "/v1/tickets":
@@ -270,6 +356,13 @@ def cli(argv):
         for r in rows:
             print(f"{r['number']}  {r['status']:11} {r['urgency']:9} {CATEGORIES[r['category']]:26} "
                   f"{r['address']}, кв. {r['apartment'] or '-'} | {r['description'][:60]} | conv={r['conversation_id']}")
+    elif argv[0] == "readings":
+        with db() as c:
+            rows = c.execute("SELECT * FROM readings ORDER BY id DESC LIMIT ?",
+                             (int(argv[1]) if len(argv) > 1 else 20,)).fetchall()
+        for r in rows:
+            print(f"{r['number']}  {METERS[r['meter_type']][0]:28} {r['value']:>12} {METERS[r['meter_type']][1]:6} "
+                  f"№{r['serial'] or '-':10} {r['address']}, кв. {r['apartment'] or '-'} | conv={r['conversation_id']}")
     elif argv[0] == "set-status" and len(argv) == 3:
         code, out = set_status(argv[1], argv[2])
         print(code, json.dumps(out, ensure_ascii=False))

@@ -8,11 +8,12 @@ Steps (idempotent where possible; secrets go to ~/secrets/*.env with mode 600 an
   agent      create/update the "ЖКХ ассистент" agent (OpenRouter model, system prompt, test mode)
   connect    connect agents to Chatwoot (private docker network) and select the account
   stt        local speech-to-text (whisper in the VM) for voice notes: vault entry + agent stt settings
+  vision     image/document reading for incoming photos (OpenRouter free VL model, Russian extraction prompt)
   tickets    ticket HTTP tools (create_ticket, get_my_tickets) on the mock dispatcher + least-privilege grants
   bind INBOX_ID   bind a Chatwoot inbox (mirror id from `inboxes`) to the agent
   inboxes    list inboxes known to agents
   playground smoke test of the agent through the playground (no WhatsApp)
-  all        chatwoot agents vault agent connect tickets stt
+  all        chatwoot agents vault agent connect tickets stt vision
 """
 import json, os, pathlib, re, secrets, string, subprocess, sys, urllib.error, urllib.request
 
@@ -258,6 +259,28 @@ def step_stt():
     print(f"  agent: stt -> {stt['provider']} {stt['model']} lang=ru")
 
 
+VISION_MODEL = os.environ.get("VISION_MODEL", "nvidia/nemotron-3.5-super-vl:free")
+VISION_PROMPT = (
+    "Опиши объективно содержимое изображения или документа от жильца многоквартирного дома. "
+    "Перепиши весь видимый текст и цифры дословно. Если это счётчик — тип (вода холодная/горячая, электричество, газ, "
+    "тепло), все цифры показаний как на табло (с разделителем, если он виден) и заводской номер. "
+    "Если это неисправность или повреждение — что именно видно и где (труба, потолок, щиток, лифт, домофон). "
+    "Если это квитанция или документ — его вид и все суммы, даты и реквизиты как написано. "
+    "Не додумывай то, чего не видно; неразборчивое отметь как «неразборчиво». Отвечай только по-русски, без комментариев.")
+
+
+def step_vision():
+    a = Agents().login()
+    ag = find_agent(a) or die("agent missing; run 'agent'")
+    v = find_vault(a) or die("OpenRouter vault entry missing; run 'vault'")
+    vision = {"enabled": True, "provider": "openrouter", "model": VISION_MODEL,
+              "credentialRef": f"vault:{v['id']}", "extractionPrompt": VISION_PROMPT}
+    st, r = a.req("PATCH", f"/v1/agents/{ag['id']}", {"settings": merged_settings(a, ag["id"], {"vision": vision})})
+    if st >= 300:
+        die(f"agent vision settings failed: {st} {str(r)[:400]}")
+    print(f"  agent: vision -> openrouter {VISION_MODEL}")
+
+
 def step_agent():
     a = Agents().login()
     v = find_vault(a) or die("vault entry missing; run 'vault'")
@@ -358,6 +381,46 @@ TICKET_TOOLS = [
         "query": {"phone": "{{contact_phone}}", "contact_id": "{{contact_id}}"},
     },
 ]
+
+
+TICKET_TOOLS.append({
+    "name": "submit_meter_reading",
+    "label": "Передать показания счётчика",
+    "description": (
+        "Передаёт показания одного счётчика в диспетчерскую и возвращает номер приёма (number), предыдущее показание "
+        "и расход. Вызывай только когда известны тип счётчика, показание и адрес (улица и дом), а квартиру — если "
+        "жилец её назвал. Если цифры прочитаны с фото, сначала назови их жильцу и дождись подтверждения. Принятыми "
+        "показания считаются ТОЛЬКО при accepted=true в ответе; номер приёма называй из ответа. HTTP 409 значит, что "
+        "показание меньше предыдущего: попроси жильца перепроверить цифры, не передавай повторно без исправления. "
+        "HTTP 400 — исправь аргументы и повтори один раз; другая ошибка — передай оператору (handoff_to_human)."),
+    "method": "POST",
+    "urlTemplate": "http://tickets:8080/v1/readings",
+    "allowedHosts": ["tickets"],
+    "expectedStatuses": [409],
+    "inputSchema": {
+        "meter_type": {"type": "enum", "required": True,
+                       "enumValues": ["cold_water", "hot_water", "electricity", "electricity_day",
+                                      "electricity_night", "gas", "heat"],
+                       "description": "cold_water=ХВС, hot_water=ГВС, electricity=свет (однотарифный), "
+                                      "electricity_day/electricity_night=день/ночь, gas=газ, heat=тепло"},
+        "value": {"type": "string", "required": True,
+                  "description": "Показание как на табло, строкой, например \"123,456\""},
+        "serial": {"type": "string", "description": "Заводской номер счётчика, если жилец его назвал или он виден"},
+        "address": {"type": "string", "required": True, "description": "Улица и номер дома"},
+        "apartment": {"type": "string", "description": "Номер квартиры строкой, если есть"},
+    },
+    "body": {"mode": "kv", "rows": [
+        {"key": "meter_type", "value": "{{meter_type}}"},
+        {"key": "value", "value": "{{value}}"},
+        {"key": "serial", "value": "{{serial}}"},
+        {"key": "address", "value": "{{address}}"},
+        {"key": "apartment", "value": "{{apartment}}"},
+        {"key": "conversation_id", "value": "{{conversation_id}}"},
+        {"key": "contact_phone", "value": "{{contact_phone}}"},
+        {"key": "contact_id", "value": "{{contact_id}}"},
+        {"key": "contact_name", "value": "{{contact_name}}"},
+    ]},
+})
 
 
 def stack_env(name):
@@ -474,7 +537,7 @@ def step_playground():
 
 
 STEPS = {"chatwoot": step_chatwoot, "agents": step_agents, "vault": step_vault, "agent": step_agent,
-         "connect": step_connect, "tickets": step_tickets, "stt": step_stt, "inboxes": step_inboxes,
+         "connect": step_connect, "tickets": step_tickets, "stt": step_stt, "vision": step_vision, "inboxes": step_inboxes,
          "playground": step_playground}
 
 if __name__ == "__main__":
@@ -482,7 +545,7 @@ if __name__ == "__main__":
         die(__doc__)
     cmd = sys.argv[1]
     if cmd == "all":
-        for s in ("chatwoot", "agents", "vault", "agent", "connect", "tickets", "stt"):
+        for s in ("chatwoot", "agents", "vault", "agent", "connect", "tickets", "stt", "vision"):
             print(f"== {s}"); STEPS[s]()
     elif cmd == "bind":
         step_bind(sys.argv[2])
