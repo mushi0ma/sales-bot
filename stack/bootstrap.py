@@ -7,11 +7,12 @@ Steps (idempotent where possible; secrets go to ~/secrets/*.env with mode 600 an
   vault      store the OpenRouter key (from ~/secrets/openrouter.env) in the agents vault
   agent      create/update the "ЖКХ ассистент" agent (OpenRouter model, system prompt, test mode)
   connect    connect agents to Chatwoot (private docker network) and select the account
+  stt        local speech-to-text (whisper in the VM) for voice notes: vault entry + agent stt settings
   tickets    ticket HTTP tools (create_ticket, get_my_tickets) on the mock dispatcher + least-privilege grants
   bind INBOX_ID   bind a Chatwoot inbox (mirror id from `inboxes`) to the agent
   inboxes    list inboxes known to agents
   playground smoke test of the agent through the playground (no WhatsApp)
-  all        chatwoot agents vault agent connect tickets
+  all        chatwoot agents vault agent connect tickets stt
 """
 import json, os, pathlib, re, secrets, string, subprocess, sys, urllib.error, urllib.request
 
@@ -214,6 +215,49 @@ def find_agent(a):
     return next((x for x in items if x.get("name") == AGENT_NAME), None)
 
 
+def merged_settings(a, agent_id, blocks):
+    st, cur = a.req("GET", f"/v1/agents/{agent_id}")
+    if st != 200:
+        die(f"agent read failed: {st} {str(cur)[:300]}")
+    settings = dict(((cur or {}).get("agent") or cur or {}).get("settings") or {})
+    settings.update(blocks)
+    return settings
+
+
+STT_VAULT = "STT (local whisper)"
+STT_BASE = "http://stt:8000/v1"
+STT_MODEL = os.environ.get("STT_MODEL_ID", "whisper-large-v3-turbo")
+
+
+def step_stt():
+    a = Agents().login()
+    ag = find_agent(a) or die("agent missing; run 'agent'")
+    token = stack_env("STT_API_TOKEN") or die("no STT_API_TOKEN in stack/.env; run ./gen-env.sh")
+    st, b = a.req("GET", "/v1/vault")
+    v = next((x for x in as_list(b) if x.get("name") == STT_VAULT), None)
+    if v:
+        st, r = a.req("PUT", f"/v1/vault/{v['id']}", {"value": token, "baseUrl": STT_BASE})
+        if st >= 300:
+            die(f"stt vault update failed: {st} {str(r)[:300]}")
+        print(f"  vault: '{STT_VAULT}' refreshed from stack/.env")
+    else:
+        st, v = a.req("POST", "/v1/vault", {"name": STT_VAULT, "kind": "openai_compatible", "value": token,
+                                            "baseUrl": STT_BASE})
+        if st not in (200, 201):
+            die(f"stt vault create failed: {st} {str(v)[:300]}")
+        v = v.get("entry", v)
+        print(f"  vault: '{STT_VAULT}' stored (kind=openai_compatible, {STT_BASE})")
+    # NOTE: no /v1/vault/test here: that probe runs behind the SSRF guard and always answers blocked_url for
+    # an internal host, while the STT call itself does not go through the guard. The real end-to-end check is
+    # POST /v1/agents/:id/playground/audio/transcribe (see docs/SETUP.md).
+    stt = {"enabled": True, "provider": "openai-compatible", "model": STT_MODEL, "language": "ru",
+           "credentialRef": f"vault:{v['id']}"}
+    st, r = a.req("PATCH", f"/v1/agents/{ag['id']}", {"settings": merged_settings(a, ag["id"], {"stt": stt})})
+    if st >= 300:
+        die(f"agent stt settings failed: {st} {str(r)[:400]}")
+    print(f"  agent: stt -> {stt['provider']} {stt['model']} lang=ru")
+
+
 def step_agent():
     a = Agents().login()
     v = find_vault(a) or die("vault entry missing; run 'vault'")
@@ -235,6 +279,8 @@ def step_agent():
     }
     cur = find_agent(a)
     if cur:
+        # PATCH refuses a settings bag that drops configured blocks (stt, ...): overlay ours on what is stored.
+        body["settings"] = merged_settings(a, cur["id"], body["settings"])
         st, b = a.req("PATCH", f"/v1/agents/{cur['id']}", body)
         print(f"  agent: updated id={cur['id']} HTTP {st} {'' if st < 300 else str(b)[:300]}")
     else:
@@ -428,7 +474,7 @@ def step_playground():
 
 
 STEPS = {"chatwoot": step_chatwoot, "agents": step_agents, "vault": step_vault, "agent": step_agent,
-         "connect": step_connect, "tickets": step_tickets, "inboxes": step_inboxes,
+         "connect": step_connect, "tickets": step_tickets, "stt": step_stt, "inboxes": step_inboxes,
          "playground": step_playground}
 
 if __name__ == "__main__":
@@ -436,7 +482,7 @@ if __name__ == "__main__":
         die(__doc__)
     cmd = sys.argv[1]
     if cmd == "all":
-        for s in ("chatwoot", "agents", "vault", "agent", "connect", "tickets"):
+        for s in ("chatwoot", "agents", "vault", "agent", "connect", "tickets", "stt"):
             print(f"== {s}"); STEPS[s]()
     elif cmd == "bind":
         step_bind(sys.argv[2])

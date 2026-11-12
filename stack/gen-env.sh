@@ -11,6 +11,7 @@ if [[ -e .env ]]; then
   added=0
   [[ -n "$(tail -c1 .env)" ]] && echo >> .env  # a hand-edited .env without a final newline
   grep -q '^TICKETS_API_TOKEN=' .env || { echo "TICKETS_API_TOKEN=$(s 32)" >> .env; added=$((added+1)); }
+  grep -q '^STT_API_TOKEN=' .env || { echo "STT_API_TOKEN=$(s 32)" >> .env; added=$((added+1)); }
   echo ".env exists; not rotating. Added $added missing variable(s)."; exit 0
 fi
 CW_PG=$(s 24); AG_PG=$(s 24); AG_APP=$(s 24)
@@ -28,6 +29,8 @@ MCP_JWT_SECRET=$(s 32)
 ENCRYPTION_KEY=$(s 32)
 # mock dispatcher (ticket HTTP tools)
 TICKETS_API_TOKEN=$(s 32)
+# local speech-to-text
+STT_API_TOKEN=$(s 32)
 EOF
 chmod 600 .env
 echo "wrote $(pwd)/.env (mode 600), $(grep -c '=' .env) variables"

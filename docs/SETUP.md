@@ -188,13 +188,36 @@ kind `bearer_token`). В agents он разрешён через `SSRF_INTERNAL_
   `… set-status 2026-00001 in_progress|done|cancelled`.
 - В playground нет телефона и `conversation_id`: `get_my_tickets` честно отвечает «телефон неизвестен».
 
+## Голосовые (локальный STT)
+
+Голосовые распознаёт сервис `stt` в ВМ: `stack/stt/` (faster-whisper 1.2.1, модель `large-v3-turbo` int8,
+скачивается **при сборке** образа и вшивается в него; в работе `HF_HUB_OFFLINE=1`). Голос жильцов не покидает ВМ,
+денег не стоит. Отвечает в формате OpenAI `/v1/audio/transcriptions`, в agents подключён как провайдер
+`openai-compatible` (vault «STT (local whisper)», `baseUrl http://stt:8000/v1`, Bearer `STT_API_TOKEN` из `stack/.env`).
+
+- Скорость: ~0,75× реального времени на 4 vCPU (7 с аудио → ~5 с). Таймаут STT в agents — 60 с, значит голосовые
+  длиннее ~75 с не распознаются (бот получит пометку «аудио не разобрано»). Модель `small` в 4 раза быстрее,
+  но заметно хуже по-русски: `WHISPER_MODEL=small docker compose build stt` + `STT_MODEL_ID=whisper-small`.
+- Память: ~1,8 ГБ (`mem_limit: 2560m`). Образ 3,9 ГБ.
+- `av==18.1.0` закреплён: в av 19 убран аргумент `metadata_errors`, который передаёт faster-whisper 1.2.1.
+- Вложения agents скачивает сам: `data_url` от `localhost:3000` переписывается на `cw-rails:3000`
+  (`attachmentFetchTarget`, потому что `cw-rails:3000` объявлен в `SSRF_INTERNAL_TARGETS`).
+- `/v1/vault/test` для этой записи всегда отвечает `blocked_url` (проба идёт через SSRF-guard) — это норма.
+  Проверка целиком: `POST /api/v1/agents/1/playground/audio/transcribe` (multipart `file`).
+- Настройка: `./gen-env.sh`, `docker compose build stt && docker compose up -d stt`, `python3 -I bootstrap.py stt`.
+
+**Внутренняя сеть `internal` (`internal: true`, без выхода в интернет):** в ней `stt` и `tickets`; `agents`
+подключён к обеим сетям. Причина: внутри faster-whisper есть onnxruntime с кодом телеметрии Microsoft
+(в логе `telemetry_1ds`), а этим двум сервисам интернет не нужен. Проверено: из `stt` наружу — `URLError`,
+из `agents` доступны `stt`, `tickets`, `cw-rails` и OpenRouter.
+
 ## Открытые задачи
 - [ ] Телефоны аварийных служб — в базу знаний. Сейчас бот номер АДС не знает, а газовую службу 104 называет «по памяти»
       (номер верный для РФ/РК, но это знание не из инструмента). При запахе газа handoff происходит только после адреса.
 - [ ] Аварийная заявка: модель передаёт оператору, но не всегда называет жильцу номер заявки.
 
-- [ ] **Медиа (голосовые/изображения) во входящих**: URL вложений строится от `FRONTEND_URL=http://localhost:3000`,
-      который внутри контейнера agents указывает в никуда → STT/vision не получат файл. Варианты: общий
-      hostname для браузера и контейнеров (`*.localhost` + алиас в docker-сети) или прокси. Сначала текстовый сценарий.
+- [ ] Проверить голосовое из WhatsApp вживую (STT проверен через playground).
+- [ ] Изображения во входящих: файл agents скачает (см. «Голосовые»), но нужна vision-модель — основная
+      `nemotron-3-ultra` только текстовая; бесплатная `nvidia/nemotron-3.5-super-vl:free` есть, не настроена.
 - [ ] База знаний (RAG): бесплатные эмбеддинги у OpenRouter есть (`nvidia/nemotron-3.5-embed-8b:free` и др.), не настроено.
 - [ ] Dev-режим Chatwoot с горячей перезагрузкой для правок админ-панели (сейчас — полная пересборка образа).
