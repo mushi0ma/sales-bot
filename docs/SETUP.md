@@ -45,6 +45,43 @@ infra/vm.sh create
 infra/vm.sh start && infra/vm.sh wait
 ```
 
+## Стек: сборка, запуск, первичная настройка
+
+```sh
+infra/sync.sh                                   # код хоста -> ВМ (~/work)
+infra/vm.sh ssh 'cd work/stack && ./gen-env.sh' # один раз: секреты стека -> stack/.env (600) в ВМ
+# ключ OpenRouter -> ВМ файлом (stdin, не argv, не печатается):
+grep '^OPENROUTER_API_KEY=' .env | infra/vm.sh ssh 'umask 077; mkdir -p ~/secrets; cat > ~/secrets/openrouter.env'
+infra/vm.sh ssh 'cd work/stack && docker compose build cw-rails && docker compose build agents'  # ~17 мин
+infra/vm.sh ssh 'cd work/stack && docker compose up -d'
+infra/vm.sh ssh 'cd work/stack && python3 -I bootstrap.py all'          # Chatwoot admin, agents /setup, vault, агент, связка
+infra/vm.sh ssh 'cd work/stack && python3 -I bootstrap.py playground'   # smoke-test без WhatsApp
+```
+
+`bootstrap.py` пишет учётные данные только в ВМ: `~/secrets/chatwoot-admin.env`, `~/secrets/agents-admin.env` (600).
+Посмотреть пароль — в своём терминале (не в чате с ИИ): `infra/vm.sh ssh cat secrets/chatwoot-admin.env`.
+
+| Сервис | Адрес (после `infra/vm.sh tunnel`) | Health-check |
+|---|---|---|
+| Chatwoot (форк) | http://localhost:3000 | `curl -s localhost:3000/api` → 200 |
+| agents (консоль, playground) | http://localhost:3100 | `curl -s localhost:3100/api/health` → `status: ok` |
+| Postgres ×2, Redis | только внутри docker-сети ВМ | `docker compose ps` → healthy |
+
+Ежедневно: `infra/vm.sh start` → `infra/vm.sh tunnel` (держать открытым) … `infra/vm.sh stop`.
+Стек поднимается сам (`restart: unless-stopped`). Логи: `infra/vm.sh ssh 'cd work/stack && docker compose logs -f agents'`.
+
+Агент создаётся в `mode: test`: **молчит в любом диалоге, пока в нём не написать `/teste`** (защита от ответов
+реальным людям, пишущим на тестовый номер). `/reset` сбрасывает память диалога.
+
+### Снапшоты
+
+| Снапшот | Состояние |
+|---|---|
+| `base-clean` | чистая ВМ после cloud-init, без секретов и стека |
+| `stack-ready` | стек собран и настроен, секреты внутри, **WhatsApp не сопряжён** |
+
+`infra/vm.sh stop && infra/vm.sh revert <имя> && infra/vm.sh start`. После сопряжения — см. политику ниже.
+
 ## Сеть и изоляция
 
 - `passt --no-map-gw --ipv4-only`: гость **не** видит loopback хоста; IPv6 выключен.
@@ -65,7 +102,11 @@ infra/vm.sh start && infra/vm.sh wait
 - Библиотека: **whatsmeow** (`go.mau.fi/whatsmeow`), сервис `fazer-ai/whatsapp-connector` (Go, MIT). Не Baileys:
   Baileys/Z-API в форке помечены «замороженными» (legacy), `baileys-api` не используется.
 - Режим: встроенный (embedded) в контейнер `cw-sidekiq`; бинарник берётся из готового образа
-  `ghcr.io/fazer-ai/whatsapp-connector:0.9.0` при сборке Chatwoot (не из исходников).
+  `ghcr.io/fazer-ai/whatsapp-connector:0.9.0@sha256:995a580c61364141fae139e476f62d29f32f7d08a87aac3f236c85d0c90df1bc`
+  при сборке Chatwoot (не из исходников).
+- Подключение: Chatwoot → Settings → Inboxes → Add Inbox → WhatsApp → **WhatsApp (native)** → номер → QR
+  (или код сопряжения, если WhatsApp требует passkey и QR не проходит). Затем привязать inbox к агенту:
+  `python3 -I bootstrap.py inboxes` → `python3 -I bootstrap.py bind <id>`.
 - Сессия (связанное устройство, ключи Signal/Noise) хранится в Postgres Chatwoot, в отдельной БД
   `chatwoot_production_whatsapp_connector` (создаётся автоматически; пользователю БД нужен CREATEDB).
   Владелец сессии определяется арендой в Redis; события/команды ходят через Redis Streams.

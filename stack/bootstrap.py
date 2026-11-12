@@ -106,12 +106,15 @@ def step_chatwoot():
 class Agents:
     def __init__(self):
         self.cookie = None
+        self.tenant = None
 
     def req(self, method, path, body=None, ok=(200, 201, 204)):
         data = json.dumps(body).encode() if body is not None else None
         h = {"Content-Type": "application/json", "Accept": "application/json"}
         if self.cookie:
             h["Cookie"] = self.cookie
+        if self.tenant:
+            h["x-tenant-id"] = str(self.tenant)
         r = urllib.request.Request(AGENTS + path, data=data, method=method, headers=h)
         try:
             with urllib.request.urlopen(r, timeout=180) as resp:
@@ -141,6 +144,9 @@ class Agents:
         st, b = self.req("POST", "/auth/login", {"email": cred["AGENTS_ADMIN_EMAIL"], "password": cred["AGENTS_ADMIN_PASSWORD"]})
         if st != 200 or not self.cookie:
             die(f"agents login failed: {st} {str(b)[:200]}")
+        # The /setup admin is SUPER_ADMIN with no tenant of its own: target the tenant /setup created.
+        st, me = self.req("GET", "/auth/me")
+        self.tenant = (me or {}).get("defaultTenantId") or ((me or {}).get("user") or {}).get("tenantId")
         return self
 
 
@@ -169,9 +175,16 @@ def step_agents():
     print("  agents: first admin created")
 
 
+def as_list(b):
+    """List endpoints answer {instance, <name>: [...], ...}: take the first list in the payload."""
+    if isinstance(b, list):
+        return b
+    return next((v for v in (b or {}).values() if isinstance(v, list)), [])
+
+
 def find_vault(a):
     st, b = a.req("GET", "/v1/vault")
-    items = b if isinstance(b, list) else (b or {}).get("items") or (b or {}).get("data") or []
+    items = as_list(b)
     for it in items:
         if it.get("name") == VAULT_NAME:
             return it
@@ -196,7 +209,7 @@ def step_vault():
 
 def find_agent(a):
     st, b = a.req("GET", "/v1/agents")
-    items = b if isinstance(b, list) else (b or {}).get("items") or (b or {}).get("data") or []
+    items = as_list(b)
     return next((x for x in items if x.get("name") == AGENT_NAME), None)
 
 
@@ -236,7 +249,7 @@ def step_connect():
     st, b = a.req("GET", "/v1/chatwoot/deployment")
     body = {"baseUrl": "http://cw-rails:3000", "adminToken": cw["CW_API_TOKEN"],
             "webhookBaseUrl": "http://agents:3000", "publicUrl": "http://localhost:3000"}
-    if st == 200 and b:
+    if st == 200 and (b or {}).get("deployment"):
         st, b = a.req("PATCH", "/v1/chatwoot/deployment", body)
     else:
         st, b = a.req("POST", "/v1/chatwoot/deployment", body)

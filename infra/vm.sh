@@ -134,7 +134,7 @@ cmd_tunnel() { # forward web UIs to host loopback only; Ctrl-C to close
 need_stopped() { running && die "stop the VM first (infra/vm.sh stop)"; return 0; }
 cmd_snapshot() { need_stopped; qemu-img snapshot -c "${1:?name}" "$DISK"; echo "snapshot '$1' created"; }
 cmd_revert()   { need_stopped; qemu-img snapshot -a "${1:?name}" "$DISK"; echo "reverted to '$1'"; }
-cmd_snapshots(){ qemu-img snapshot -l "$DISK"; }
+cmd_snapshots(){ qemu-img snapshot -U -l "$DISK"; }  # -U: read-only listing works while the VM runs
 cmd_console()  { tail -n 50 -f "$RUN/console.log"; }
 
 case "${1:-}" in
