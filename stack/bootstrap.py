@@ -9,7 +9,7 @@ Steps (idempotent where possible; secrets go to ~/secrets/*.env with mode 600 an
   connect    connect agents to Chatwoot (private docker network) and select the account
   stt        local speech-to-text (whisper in the VM) for voice notes: vault entry + agent stt settings
   operator   Chatwoot: macro «🤖 Вернуть боту» + contact attribute «Тестировщик бота»
-  testers    testers all | <contact_id>...: tick «Тестировщик бота» (the bot answers only them)
+  testers    testers <contact_id>...: tick «Тестировщик бота» (the bot answers only them)
   telegram   Telegram inbox from TELEGRAM_BOT_TOKEN (stack/.env) + bind to the agent; needs the tg-bridge profile
   knowledge  RAG: OpenRouter embeddings + knowledge base from agent/knowledge.md, search smoke test
   vision     image/document reading for incoming photos (OpenRouter free VL model, Russian extraction prompt)
@@ -31,6 +31,8 @@ MODEL = os.environ.get("AGENT_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
 #   everyone no gate at all — refused while agent/knowledge.md still holds test placeholders.
 AGENT_MODE = os.environ.get("AGENT_MODE", "production")
 BOT_AUDIENCE = os.environ.get("BOT_AUDIENCE", "testers")
+if AGENT_MODE not in ("test", "production") or BOT_AUDIENCE not in ("testers", "everyone"):
+    sys.exit("AGENT_MODE must be test|production and BOT_AUDIENCE testers|everyone")
 TESTER_ATTR = "salesbot_tester"
 AGENT_NAME = "ЖКХ ассистент (тест)"
 VAULT_NAME = "OpenRouter"
@@ -342,13 +344,25 @@ def step_agent():
         # PATCH refuses a settings bag that drops configured blocks (stt, ...): overlay ours on what is stored.
         body["settings"] = merged_settings(a, cur["id"], body["settings"])
         st, b = a.req("PATCH", f"/v1/agents/{cur['id']}", body)
-        print(f"  agent: updated id={cur['id']} mode={AGENT_MODE} audience={BOT_AUDIENCE} HTTP {st} "
-              f"{'' if st < 300 else str(b)[:300]}")
+        if st >= 300:
+            die(f"agent update failed: {st} {str(b)[:300]}")
+        print(f"  agent: updated id={cur['id']} mode={AGENT_MODE} audience={BOT_AUDIENCE} HTTP {st}")
     else:
         st, b = a.req("POST", "/v1/agents", body)
         if st not in (200, 201):
             die(f"agent create failed: {st} {str(b)[:400]}")
-        print(f"  agent: created id={(b or {}).get('id')} model={MODEL} mode=test")
+        print(f"  agent: created id={(b or {}).get('id')} model={MODEL} mode={AGENT_MODE}")
+    check_gate(a)
+
+
+def check_gate(a):
+    """Read the agent back: with BOT_AUDIENCE=testers the contact gate MUST be on with our rule, or strangers'
+    messages reach the model."""
+    ag = one(a.req("GET", f"/v1/agents/{find_agent(a)['id']}")[1])
+    gate = (ag.get("settings") or {}).get("contactAuth") or {}
+    if BOT_AUDIENCE == "testers" and not (gate.get("enabled") is True and (gate.get("rule") or {}).get("key") == TESTER_ATTR):
+        die(f"contact gate is NOT active on the agent (stored: {json.dumps(gate, ensure_ascii=False)[:200]})")
+    print(f"  agent: mode={ag.get('mode')} gate={'testers only' if gate.get('enabled') else 'off'}")
 
 
 TICKETS_VAULT = "Tickets (test dispatcher)"
@@ -487,7 +501,7 @@ TICKET_TOOLS.append({
 def stack_env(name):
     for line in (STACK / ".env").read_text().splitlines():
         if line.startswith(name + "="):
-            return line.split("=", 1)[1].strip()
+            return line.split("=", 1)[1].strip().strip("'\"")  # compose strips quotes too
     return None
 
 
@@ -607,7 +621,13 @@ def step_knowledge():
             f"got kind={v.get('kind')} baseUrl={v.get('baseUrl')} — refusing (the key would go to api.openai.com)")
     print(f"  vault: '{EMBED_VAULT}' kind=openai_compatible baseUrl={OPENROUTER_BASE}")
     st, b = a.req("PUT", "/v1/tenant-settings/embedding", {"credentialRef": f"vault:{v['id']}"})
-    print(f"  embedding credential -> vault:{v['id']}: HTTP {st} {'' if st < 300 else str(b)[:300]}")
+    if st >= 300:
+        die(f"embedding settings failed: {st} {str(b)[:300]}")
+    st, ts = a.req("GET", "/v1/tenant-settings")
+    stored = ((ts or {}).get("settings") or ts or {}).get("embedding", {}).get("credentialRef")
+    if stored != f"vault:{v['id']}":
+        die(f"embedding credential is {stored!r}, expected vault:{v['id']} — refusing to index")
+    print(f"  embedding credential -> vault:{v['id']} (verified)")
     st, b = a.req("GET", "/v1/knowledge/bases")
     kb = next((k for k in as_list(b) if k.get("name") == KB_NAME), None)
     if not kb:
@@ -682,11 +702,10 @@ def step_operator():
 
 
 def step_testers(ids):
-    """Tick 'Тестировщик бота' on contacts: given ids, or `all` = every contact that exists now (test env: only the
-    owner's own numbers/accounts have written in). Prints ids only, never names or phones."""
-    if ids == ["all"]:
-        st, b = cw_api("GET", "/contacts?page=1")
-        ids = [str(c["id"]) for c in (b or {}).get("payload", [])]
+    """Tick 'Тестировщик бота' on the given contact ids (explicit only: a blanket "all" would also admit a stranger who
+    already wrote to the real SIM or the bot). Prints ids only, never names or phones."""
+    if not all(i.isdigit() for i in ids):
+        die("usage: testers <contact_id>...  (ids from Chatwoot → Contacts)")
     for cid in ids:
         st, r = cw_api("PATCH", f"/contacts/{cid}", {"custom_attributes": {TESTER_ATTR: True}})
         print(f"  contact {cid}: tester HTTP {st}")
@@ -769,7 +788,7 @@ if __name__ == "__main__":
     elif cmd == "bind":
         step_bind(sys.argv[2])
     elif cmd == "testers":
-        step_testers(sys.argv[2:] or die("usage: testers all | <contact_id>..."))
+        step_testers(sys.argv[2:] or die("usage: testers <contact_id>..."))
     elif cmd in STEPS:
         STEPS[cmd]()
     else:

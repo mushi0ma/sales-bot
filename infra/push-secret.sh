@@ -9,4 +9,4 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 line="$(grep -E "^${name}=" "$root/.env" | tail -1 || true)"
 [[ -n "${line#*=}" ]] || { echo "$name is not set in ./.env" >&2; exit 1; }
 printf '%s\n' "$line" | "$root/infra/vm.sh" ssh -o BatchMode=yes \
-  "f=~/work/stack/.env; umask 077; touch \$f; grep -v '^${name}=' \$f > \$f.new || true; cat >> \$f.new; mv \$f.new \$f; chmod 600 \$f; echo '${name} -> VM stack/.env'"
+  "f=~/work/stack/.env; umask 077; touch \$f; { grep -v '^${name}=' \$f | sed -e '\$a\\' || true; cat; } > \$f.new; mv \$f.new \$f; chmod 600 \$f; echo '${name} -> VM stack/.env'"

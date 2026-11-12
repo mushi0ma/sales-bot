@@ -79,9 +79,12 @@ infra/vm.sh ssh 'cd work/stack && python3 -I bootstrap.py playground'   # smoke-
 agents `contactAuth`, отказ без копии и без handoff): номер WhatsApp — настоящая SIM, Telegram-бота может найти кто
 угодно, а данные в стеке только тестовые.
 - Добавить тестировщика: Chatwoot → контакт → «Атрибуты контакта» → «Тестировщик бота» ✓, или
-  `python3 -I bootstrap.py testers <contact_id>` (`testers all` — все текущие контакты).
+  `python3 -I bootstrap.py testers <contact_id>...` (только явные id: «всем сразу» впустило бы и постороннего).
 - Вернуть режим «молчит до `/teste`»: `AGENT_MODE=test python3 -I bootstrap.py agent`.
-- Открыть всем: `BOT_AUDIENCE=everyone` — bootstrap откажется, пока в `knowledge.md` тестовые заглушки.
+- Открыть всем: `BOT_AUDIENCE=everyone` — bootstrap откажется, пока в `knowledge.md` тестовые заглушки. Любое
+  другое значение (опечатка) — отказ; после записи bootstrap читает агента обратно и падает, если гейт не включён.
+- Оговорка: правило по атрибуту контакта надёжно, пока к агенту не привязан web-widget inbox (там посетитель сам
+  задаёт атрибуты через SDK).
 - `/reset` в диалоге сбрасывает память бота.
 
 ### Оператор ↔ бот
@@ -277,7 +280,12 @@ Inbox Chatwoot «Telegram» на бота из @BotFather. Chatwoot для Teleg
 Telegram ходит только на публичный HTTPS — у ВМ его нет. Поэтому вебхук не ставится, а сервис `tg-bridge`
 (`stack/tg-bridge/bridge.py`, stdlib) опрашивает `getUpdates` и передаёт каждое обновление в собственный маршрут
 Chatwoot `POST http://cw-rails:3000/webhooks/telegram/<token>` внутри docker-сети. Ответы Chatwoot отправляет сам
-через `api.telegram.org`. Наружу ходит только в `api.telegram.org`; токен не логируется.
+через `api.telegram.org`. Мост наружу ходит только в `api.telegram.org` и токен не пишет в лог. Chatwoot писал бы
+токен из пути вебхука в лог запросов и в аргументы задания — это закрывает патч
+`stack/patches/chatwoot-telegram-token-logs.patch` (маска пути, `bot_token` в filter_parameters,
+`log_arguments = false`); после `git pull` в vendor/chatwoot: `stack/patches/apply.sh` и пересборка cw-rails.
+Обновление подтверждается Telegram только после ответа Chatwoot 2xx: перезапуск Chatwoot ничего не теряет, но
+таймаут после уже принятого обновления даст одно повторное сообщение.
 
 1. @BotFather → `/newbot` → токен. Записать на хосте в `./.env`: `TELEGRAM_BOT_TOKEN=…` (**не в чат**).
 2. `infra/push-secret.sh TELEGRAM_BOT_TOKEN` — переносит одну строку в `~/work/stack/.env` ВМ через stdin ssh.
@@ -304,5 +312,6 @@ Chatwoot `POST http://cw-rails:3000/webhooks/telegram/<token>` внутри dock
 - [ ] При запахе газа handoff происходит только после адреса (номера 104/112 бот теперь берёт из справочника).
 - [ ] Перепроверить фото из WhatsApp после `reasoningEffort: none` (до этого — таймаут). Голосовое — проверено.
 - [ ] Окно приёма показаний 20–25 инструмент не проверяет (бот может «принять» 3-го числа).
+- [ ] Upstream (fazer-ai/chatwoot): маска токена Telegram в логах (наш патч).
 - [ ] Upstream (fazer-ai/agents): issue/PR на `dimensions` и на молчаливый fallback эмбеддингов к api.openai.com.
 - [ ] Dev-режим Chatwoot с горячей перезагрузкой для правок админ-панели (сейчас — полная пересборка образа).

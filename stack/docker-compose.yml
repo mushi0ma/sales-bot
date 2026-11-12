@@ -170,7 +170,7 @@ services:
     command: [python3, -I, -u, /app/bridge.py]
     networks: [default]
     environment:
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?put the BotFather token into stack/.env}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}  # empty: the bridge exits with a message
       CHATWOOT_URL: http://cw-rails:3000
     volumes:
       - ./tg-bridge/bridge.py:/app/bridge.py:ro

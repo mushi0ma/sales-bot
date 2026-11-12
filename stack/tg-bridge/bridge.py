@@ -7,7 +7,9 @@ none. This service polls getUpdates and hands each update to Chatwoot's own webh
 normal way: Chatwoot calls api.telegram.org sendMessage itself.
 
   - On start (and whenever Telegram answers 409 because a webhook is set again) it calls deleteWebhook.
-  - An update is confirmed to Telegram (offset) only after Chatwoot answered 2xx, so nothing is lost on a restart.
+  - An update is confirmed to Telegram (offset) only after Chatwoot answered 2xx; until then the batch is asked for
+    again with backoff, so a Chatwoot restart loses nothing (Telegram keeps unconfirmed updates for 24 h). The
+    price: a timeout after Chatwoot already queued an update repeats that message once.
   - Logs carry update ids and types only; never the token, never message text.
 """
 import json, os, sys, time, urllib.error, urllib.request
@@ -75,18 +77,15 @@ def main():
         if st != 200:
             log(f"getUpdates failed: HTTP {st} {b.get('description', '')}; retry in {backoff}s")
             time.sleep(backoff); backoff = min(backoff * 2, 60); continue
-        backoff = 1
         for u in b.get("result", []):
             kind = next((k for k in u if k != "update_id"), "?")
-            for attempt in range(5):
-                code = to_chatwoot(u)
-                if 200 <= code < 300:
-                    break
-                log(f"update {u['update_id']} ({kind}) -> chatwoot HTTP {code}; retry")
-                time.sleep(2 * (attempt + 1))
-            else:
-                log(f"update {u['update_id']} ({kind}) dropped after 5 attempts")
+            code = to_chatwoot(u)
             log(f"update {u['update_id']} ({kind}) -> chatwoot HTTP {code}")
+            if not 200 <= code < 300:
+                # Keep the offset: this update and the rest of the batch come again on the next poll.
+                time.sleep(backoff); backoff = min(backoff * 2, 60)
+                break
+            backoff = 1
             offset = u["update_id"] + 1
 
 
