@@ -17,6 +17,9 @@ Cases:
   gas        smell of gas                      -> must give 104 or 112 (from the KB) in the first reply
   kbnear     a service NOT in the KB price list -> no price, handoff (no "similar service" quoting)
   kbhours    office hours (in the KB)           -> 18:00, no handoff
+  emergdone  emergency ticket already created (tool result in history) -> reply names 2026-00042, calls handoff
+every case: no "---" separators or "#" headers (agents sends each paragraph as its own WhatsApp message;
+            **bold** is fine — Chatwoot's WhatsApp renderer turns it into *bold*)
 """
 import argparse, json, pathlib, re, sys, time, urllib.error, urllib.request
 
@@ -65,7 +68,20 @@ CASES = [
     ("gas", "Пахнет газом в подъезде!", dict(must=r"\b104\b|\b112\b")),
     ("kbnear", "Сколько стоит заменить розетку?", dict(no_money=True, handoff=True)),
     ("kbhours", "До скольки работает офис УК в пятницу?", dict(must=r"18[:.]00", no_tool="handoff_to_human")),
+    ("emergdone", [
+        {"role": "user", "content": "Сильно пахнет газом в квартире! ул. Абая 12, кв 45"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {
+            "name": "create_ticket", "arguments": json.dumps({"category": "other", "urgency": "emergency",
+                "address": "ул. Абая 12", "apartment": "45", "description": "запах газа в квартире"},
+                ensure_ascii=False)}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": json.dumps({
+            "number": "2026-00042", "status": "new", "status_text": "принята", "urgency": "emergency",
+            "sla_text": "аварийная бригада выедет в течение 2 часов", "duplicate": False,
+            "next_step": "аварийная заявка: в ответе жильцу назови номер заявки 2026-00042 и номер "
+                         "аварийно-диспетчерской службы, затем вызови handoff_to_human"}, ensure_ascii=False)},
+    ], dict(must=r"2026-00042", handoff=True)),
 ]
+MARKDOWN = re.compile(r"^\s*(-{3,}|\*{3,}|_{3,})\s*$|^\s*#", re.M)
 
 
 def read_key(path):
@@ -78,8 +94,9 @@ def read_key(path):
 
 
 def ask(key, model, text):
-    body = {"model": model, "max_tokens": 400, "tools": TOOLS,
-            "messages": [{"role": "system", "content": PROMPT}, {"role": "user", "content": text}]}
+    history = text if isinstance(text, list) else [{"role": "user", "content": text}]
+    body = {"model": model, "max_tokens": 600, "tools": TOOLS,
+            "messages": [{"role": "system", "content": PROMPT}, *history]}
     req = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions", json.dumps(body).encode(),
                                  {"Authorization": "Bearer " + key, "Content-Type": "application/json"})
     for attempt in range(3):
@@ -121,6 +138,8 @@ def main():
                     errs.append(f"missing {exp['must']!r}")
                 if exp.get("no_promise") and PROMISE.search(content):
                     errs.append("promises a ticket/master without a tool result")
+                if MARKDOWN.search(content):
+                    errs.append("separator/header line (becomes its own WhatsApp message)")
                 if exp.get("russian") and not tools and not CYR.search(content):
                     errs.append("reply not in Russian")
             status = "PASS" if not errs else "FAIL: " + "; ".join(errs)

@@ -132,8 +132,8 @@ def view(r, duplicate=False):
         "sla_text": SLA[r["urgency"]] if r["status"] in OPEN else "",
         "duplicate": duplicate,
         # Instruction for the bot, not for the resident: an emergency always reaches a human too.
-        "next_step": ("аварийная заявка: попроси жильца позвонить в аварийно-диспетчерскую службу и вызови "
-                      "handoff_to_human") if r["urgency"] == "emergency" and r["status"] in OPEN else "",
+        "next_step": ("аварийная заявка: в ответе жильцу назови номер заявки " + r["number"] + " и номер "
+                      "аварийно-диспетчерской службы, затем вызови handoff_to_human") if r["urgency"] == "emergency" and r["status"] in OPEN else "",
     }
 
 
