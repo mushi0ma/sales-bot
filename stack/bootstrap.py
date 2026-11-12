@@ -741,6 +741,12 @@ def step_telegram():
     res = json.loads(m.group(1))
     print(f"  chatwoot: Telegram inbox {res['inbox_id']} for @{res['bot']} (created={res['created']})")
     a = Agents().login()
+    # agents mirrors inboxes on its own schedule; ask it to read Chatwoot's list now.
+    st, b = a.req("GET", "/v1/chatwoot/deployment")
+    inst = ((b or {}).get("deployment") or {}).get("instanceId") or ((b or {}).get("deployment") or {}).get("id")
+    if inst:
+        st, _ = a.req("POST", f"/v1/chatwoot/instances/{inst}/sync-inboxes")
+        print(f"  agents: sync-inboxes HTTP {st}")
     for _ in range(10):
         st, b = a.req("GET", "/v1/chatwoot/inboxes")
         mine = next((i for i in as_list(b) if str(i.get("chatwootInboxId")) == str(res["inbox_id"])), None)
