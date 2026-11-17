@@ -14,7 +14,9 @@ Steps (idempotent where possible; secrets go to ~/secrets/*.env with mode 600 an
   tg-userbot API inbox «Telegram (userbot)» for the tg-userbot service (a real account, plan v2 spike S2):
              writes CW_TGU_* (inbox identifier, webhook secret, account id, operator token) to stack/.env,
              binds the agent; operator user «Оператор (телефон Telegram)» = owner's phone messages
-  tg-outreach TG_USER_ID TEXT   first message from Chatwoot to a member of an allowed group (via tg-userbot)
+  tg-outreach TG_USER_ID TEXT   first message from Chatwoot to a member of an allowed group (via tg-userbot),
+             then the hand-back macro: the agent answers the resident's reply
+  return-to-bot CONV_ID   apply the hand-back macro to a Chatwoot conversation
   knowledge  RAG: OpenRouter embeddings + knowledge base from agent/knowledge.md, attached to the agent
              (search_knowledge), search smoke test
   vision     image/document reading for incoming photos (OpenRouter free VL model, Russian extraction prompt)
@@ -878,6 +880,27 @@ def step_tg_outreach(tg_user_id, text):
         step_testers([str(contact["id"])])
     st, m = cw_api("POST", f"/conversations/{conv}/messages", {"content": text, "message_type": "outgoing"})
     print(f"  contact {contact['id']}, conversation {conv}: message HTTP {st} (tg-userbot log shows the send)")
+    return_to_bot(conv)
+
+
+def return_to_bot(conv):
+    """The operator's hand-back macro: the agent answers the resident's reply, with the first message in memory.
+    A person's message makes the agent step aside (status open); wait for that, then hand back."""
+    for _ in range(20):
+        st, c = cw_api("GET", f"/conversations/{conv}")
+        if c.get("status") == "open":
+            break
+        time.sleep(1)
+    st, b = cw_api("GET", "/macros")
+    macros = b.get("payload", b) if isinstance(b, dict) else b
+    macro = next((x for x in macros or [] if x.get("name") == MACRO_NAME), None) or die("run 'operator' first")
+    st, _ = cw_api("POST", f"/macros/{macro['id']}/execute", {"conversation_ids": [conv]})
+    for _ in range(10):
+        time.sleep(1)
+        st, c = cw_api("GET", f"/conversations/{conv}")
+        if c.get("status") == "pending":
+            break
+    print(f"  conversation {conv}: '{MACRO_NAME}' HTTP {st}, status {c.get('status')}")
 
 
 def step_playground():
@@ -919,6 +942,8 @@ if __name__ == "__main__":
     elif cmd == "tg-outreach":
         len(sys.argv) == 4 or die("usage: tg-outreach TG_USER_ID TEXT")
         step_tg_outreach(sys.argv[2], sys.argv[3])
+    elif cmd == "return-to-bot":
+        return_to_bot(int(sys.argv[2]))
     elif cmd == "testers":
         step_testers(sys.argv[2:] or die("usage: testers <contact_id>..."))
     elif cmd in STEPS:
