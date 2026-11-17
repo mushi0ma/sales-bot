@@ -12,7 +12,9 @@ Steps (idempotent where possible; secrets go to ~/secrets/*.env with mode 600 an
   testers    testers <contact_id>...: tick «Тестировщик бота» (the bot answers only them)
   telegram   Telegram inbox from TELEGRAM_BOT_TOKEN (stack/.env) + bind to the agent; needs the tg-bridge profile
   tg-userbot API inbox «Telegram (userbot)» for the tg-userbot service (a real account, plan v2 spike S2):
-             writes CW_TGU_INBOX_IDENTIFIER / CW_TGU_WEBHOOK_SECRET to stack/.env, binds the agent
+             writes CW_TGU_* (inbox identifier, webhook secret, account id, operator token) to stack/.env,
+             binds the agent; operator user «Оператор (телефон Telegram)» = owner's phone messages
+  tg-outreach TG_USER_ID TEXT   first message from Chatwoot to a member of an allowed group (via tg-userbot)
   knowledge  RAG: OpenRouter embeddings + knowledge base from agent/knowledge.md, attached to the agent
              (search_knowledge), search smoke test
   vision     image/document reading for incoming photos (OpenRouter free VL model, Russian extraction prompt)
@@ -806,6 +808,21 @@ def set_stack_env(values):
 
 
 TGU_INBOX = "Telegram (userbot)"
+TGU_OPERATOR_EMAIL = "tg-phone@salesbot.test"
+TGU_OPERATOR_RUBY = r'''
+require 'json'; require 'securerandom'
+acc = Account.find(ENV.fetch('CW_ACCOUNT_ID').to_i); inbox = acc.inboxes.find(ENV.fetch('TGU_INBOX_ID').to_i)
+u = User.find_by(email: ENV.fetch('TGU_EMAIL'))
+unless u
+  u = User.new(email: ENV.fetch('TGU_EMAIL'), name: 'Оператор (телефон Telegram)', password: SecureRandom.base64(24) + 'aA1!')
+  u.skip_confirmation!
+  u.save!
+end
+AccountUser.find_or_create_by!(account: acc, user: u) { |au| au.role = :agent }
+InboxMember.find_or_create_by!(inbox: inbox, user: u)
+token = u.access_token || u.create_access_token
+STDOUT.write('TGU_JSON:' + JSON.generate({ user_id: u.id, token: token.token }) + "\n")
+'''
 TGU_WEBHOOK = "http://tg-userbot:8080/chatwoot"
 
 
@@ -823,9 +840,44 @@ def step_tg_userbot():
         die(f"inbox {inbox['id']} webhook_url is not {TGU_WEBHOOK}; fix it in Chatwoot inbox settings")
     if not (full.get("inbox_identifier") and full.get("secret")):
         die("inbox API did not return inbox_identifier/secret (admin token required)")
-    set_stack_env({"CW_TGU_INBOX_IDENTIFIER": full["inbox_identifier"], "CW_TGU_WEBHOOK_SECRET": full["secret"]})
+    cw = read_env("chatwoot-admin.env")
+    # The owner's phone messages are mirrored as an operator's: a dedicated agent user with only this inbox.
+    env = dict(os.environ, CW_ACCOUNT_ID=cw["CW_ACCOUNT_ID"], TGU_INBOX_ID=str(inbox["id"]), TGU_EMAIL=TGU_OPERATOR_EMAIL)
+    r = subprocess.run(["docker", "compose", "exec", "-T", "-e", "CW_ACCOUNT_ID", "-e", "TGU_INBOX_ID", "-e", "TGU_EMAIL",
+                        "cw-rails", "sh", "-c", "umask 077; cat > /tmp/tgu.rb && bundle exec rails runner /tmp/tgu.rb; "
+                        "rc=$?; rm -f /tmp/tgu.rb; exit $rc"], cwd=STACK, input=TGU_OPERATOR_RUBY, capture_output=True,
+                       text=True, env=env)
+    m = re.search(r"^TGU_JSON:(.*)$", r.stdout, re.M)
+    if r.returncode != 0 or not m:
+        die("operator user failed (output withheld: it may hold a token); rerun the runner by hand to debug")
+    op = json.loads(m.group(1))
+    print(f"  chatwoot: operator user {op['user_id']} ({TGU_OPERATOR_EMAIL}), agent of inbox {inbox['id']} only")
+    set_stack_env({"CW_TGU_INBOX_IDENTIFIER": full["inbox_identifier"], "CW_TGU_WEBHOOK_SECRET": full["secret"],
+                   "CW_TGU_ACCOUNT_ID": cw["CW_ACCOUNT_ID"], "CW_TGU_OPERATOR_TOKEN": op["token"]})
     bind_cw_inbox(inbox["id"])
     print("  next: docker compose --profile tg-userbot up -d --build tg-userbot (login once first, see SETUP.md)")
+
+
+def step_tg_outreach(tg_user_id, text):
+    """First contact (plan v2: operator approved an offer): a conversation for the Telegram user in the userbot inbox
+    and an outgoing message in it. tg-userbot sends it only to members of an allowed group."""
+    tg_user_id.isdigit() or die("usage: tg-outreach TG_USER_ID TEXT")
+    ident = stack_env("CW_TGU_INBOX_IDENTIFIER") or die("run 'tg-userbot' first")
+    base = f"http://127.0.0.1:3000/public/api/v1/inboxes/{ident}"
+
+    def post(url, body):
+        r = urllib.request.Request(url, json.dumps(body).encode(), {"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(r, timeout=30) as resp:
+            return json.load(resp)
+
+    # Finds the contact by identifier when it exists (the bridge made it on a private message); new contact_inbox.
+    c = post(f"{base}/contacts", {"identifier": f"tg:{tg_user_id}", "name": f"tg {tg_user_id}"})
+    src, contact = c["source_id"], c
+    conv = post(f"{base}/contacts/{src}/conversations", {})["id"]
+    if BOT_AUDIENCE == "testers":
+        step_testers([str(contact["id"])])
+    st, m = cw_api("POST", f"/conversations/{conv}/messages", {"content": text, "message_type": "outgoing"})
+    print(f"  contact {contact['id']}, conversation {conv}: message HTTP {st} (tg-userbot log shows the send)")
 
 
 def step_playground():
@@ -864,6 +916,9 @@ if __name__ == "__main__":
             print(f"== {s}"); STEPS[s]()
     elif cmd == "bind":
         step_bind(sys.argv[2])
+    elif cmd == "tg-outreach":
+        len(sys.argv) == 4 or die("usage: tg-outreach TG_USER_ID TEXT")
+        step_tg_outreach(sys.argv[2], sys.argv[3])
     elif cmd == "testers":
         step_testers(sys.argv[2:] or die("usage: testers <contact_id>..."))
     elif cmd in STEPS:

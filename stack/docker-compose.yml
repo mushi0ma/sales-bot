@@ -196,8 +196,10 @@ services:
       TG_API_ID: ${TG_API_ID:-}
       TG_API_HASH: ${TG_API_HASH:-}
       CW_URL: http://cw-rails:3000
+      CW_ACCOUNT_ID: ${CW_TGU_ACCOUNT_ID:-}
       CW_INBOX_IDENTIFIER: ${CW_TGU_INBOX_IDENTIFIER:-}
       CW_WEBHOOK_SECRET: ${CW_TGU_WEBHOOK_SECRET:-}
+      CW_OPERATOR_TOKEN: ${CW_TGU_OPERATOR_TOKEN:-}
     volumes:
       - tgu_data:/data
     read_only: true
