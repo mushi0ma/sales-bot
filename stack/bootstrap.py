@@ -11,6 +11,8 @@ Steps (idempotent where possible; secrets go to ~/secrets/*.env with mode 600 an
   operator   Chatwoot: macro «🤖 Вернуть боту» + contact attribute «Тестировщик бота»
   testers    testers <contact_id>...: tick «Тестировщик бота» (the bot answers only them)
   telegram   Telegram inbox from TELEGRAM_BOT_TOKEN (stack/.env) + bind to the agent; needs the tg-bridge profile
+  tg-userbot API inbox «Telegram (userbot)» for the tg-userbot service (a real account, plan v2 spike S2):
+             writes CW_TGU_INBOX_IDENTIFIER / CW_TGU_WEBHOOK_SECRET to stack/.env, binds the agent
   knowledge  RAG: OpenRouter embeddings + knowledge base from agent/knowledge.md, attached to the agent
              (search_knowledge), search smoke test
   vision     image/document reading for incoming photos (OpenRouter free VL model, Russian extraction prompt)
@@ -771,6 +773,11 @@ def step_telegram():
         die("telegram inbox failed:\n" + (r.stderr or r.stdout).replace(token, "<token>")[-1500:])
     res = json.loads(m.group(1))
     print(f"  chatwoot: Telegram inbox {res['inbox_id']} for @{res['bot']} (created={res['created']})")
+    bind_cw_inbox(res["inbox_id"])
+
+
+def bind_cw_inbox(cw_inbox_id):
+    """Make agents see a Chatwoot inbox it has not mirrored yet, then bind it to the agent."""
     a = Agents().login()
     # agents mirrors inboxes on its own schedule; ask it to read Chatwoot's list now.
     st, b = a.req("GET", "/v1/chatwoot/deployment")
@@ -780,13 +787,45 @@ def step_telegram():
         print(f"  agents: sync-inboxes HTTP {st}")
     for _ in range(10):
         st, b = a.req("GET", "/v1/chatwoot/inboxes")
-        mine = next((i for i in as_list(b) if str(i.get("chatwootInboxId")) == str(res["inbox_id"])), None)
+        mine = next((i for i in as_list(b) if str(i.get("chatwootInboxId")) == str(cw_inbox_id)), None)
         if mine:
             break
         time.sleep(3)
     if not mine:
         die("agents does not list the new inbox yet; run 'connect', then 'bind <id>' (ids: 'inboxes')")
     step_bind(mine["id"])
+
+
+def set_stack_env(values):
+    """Set KEY=value lines in stack/.env (600), replacing existing keys. Prints names only."""
+    p = STACK / ".env"
+    lines = [l for l in p.read_text().splitlines() if l.split("=", 1)[0] not in values]
+    p.write_text("\n".join(lines + [f"{k}={v}" for k, v in values.items()]) + "\n")
+    p.chmod(0o600)
+    print(f"  stack/.env: {', '.join(values)}")
+
+
+TGU_INBOX = "Telegram (userbot)"
+TGU_WEBHOOK = "http://tg-userbot:8080/chatwoot"
+
+
+def step_tg_userbot():
+    st, b = cw_api("GET", "/inboxes")
+    inbox = next((i for i in (b or {}).get("payload", []) if i.get("name") == TGU_INBOX), None)
+    if inbox is None:
+        st, inbox = cw_api("POST", "/inboxes", {"name": TGU_INBOX,
+                                                "channel": {"type": "api", "webhook_url": TGU_WEBHOOK}})
+        if st >= 300:
+            die(f"API inbox: HTTP {st} {str(inbox)[:300]}")
+        print(f"  chatwoot: created API inbox {inbox['id']} «{TGU_INBOX}»")
+    st, full = cw_api("GET", f"/inboxes/{inbox['id']}")
+    if full.get("webhook_url") != TGU_WEBHOOK:
+        die(f"inbox {inbox['id']} webhook_url is not {TGU_WEBHOOK}; fix it in Chatwoot inbox settings")
+    if not (full.get("inbox_identifier") and full.get("secret")):
+        die("inbox API did not return inbox_identifier/secret (admin token required)")
+    set_stack_env({"CW_TGU_INBOX_IDENTIFIER": full["inbox_identifier"], "CW_TGU_WEBHOOK_SECRET": full["secret"]})
+    bind_cw_inbox(inbox["id"])
+    print("  next: docker compose --profile tg-userbot up -d --build tg-userbot (login once first, see SETUP.md)")
 
 
 def step_playground():
@@ -811,7 +850,7 @@ def step_playground():
 
 STEPS = {"chatwoot": step_chatwoot, "agents": step_agents, "vault": step_vault, "agent": step_agent,
          "connect": step_connect, "tickets": step_tickets, "stt": step_stt, "vision": step_vision, "inboxes": step_inboxes,
-         "operator": step_operator, "telegram": step_telegram,
+         "operator": step_operator, "telegram": step_telegram, "tg-userbot": step_tg_userbot,
          "knowledge": step_knowledge,
          "playground": step_playground}
 

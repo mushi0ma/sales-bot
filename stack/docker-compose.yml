@@ -24,7 +24,7 @@ x-cw-env: &cw-env
   ENABLE_ACCOUNT_SIGNUP: "false"
   DISABLE_TELEMETRY: "true"
   # Agent Bot webhooks to the agents service on the private docker network.
-  SAFE_FETCH_PRIVATE_TARGETS: agents:3000
+  SAFE_FETCH_PRIVATE_TARGETS: agents:3000,tg-userbot:8080
   # Native WhatsApp connector (whatsmeow), embedded in Sidekiq. Calls/UDP stay off.
   WHATSAPP_CONNECTOR_ENABLED: "true"
   WHATSAPP_CONNECTOR_EMBEDDED: "true"
@@ -185,6 +185,32 @@ services:
     depends_on: [cw-rails]
     restart: unless-stopped
 
+  # Telegram userbot (a real account, MTProto) <-> Chatwoot API inbox; groups -> /data queue (plan v2, spike S2).
+  # Default deny: only chats allowed with `/salesbot allow` from the account itself. Session = secret (volume).
+  tg-userbot:
+    build: ./tg-userbot
+    image: salesbot/tg-userbot:local
+    profiles: [tg-userbot]
+    networks: [default]
+    environment:
+      TG_API_ID: ${TG_API_ID:-}
+      TG_API_HASH: ${TG_API_HASH:-}
+      CW_URL: http://cw-rails:3000
+      CW_INBOX_IDENTIFIER: ${CW_TGU_INBOX_IDENTIFIER:-}
+      CW_WEBHOOK_SECRET: ${CW_TGU_WEBHOOK_SECRET:-}
+    volumes:
+      - tgu_data:/data
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 192m
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 30s
+    depends_on: [cw-rails]
+    restart: unless-stopped
+
   # Local speech-to-text (faster-whisper, model baked in at build). Voice notes stay inside the VM.
   stt:
     build:
@@ -239,3 +265,4 @@ volumes:
   agents_storage:
   agents_postgres:
   tickets_data:
+  tgu_data:

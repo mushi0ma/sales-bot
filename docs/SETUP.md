@@ -320,6 +320,35 @@ Chatwoot `POST http://cw-rails:3000/webhooks/telegram/<token>` внутри dock
   если Telegram ответит 409, но настройки Telegram-inbox в UI лучше не трогать.
 - У Telegram-контакта нет телефона: `get_my_tickets` ищет заявки по `contact_id`.
 
+## Telegram userbot (v2, спайк S2)
+
+Обычный Telegram-аккаунт со своим номером, а не бот: жильцы видят человека с username. Сервис `tg-userbot`
+(`stack/tg-userbot/`, Telethon 1.45, зависимости закреплены хэшами) — профиль compose `tg-userbot`:
+- личка → API-inbox Chatwoot «Telegram (userbot)» через публичный client API (контакт `tg:<user_id>`), ответы
+  оператора или бота приходят вебхуком (HMAC `X-Chatwoot-Signature`) и уходят от имени аккаунта;
+- группы → таблица `group_messages` в `/data/userbot.db` — очередь для будущего profiler (V2-GROUPS-PLAN.md).
+
+**По умолчанию ничего не читается.** Аккаунт личный, в нём есть чужие переписки. Сервис обрабатывает только
+чаты, разрешённые самим владельцем: написать **с этого аккаунта** в нужном чате (тестовая группа или личка с
+тестировщиком) `/salesbot allow`; `/salesbot deny` — запретить; `/salesbot status` — ответ придёт в «Избранное».
+Командное сообщение сразу удаляется. В логах только id и длины, без текста.
+
+Запуск:
+1. `TG_API_ID`, `TG_API_HASH` (my.telegram.org) в `./.env` хоста → `infra/push-secret.sh TG_API_ID`, то же для
+   `TG_API_HASH`.
+2. В ВМ: `python3 -I bootstrap.py tg-userbot` — API-inbox, `CW_TGU_INBOX_IDENTIFIER` / `CW_TGU_WEBHOOK_SECRET` в
+   `stack/.env`, привязка агента. Chatwoot должен пускать вебхук внутрь сети: `tg-userbot:8080` в
+   `SAFE_FETCH_PRIVATE_TARGETS` (compose), после правки — `docker compose up -d cw-rails cw-sidekiq`.
+3. Вход (один раз, интерактивно — номер, код из Telegram, пароль 2FA) в своём терминале:
+   `infra/vm.sh ssh -t 'cd ~/work/stack && docker compose --profile tg-userbot run --rm tg-userbot login'`.
+   Сессия — секрет, как сессия WhatsApp: лежит в томе `tgu_data`, в git и логи не попадает.
+4. `docker compose --profile tg-userbot up -d tg-userbot`; в тестовом чате `/salesbot allow`; отметить новый
+   контакт тестировщиком (`bootstrap.py testers <id>`), иначе агент ему не ответит.
+
+Риски: антиспам Telegram (`PEER_FLOOD`, `FLOOD_WAIT`, заморозка аккаунта). Сервис отправляет только в
+разрешённые чаты, не чаще раза в `SEND_MIN_INTERVAL` (3 с) на чат и не больше `SEND_MAX_PER_HOUR` (30) в час.
+Сообщения, которые владелец пишет с телефона в разрешённую личку, в Chatwoot не попадают (ограничение спайка).
+
 ## Админ-панели
 
 | Где | Адрес (через `infra/vm.sh tunnel`) | Для чего |
