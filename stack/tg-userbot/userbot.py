@@ -43,6 +43,7 @@ SEND_MIN_INTERVAL = float(os.environ.get("SEND_MIN_INTERVAL", "3"))
 SEND_MAX_PER_HOUR = int(os.environ.get("SEND_MAX_PER_HOUR", "30"))
 MEDIA_MAX = int(float(os.environ.get("MEDIA_MAX_MB", "20")) * 1024 * 1024)
 WEBHOOK_MAX_SKEW = 300
+BACKFILL_EVERY = int(os.environ.get("BACKFILL_EVERY", "300"))
 MIRROR_PREFIX = "tgm:"  # source_id of messages mirrored from the owner's phone: not sent back to Telegram
 CMD = "/salesbot"
 
@@ -298,15 +299,40 @@ async def run():
                 log.error("private in: user=%s failed: %s", sender.id, e)
             return
         sender = await ev.get_sender()
-        chat = await ev.get_chat()
-        with db() as c:
-            c.execute("INSERT OR IGNORE INTO group_messages (chat_id, msg_id, chat_title, sender_id, sender_name, "
-                      "sender_username, sent_at, text, reply_to, has_media) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                      (ev.chat_id, ev.id, display_name(chat), getattr(sender, "id", None), display_name(sender),
-                       getattr(sender, "username", None), ev.date.strftime("%Y-%m-%dT%H:%M:%SZ"), text,
-                       ev.reply_to_msg_id, int(ev.media is not None)))
+        store_group(ev.chat_id, display_name(await ev.get_chat()), ev.message, sender)
         log.info("group %s: chat=%s sender=%s len=%d", "out" if ev.out else "in", ev.chat_id,
                  getattr(sender, "id", None), len(text))
+
+    def store_group(chat_id, title, msg, sender):
+        with db() as c:
+            return c.execute(
+                "INSERT OR IGNORE INTO group_messages (chat_id, msg_id, chat_title, sender_id, sender_name, "
+                "sender_username, sent_at, text, reply_to, has_media) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (chat_id, msg.id, title, getattr(sender, "id", None), display_name(sender),
+                 getattr(sender, "username", None), msg.date.strftime("%Y-%m-%dT%H:%M:%SZ"), msg.raw_text or "",
+                 msg.reply_to_msg_id, int(msg.media is not None))).rowcount
+
+    async def backfill():
+        """Updates are lost while the service is down or Telegram drops them: read each allowed group's history
+        since it was allowed and store what is missing. At start, then every BACKFILL_EVERY seconds."""
+        while True:
+            with db() as c:
+                groups = c.execute("SELECT chat_id, title, allowed_at FROM allowed_chats WHERE kind='group'").fetchall()
+            for g in groups:
+                since = time.mktime(time.strptime(g["allowed_at"], "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+                added = 0
+                try:
+                    async for msg in client.iter_messages(g["chat_id"], limit=500):
+                        if msg.date.timestamp() < since:
+                            break
+                        if msg.action is not None or (msg.out and (msg.raw_text or "").startswith(CMD)):
+                            continue
+                        added += store_group(g["chat_id"], g["title"], msg, await msg.get_sender())
+                except Exception as e:
+                    log.error("backfill chat=%s failed: %s", g["chat_id"], type(e).__name__)
+                if added:
+                    log.warning("backfill chat=%s: %d messages were missing, stored", g["chat_id"], added)
+            await asyncio.sleep(BACKFILL_EVERY)
 
     async def mirror(ev, text):
         # Telethon may deliver our own sends as events before send_message returns their ids: give it a moment.
@@ -416,6 +442,7 @@ async def run():
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", 8080).start()
     log.info("listening :8080; %d allowed chats", len(db().execute("SELECT 1 FROM allowed_chats").fetchall()))
+    asyncio.create_task(backfill())
     try:
         await client.run_until_disconnected()
     finally:
