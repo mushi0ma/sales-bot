@@ -26,7 +26,7 @@ x-cw-env: &cw-env
   ENABLE_ACCOUNT_SIGNUP: "false"
   DISABLE_TELEMETRY: "true"
   # Agent Bot webhooks to the agents service on the private docker network.
-  SAFE_FETCH_PRIVATE_TARGETS: agents:3000,tg-userbot:8080
+  SAFE_FETCH_PRIVATE_TARGETS: agents:3000,tg-userbot:8080,group-watcher:8080
   # Telegram setWebhook carries this secret_token; Caddy refuses webhook calls without it.
   TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:?}
   # Native WhatsApp connector (whatsmeow), embedded in Sidekiq. Calls/UDP stay off.
@@ -35,6 +35,8 @@ x-cw-env: &cw-env
   WAC_MEDIA_ROOT: /app/wac-media
   # Legacy Baileys/Z-API providers not offered.
   WHATSAPP_LEGACY_PROVIDERS_CREATABLE: "false"
+  # WhatsApp Cloud webhooks must carry Meta's signature (app secret); the default accepts unsigned ones.
+  WHATSAPP_ACCEPT_UNSIGNED_WEBHOOKS: "false"
 
 services:
   cw-rails:
@@ -151,6 +153,9 @@ services:
     image: ghcr.io/berriai/litellm:v1.83.14-stable.patch.3@sha256:f12d528d4a05add56cb09e54c5126088f2edc6bdf3a2f943bcd3a32b08769da2
     command: [--config, /app/config.yaml, --port, "4000", --num_workers, "1"]
     networks: [default]
+    # VM loopback only: laptops reach it through `deploy/ssh.sh -- -N -L 4000:127.0.0.1:4000` (same limits for all).
+    ports:
+      - "127.0.0.1:4000:4000"
     environment:
       GCP_PROJECT: ${GCP_PROJECT:?run render-env.sh}
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?}
@@ -168,6 +173,40 @@ services:
       timeout: 5s
       retries: 10
       start_period: 60s
+    restart: unless-stopped
+
+  # Sales needs in WhatsApp groups -> private offers (path A). Chatwoot account webhook in, Chatwoot API and
+  # LiteLLM out. Only groups labelled salesbot-watch. Config from `bootstrap.py group-watcher` (GW_* in stack/.env).
+  group-watcher:
+    image: python:3.13-alpine@sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e
+    command: [python3, -I, -u, /app/watcher.py, serve]
+    networks: [default]
+    environment:
+      CW_ACCOUNT_ID: ${GW_CW_ACCOUNT_ID:-1}
+      CW_API_TOKEN: ${GW_CW_TOKEN:-}
+      WEBHOOK_SECRET: ${GW_WEBHOOK_SECRET:-}
+      LLM_KEY: ${LITELLM_MASTER_KEY:?}
+      LLM_MODEL: ${GW_MODEL:-gemini-3.5-flash-lite}
+      # auto: send at once | approve: the operator answers the card with /offer N | dry: cards only
+      SEND_MODE: ${GW_SEND_MODE:-auto}
+      DAILY_SEND_CAP: ${GW_DAILY_SEND_CAP:-20}
+      DB_PATH: /data/watcher.db
+    volumes:
+      - ./group-watcher/watcher.py:/app/watcher.py:ro
+      - ./group-watcher/services.json:/app/services.json:ro
+      - ./group-watcher/samples.json:/app/samples.json:ro
+      - gw_data:/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    depends_on:
+      litellm: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   # Public HTTPS entry (Let's Encrypt for PUBLIC_DOMAIN) in front of Chatwoot: UI, WhatsApp Cloud and Telegram webhooks.
@@ -302,3 +341,4 @@ volumes:
   tgu_data:
   caddy_data:
   caddy_config:
+  gw_data:

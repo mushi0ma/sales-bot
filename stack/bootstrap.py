@@ -18,6 +18,9 @@ Steps (idempotent where possible; secrets go to ~/secrets/*.env with mode 600 an
   tg-outreach TG_USER_ID TEXT   first message from Chatwoot to a member of an allowed group (via tg-userbot),
              then the hand-back macro: the agent answers the resident's reply
   return-to-bot CONV_ID   apply the hand-back macro to a Chatwoot conversation
+  group-watcher  sales needs in WhatsApp groups (stack/group-watcher): Chatwoot user «e-KNOT (предложения)» in every
+             inbox, account webhook (message_created, HMAC) to group-watcher, label salesbot-watch (an operator puts
+             it on a group to let the service read it), contact attribute salesbot_optout; GW_* to stack/.env
   knowledge  RAG: gemini-embedding-001 (1536) + knowledge base from agent/knowledge.md, attached to the agent
              (search_knowledge), search smoke test
   vision     image/document reading for incoming photos (Gemini Flash, Russian extraction prompt)
@@ -362,8 +365,10 @@ def step_agent():
                                                 "model": GROUNDING_MODEL, "credentialRef": f"vault:{v['id']}"}},
             # Contact gate: the WhatsApp number is a real SIM and the Telegram bot is findable by anyone, so a
             # stranger's message must not reach the model (test data only). The rule refusal is silent.
-            "contactAuth": ({"enabled": True, "rule": {"kind": "attribute", "scope": "contact", "key": TESTER_ATTR,
-                                                       "equals": "true"},
+            # Never in a WhatsApp group (group-watcher reads groups; the bot answers in private only).
+            "contactAuth": ({"enabled": True, "rule": {"kind": "all", "conditions": [
+                                {"kind": "attribute", "scope": "contact", "key": TESTER_ATTR, "equals": "true"},
+                                {"kind": "conversation_type", "type": "individual"}]},
                              "denyMessage": None, "handoffEnabled": False, "operatorNoteEnabled": False}
                             if BOT_AUDIENCE == "testers" else {"enabled": False}),
         },
@@ -389,7 +394,9 @@ def check_gate(a):
     messages reach the model."""
     ag = one(a.req("GET", f"/v1/agents/{find_agent(a)['id']}")[1])
     gate = (ag.get("settings") or {}).get("contactAuth") or {}
-    if BOT_AUDIENCE == "testers" and not (gate.get("enabled") is True and (gate.get("rule") or {}).get("key") == TESTER_ATTR):
+    conds = (gate.get("rule") or {}).get("conditions") or []
+    if BOT_AUDIENCE == "testers" and not (gate.get("enabled") is True and any(c.get("key") == TESTER_ATTR for c in conds)
+                                          and {"kind": "conversation_type", "type": "individual"} in conds):
         die(f"contact gate is NOT active on the agent (stored: {json.dumps(gate, ensure_ascii=False)[:200]})")
     print(f"  agent: mode={ag.get('mode')} gate={'testers only' if gate.get('enabled') else 'off'}")
 
@@ -884,6 +891,69 @@ def step_tg_outreach(tg_user_id, text):
     return_to_bot(conv)
 
 
+GW_EMAIL = "offers@salesbot.test"
+GW_URL = "http://group-watcher:8080/chatwoot"
+GW_LABEL = "salesbot-watch"
+OPTOUT_ATTR = "salesbot_optout"
+GW_RUBY = r'''
+require 'json'; require 'securerandom'
+acc = Account.find(ENV.fetch('CW_ACCOUNT_ID').to_i)
+u = User.find_by(email: ENV.fetch('GW_EMAIL'))
+unless u
+  u = User.new(email: ENV.fetch('GW_EMAIL'), name: 'e-KNOT (предложения)', password: SecureRandom.base64(24) + 'aA1!')
+  u.skip_confirmation!
+  u.save!
+end
+AccountUser.find_or_create_by!(account: acc, user: u) { |au| au.role = :agent }
+acc.inboxes.each { |i| InboxMember.find_or_create_by!(inbox: i, user: u) }
+token = u.access_token || u.create_access_token
+STDOUT.write('GW_JSON:' + JSON.generate({ user_id: u.id, inboxes: acc.inboxes.count, token: token.token }) + "\n")
+'''
+
+
+def step_group_watcher():
+    """group-watcher's Chatwoot side. Rerun after adding an inbox (the user joins every inbox)."""
+    cw = read_env("chatwoot-admin.env") or die("run 'chatwoot' first")
+    env = dict(os.environ, CW_ACCOUNT_ID=cw["CW_ACCOUNT_ID"], GW_EMAIL=GW_EMAIL)
+    r = subprocess.run(["docker", "compose", "exec", "-T", "-e", "CW_ACCOUNT_ID", "-e", "GW_EMAIL",
+                        "cw-rails", "sh", "-c", "umask 077; cat > /tmp/gw.rb && bundle exec rails runner /tmp/gw.rb; "
+                        "rc=$?; rm -f /tmp/gw.rb; exit $rc"], cwd=STACK, input=GW_RUBY, capture_output=True,
+                       text=True, env=env)
+    m = re.search(r"^GW_JSON:(.*)$", r.stdout, re.M)
+    if r.returncode != 0 or not m:
+        die("offers user failed (output withheld: it may hold a token); rerun the runner by hand to debug")
+    u = json.loads(m.group(1))
+    print(f"  chatwoot: user {u['user_id']} ({GW_EMAIL}), member of {u['inboxes']} inbox(es)")
+    st, b = cw_api("GET", "/labels")
+    if not any(l.get("title") == GW_LABEL for l in (b or {}).get("payload", [])):
+        st, _ = cw_api("POST", "/labels", {"title": GW_LABEL, "color": "#2E7D32", "show_on_sidebar": True,
+                                           "description": "group-watcher читает эту группу и ищет потребности"})
+    print(f"  label '{GW_LABEL}': HTTP {st}")
+    st, b = cw_api("GET", "/custom_attribute_definitions?attribute_model=1")
+    defs = b if isinstance(b, list) else (b or {}).get("payload", [])
+    if not any(d.get("attribute_key") == OPTOUT_ATTR for d in defs):
+        st, _ = cw_api("POST", "/custom_attribute_definitions", {
+            "attribute_display_name": "Отказ от предложений", "attribute_key": OPTOUT_ATTR,
+            "attribute_display_type": "checkbox", "attribute_model": "contact_attribute",
+            "attribute_description": "Человек написал «стоп»: group-watcher ему не пишет"})
+    print(f"  contact attribute '{OPTOUT_ATTR}': HTTP {st}")
+    st, b = cw_api("GET", "/webhooks")
+    hooks = (b or {}).get("payload", {}).get("webhooks", []) if isinstance(b, dict) else []
+    hook = next((h for h in hooks if h.get("url") == GW_URL), None)
+    if hook is None:
+        st, b = cw_api("POST", "/webhooks", {"webhook": {"url": GW_URL, "name": "group-watcher",
+                                                         "subscriptions": ["message_created"]}})
+        hook = ((b or {}).get("payload") or {}).get("webhook") if isinstance(b, dict) else None
+        if st >= 300 or not hook:
+            die(f"webhook: HTTP {st} {str(b)[:200]}")
+    if not hook.get("secret"):
+        die("webhook has no secret in the API answer; cannot verify signatures")
+    print(f"  webhook {hook.get('id')} -> {GW_URL} (message_created, signed)")
+    set_stack_env({"GW_CW_TOKEN": u["token"], "GW_WEBHOOK_SECRET": hook["secret"], "GW_CW_ACCOUNT_ID": cw["CW_ACCOUNT_ID"]})
+    print("  next: docker compose up -d cw-rails cw-sidekiq group-watcher; label a test group "
+          f"'{GW_LABEL}' in Chatwoot")
+
+
 def return_to_bot(conv):
     """The operator's hand-back macro: the agent answers the resident's reply, with the first message in memory.
     A person's message makes the agent step aside (status open); wait for that, then hand back."""
@@ -927,7 +997,7 @@ def step_playground():
 STEPS = {"chatwoot": step_chatwoot, "agents": step_agents, "vault": step_vault, "agent": step_agent,
          "connect": step_connect, "tickets": step_tickets, "stt": step_stt, "vision": step_vision, "inboxes": step_inboxes,
          "operator": step_operator, "telegram": step_telegram, "tg-userbot": step_tg_userbot,
-         "knowledge": step_knowledge,
+         "knowledge": step_knowledge, "group-watcher": step_group_watcher,
          "playground": step_playground}
 
 if __name__ == "__main__":
