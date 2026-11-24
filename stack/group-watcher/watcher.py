@@ -476,7 +476,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:  # never echo payloads into logs: they hold residents' text
             log.exception("webhook: intake failed")
             return self._reply(200)
-        if not result.startswith("ignored"):
+        if result != "ignored:not_incoming":
             log.info("webhook: %s", result)
         self._reply(200)
 

@@ -26,7 +26,10 @@ Steps (idempotent where possible; secrets go to ~/secrets/*.env with mode 600 an
   vision     image/document reading for incoming photos (Gemini Flash, Russian extraction prompt)
   tickets    ticket HTTP tools (create_ticket, get_my_tickets) on the mock dispatcher + least-privilege grants
   bind INBOX_ID   bind a Chatwoot inbox (mirror id from `inboxes`) to the agent
-  bind-cw CW_INBOX_ID   same by the Chatwoot inbox id (e.g. a WhatsApp inbox just paired in the UI); syncs first
+  bind-cw CW_INBOX_ID [seller]   same by the Chatwoot inbox id (e.g. a WhatsApp inbox just paired in the UI);
+             syncs first; `seller` binds it to the sales agent instead of the support agent
+  seller     the sales agent «Продавец e-KNOT»: prompt agent/seller-prompt.md, knowledge base from
+             group-watcher/services.json, fact check, handoff to an e-KNOT manager, label `lead`
   inboxes    list inboxes known to agents
   playground smoke test of the agent through the playground (no WhatsApp)
   all        chatwoot agents vault agent connect tickets stt vision
@@ -262,10 +265,10 @@ def step_vault():
             f"baseUrl={v.get('baseUrl')} — refusing (the key would go elsewhere)")
 
 
-def find_agent(a):
+def find_agent(a, name=None):
     st, b = a.req("GET", "/v1/agents")
     items = as_list(b)
-    return next((x for x in items if x.get("name") == AGENT_NAME), None)
+    return next((x for x in items if x.get("name") == (name or AGENT_NAME)), None)
 
 
 def agent_prompt():
@@ -390,10 +393,10 @@ def step_agent():
     check_gate(a)
 
 
-def check_gate(a):
+def check_gate(a, name=None):
     """Read the agent back: with BOT_AUDIENCE=testers the contact gate MUST be on with our rule, or strangers'
     messages reach the model."""
-    ag = one(a.req("GET", f"/v1/agents/{find_agent(a)['id']}")[1])
+    ag = one(a.req("GET", f"/v1/agents/{find_agent(a, name)['id']}")[1])
     gate = (ag.get("settings") or {}).get("contactAuth") or {}
     conds = (gate.get("rule") or {}).get("conditions") or []
     if BOT_AUDIENCE == "testers" and not (gate.get("enabled") is True and any(c.get("key") == TESTER_ATTR for c in conds)
@@ -610,9 +613,9 @@ def step_inboxes():
     print(json.dumps(b, ensure_ascii=False, indent=1)[:3000])
 
 
-def step_bind(inbox_id):
+def step_bind(inbox_id, name=None):
     a = Agents().login()
-    ag = find_agent(a) or die("agent missing")
+    ag = find_agent(a, name) or die(f"agent {name or AGENT_NAME!r} missing")
     st, b = a.req("PATCH", f"/v1/chatwoot/inboxes/{inbox_id}", {"agentId": str(ag["id"])})
     print(f"  bind inbox {inbox_id} -> agent {ag['id']}: HTTP {st} {'' if st < 300 else str(b)[:400]}")
     # Chatwoot auto-assignment hands every new conversation to a human at once, and the bot never answers a
@@ -649,25 +652,40 @@ def step_knowledge():
     if stored != f"vault:{v['id']}":
         die(f"embedding credential is {stored!r}, expected vault:{v['id']} — refusing to index")
     print(f"  embedding credential -> vault:{v['id']} (verified)")
+    text = (STACK / "agent" / "knowledge.md").read_text(encoding="utf-8")
+    # knowledge.md holds fictional УК phones; never let them reach real residents (an emergency number that rings
+    # nowhere). Real data replaces the file before the bot answers everyone.
+    if BOT_AUDIENCE != "testers" and re.search(r"000-00-0|\.example|«Тестовая»", text):
+        die("agent/knowledge.md still has TEST placeholders; keep BOT_AUDIENCE=testers until it is replaced")
+    kb = upsert_kb(a, KB_NAME, "agent/knowledge.md", "Справочник УК", text)
+    ag = find_agent(a) or die("agent missing; run 'agent'")
+    grant_rag(a, ag, kb)
+    for q in ("куда звонить если пахнет газом", "сколько стоит сантехник", "когда сдавать показания воды"):
+        search_smoke(a, kb, q)
+
+
+def search_smoke(a, kb, q):
+    st, r = a.req("POST", "/v1/knowledge/search", {"query": q, "knowledgeBaseIds": [str(kb["id"])], "limit": 1})
+    hit = (as_list(r) or [{}])[0]
+    print(f"  search {q!r}: HTTP {st} | {(hit.get('content') or hit.get('text') or str(r))[:90]!r}")
+
+
+def upsert_kb(a, name, description, title, text):
+    """A knowledge base that mirrors one text (documents replaced on every run), indexed before returning."""
     st, b = a.req("GET", "/v1/knowledge/bases")
-    kb = next((k for k in as_list(b) if k.get("name") == KB_NAME), None)
+    kb = next((k for k in as_list(b) if k.get("name") == name), None)
     if not kb:
-        st, kb = a.req("POST", "/v1/knowledge/bases", {"name": KB_NAME, "description": "agent/knowledge.md",
+        st, kb = a.req("POST", "/v1/knowledge/bases", {"name": name, "description": description,
                                                        "embeddingModel": EMBED_MODEL})
         kb = one(kb)
         print(f"  knowledge base: HTTP {st} id={kb.get('id')}")
     elif kb.get("embeddingModel") != EMBED_MODEL:  # each base names its own model; the default is OpenAI's
         st, _ = a.req("PATCH", f"/v1/knowledge/bases/{kb['id']}", {"embeddingModel": EMBED_MODEL})
         print(f"  knowledge base {kb['id']}: embeddingModel -> {EMBED_MODEL} HTTP {st}")
-    text = (STACK / "agent" / "knowledge.md").read_text(encoding="utf-8")
-    # knowledge.md holds fictional УК phones; never let them reach real residents (an emergency number that rings
-    # nowhere). Real data replaces the file before the bot answers everyone.
-    if BOT_AUDIENCE != "testers" and re.search(r"000-00-0|\.example|«Тестовая»", text):
-        die("agent/knowledge.md still has TEST placeholders; keep BOT_AUDIENCE=testers until it is replaced")
     st, b = a.req("GET", f"/v1/knowledge/bases/{kb['id']}/documents")
     for d in as_list(b):  # replace, so the base always mirrors the file
         a.req("DELETE", f"/v1/knowledge/documents/{d['id']}")
-    st, doc = a.req("POST", f"/v1/knowledge/bases/{kb['id']}/documents", {"title": "Справочник УК", "text": text})
+    st, doc = a.req("POST", f"/v1/knowledge/bases/{kb['id']}/documents", {"title": title, "text": text})
     doc = one(doc)
     print(f"  document: HTTP {st} status={doc.get('status') if isinstance(doc, dict) else doc}")
     for _ in range(30):
@@ -677,9 +695,12 @@ def step_knowledge():
             break
         time.sleep(2)
     print(f"  indexed: status={d.get('status')} chunks={d.get('chunkCount', d.get('chunks'))} {str(d.get('error') or '')[:200]}")
-    # The agent searches this base (search_knowledge only; no suggest_kb_entry). PUT replaces the whole set, so
-    # every other grant is kept as stored.
-    ag = find_agent(a) or die("agent missing; run 'agent'")
+    return kb
+
+
+def grant_rag(a, ag, kb):
+    """The agent searches this base (search_knowledge only; no suggest_kb_entry). PUT replaces the whole set, so
+    every other grant is kept as stored."""
     st, cur = a.req("GET", f"/v1/agents/{ag['id']}/tool-selections")
     keep = [g for g in (cur or {}).get("grants", []) if g.get("source") != "RAG"]
     st, r = a.req("PUT", f"/v1/agents/{ag['id']}/tool-selections",
@@ -688,10 +709,88 @@ def step_knowledge():
     if st >= 300:
         die(f"RAG grant failed: HTTP {st} {str(r)[:300]}")
     print(f"  agent {ag['id']}: search_knowledge over base {kb['id']} (kept {len(keep)} grants)")
-    for q in ("куда звонить если пахнет газом", "сколько стоит сантехник", "когда сдавать показания воды"):
-        st, r = a.req("POST", "/v1/knowledge/search", {"query": q, "knowledgeBaseIds": [str(kb["id"])], "limit": 1})
-        hit = (as_list(r) or [{}])[0]
-        print(f"  search {q!r}: HTTP {st} score={hit.get('score')} | {(hit.get('content') or hit.get('text') or str(r))[:90]!r}")
+
+
+SELLER_NAME = "Продавец e-KNOT (тест)"
+SELLER_KB = "Услуги e-KNOT (eknot.me)"
+SELLER_NATIVE = ["handoff_to_human", "private_note", "set_labels", "get_current_time"]
+
+
+def seller_knowledge_text():
+    """The seller's knowledge base from the same catalog group-watcher matches needs against (one source)."""
+    d = json.loads((STACK / "group-watcher" / "services.json").read_text(encoding="utf-8"))
+    c = d["company"]
+    parts = ["УСЛУГИ E-KNOT (по сайту eknot.me, прочитано 24.11.2026).", f"Цены. {c['prices']}",
+             f"Контакты e-KNOT. Сайт {c['site']}; связаться: {c['contact']}; поддержка в Telegram: "
+             f"{c['support_telegram']}. Приложение E-KNOT: Android {c['app_android']}, iPhone {c['app_ios']}."]
+    for sv in d["services"]:
+        parts.append(f"\n{sv['name']}.\nСсылка: {sv['url']}\nЧто это: {sv['what']}\n{sv['details']}\n"
+                     f"Когда нужно: {sv['signals']}.")
+    return "\n".join(parts) + "\n"
+
+
+def step_seller():
+    """The sales agent (answers residents after group-watcher's offer, and anyone who writes the WhatsApp number):
+    Gemini Flash, knowledge base of e-KNOT services, fact check on Flash-Lite, handoff = e-KNOT manager. Voice and
+    photo settings are copied from the support agent. Bind its inbox with `bind-cw <id> seller`."""
+    a = Agents().login()
+    v = find_vault(a) or die("vault entry missing; run 'vault'")
+    support = find_agent(a)
+    copied = {}
+    if support:
+        st, cur = a.req("GET", f"/v1/agents/{support['id']}")
+        sset = ((cur or {}).get("agent") or cur or {}).get("settings") or {}
+        copied = {k: sset[k] for k in ("stt", "vision") if k in sset}
+    settings = {
+        **copied,
+        "handoff": {"mode": "route", "instructions":
+                    "Передай менеджеру e-KNOT, если человек хочет подключить услугу или узнать цену, он председатель "
+                    "или представитель УК, просит человека, жалуется, или нужен факт, которого нет в базе знаний."},
+        "debounce": {"enabled": True, "windowSeconds": 4, "maxWindowSeconds": 30, "maxMessagesPerBurst": 10},
+        "guardrails": {"enabled": True, "input": {"enabled": False}, "output": {"enabled": False}, "onFailure": "pass",
+                       "factualGrounding": {"enabled": True, "action": "revise", "contextMessages": 6,
+                                            "sourceTools": ["search_knowledge"], "provider": LLM_PROVIDER,
+                                            "model": GROUNDING_MODEL, "credentialRef": f"vault:{v['id']}"}},
+        "contactAuth": ({"enabled": True, "rule": {"kind": "all", "conditions": [
+                            {"kind": "attribute", "scope": "contact", "key": TESTER_ATTR, "equals": "true"},
+                            {"kind": "conversation_type", "type": "individual"}]},
+                         "denyMessage": None, "handoffEnabled": False, "operatorNoteEnabled": False}
+                        if BOT_AUDIENCE == "testers" else
+                        {"enabled": True, "rule": {"kind": "conversation_type", "type": "individual"},
+                         "denyMessage": None, "handoffEnabled": False, "operatorNoteEnabled": False}),
+    }
+    body = {"name": SELLER_NAME, "systemPrompt": (STACK / "agent" / "seller-prompt.md").read_text(encoding="utf-8"),
+            "enabled": True, "mode": AGENT_MODE, "kind": "text",
+            "modelConfig": {"provider": LLM_PROVIDER, "model": MODEL, "credentialRef": f"vault:{v['id']}",
+                            "temperature": 0.4},
+            "settings": settings}
+    cur = find_agent(a, SELLER_NAME)
+    if cur:
+        body["settings"] = merged_settings(a, cur["id"], settings)
+        st, b = a.req("PATCH", f"/v1/agents/{cur['id']}", body)
+    else:
+        st, b = a.req("POST", "/v1/agents", body)
+    if st >= 300:
+        die(f"seller agent: HTTP {st} {str(b)[:400]}")
+    ag = find_agent(a, SELLER_NAME) or die("seller agent not found after save")
+    print(f"  seller agent id={ag['id']} model={MODEL} copied={sorted(copied)} HTTP {st}")
+    check_gate(a, SELLER_NAME)
+    kb = upsert_kb(a, SELLER_KB, "stack/group-watcher/services.json", "Услуги e-KNOT", seller_knowledge_text())
+    st, cur = a.req("GET", f"/v1/agents/{ag['id']}/tool-selections")
+    keep = [g for g in (cur or {}).get("grants", []) if g.get("source") not in ("NATIVE", "RAG")]
+    st, r = a.req("PUT", f"/v1/agents/{ag['id']}/tool-selections", {"grants": keep + [
+        {"source": "NATIVE", "enabledTools": SELLER_NATIVE},
+        {"source": "RAG", "knowledgeBaseIds": [str(kb["id"])], "enabledTools": ["search_knowledge"]}]})
+    if st >= 300:
+        die(f"seller grants: HTTP {st} {str(r)[:300]}")
+    print(f"  seller grants: natives={SELLER_NATIVE} + search_knowledge over base {kb['id']}")
+    st, b = cw_api("GET", "/labels")
+    if not any(l.get("title") == "lead" for l in (b or {}).get("payload", [])):
+        st, _ = cw_api("POST", "/labels", {"title": "lead", "color": "#F57C00", "show_on_sidebar": True,
+                                           "description": "Продавец: человек хочет подключение или расчёт"})
+    print(f"  label 'lead': HTTP {st}")
+    for q in ("как работает обзвон должников", "сколько стоит онлайн голосование", "как скачать приложение"):
+        search_smoke(a, kb, q)
 
 
 # ---------------------------------------------------------------- Chatwoot operator side
@@ -789,7 +888,7 @@ def step_telegram():
     bind_cw_inbox(res["inbox_id"])
 
 
-def bind_cw_inbox(cw_inbox_id):
+def bind_cw_inbox(cw_inbox_id, name=None):
     """Make agents see a Chatwoot inbox it has not mirrored yet, then bind it to the agent."""
     a = Agents().login()
     # agents mirrors inboxes on its own schedule; ask it to read Chatwoot's list now.
@@ -806,7 +905,7 @@ def bind_cw_inbox(cw_inbox_id):
         time.sleep(3)
     if not mine:
         die("agents does not list the new inbox yet; run 'connect', then 'bind <id>' (ids: 'inboxes')")
-    step_bind(mine["id"])
+    step_bind(mine["id"], name)
 
 
 def set_stack_env(values):
@@ -998,7 +1097,7 @@ def step_playground():
 STEPS = {"chatwoot": step_chatwoot, "agents": step_agents, "vault": step_vault, "agent": step_agent,
          "connect": step_connect, "tickets": step_tickets, "stt": step_stt, "vision": step_vision, "inboxes": step_inboxes,
          "operator": step_operator, "telegram": step_telegram, "tg-userbot": step_tg_userbot,
-         "knowledge": step_knowledge, "group-watcher": step_group_watcher,
+         "knowledge": step_knowledge, "group-watcher": step_group_watcher, "seller": step_seller,
          "playground": step_playground}
 
 if __name__ == "__main__":
@@ -1012,7 +1111,7 @@ if __name__ == "__main__":
     elif cmd == "bind":
         step_bind(sys.argv[2])
     elif cmd == "bind-cw":
-        bind_cw_inbox(sys.argv[2])
+        bind_cw_inbox(sys.argv[2], SELLER_NAME if sys.argv[3:4] == ["seller"] else None)
     elif cmd == "tg-outreach":
         len(sys.argv) == 4 or die("usage: tg-outreach TG_USER_ID TEXT")
         step_tg_outreach(sys.argv[2], sys.argv[3])
