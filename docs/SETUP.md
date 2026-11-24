@@ -1,382 +1,246 @@
-# sales-bot — тестовая среда (ИИ-агент продаж для ЖКХ)
+# sales-bot: развёртывание и эксплуатация
 
-Изолированная ВМ (QEMU/KVM + passt, без libvirt) на хосте CachyOS. Внутри — стек fazer.ai, собранный из исходников:
-Chatwoot-форк (+ встроенный нативный WhatsApp-коннектор) и fazer.ai agents. LLM — OpenRouter, бесплатные модели.
-**Только тестовые данные. Секретов в репозитории нет.**
+Стек работает на ВМ Google Cloud компании e-KNOT (проект, зона, имя ВМ, домен и бакет в `deploy/gcp.env`).
+Внутри Docker Compose: Chatwoot-форк fazer.ai со встроенным WhatsApp-коннектором, fazer.ai agents, LiteLLM
+(шлюз к Gemini на Vertex AI), group-watcher, тестовая диспетчерская, локальный STT, Caddy.
+**Только тестовые данные. Секреты только в Secret Manager, в репозитории их нет.**
 
 ## Состав репозитория
 
 | Путь | Что |
 |---|---|
-| `infra/vm.conf` | параметры ВМ (4 vCPU, 6 ГБ RAM, 60 ГБ, ssh 127.0.0.1:2222) |
-| `infra/vm.sh` | create / start / stop / status / ssh / wait / tunnel / snapshot / revert / snapshots / console |
-| `infra/cloud-init/*.tmpl` | cloud-init: пользователь `dev` (только ключ), Docker, ufw, swap 4 ГБ, ротация логов |
-| `infra/guest/egress-fw.sh` | файрвол исходящего трафика в госте (см. ниже) |
-| `infra/sync.sh` | rsync `vendor/` + `stack/` → `~/work` в ВМ |
-| `infra/vm/` | диски, seed, ssh-ключ ВМ, run-файлы — **в .gitignore** |
-| `vendor/` | shallow-клоны fazer-ai/* — **в .gitignore** |
-| `stack/docker-compose.yml` | стек, собирается из `vendor/` внутри ВМ |
-| `stack/gen-env.sh` | генерирует `stack/.env` с секретами внутри ВМ (chmod 600) |
-| `stack/agent/system-prompt.md` | системный промпт агента |
-| `stack/tickets/server.py` | мок-диспетчерская (заявки) для HTTP-инструментов агента |
-| `stack/bootstrap.py` | первичная настройка Chatwoot/agents, инструменты заявок, playground |
-| `stack/tests/scenarios.py` + `scenarios.json` | сценарии через настоящий пайплайн agents (playground): инструменты, RAG, guardrail |
+| `deploy/gcp.env` | куда разворачивать: проект, зона, ВМ, домен, бакет, `VM_ROOT=/srv/salesbot` |
+| `deploy/ssh.sh` | shell или одна команда на ВМ через IAP (публичного SSH нет); `-- -N -L …` для туннелей |
+| `deploy/sync.sh` | `stack/` и `deploy/` с ноутбука на ВМ. Источник правды: этот checkout. `.env` и ключи не отправляет |
+| `deploy/secrets.sh`, `deploy/secrets.map` | секреты в Secret Manager: `status`, `init` (создать и заполнить случайными), `import` |
+| `deploy/vendor.lock` | исходники fazer.ai, закреплённые по коммиту |
+| `deploy/vm/provision.sh` | разовая подготовка ВМ: Docker из apt, ротация логов, swap, каталог стека, таймер бэкапа |
+| `deploy/vm/fetch-vendor.sh` | клонирует `vendor/` по `vendor.lock` и накладывает `stack/patches` |
+| `deploy/vm/backup.sh` | ночной `pg_dump` обеих баз прямо в `gs://<бакет>/backups/` (хранение 30 дней) |
+| `stack/docker-compose.yml` | стек |
+| `stack/render-env.sh` | на ВМ собирает `stack/.env` (600) из Secret Manager через сервисный аккаунт ВМ, печатает только имена |
+| `stack/bootstrap.py` | настройка Chatwoot и agents по шагам (`python3 -I bootstrap.py` без аргументов печатает список) |
+| `stack/litellm/config.yaml` | модели Gemini и жёсткие лимиты rpm/rpd на каждую |
+| `stack/caddy/Caddyfile` | HTTPS (Let's Encrypt) только для Chatwoot, проверка `secret_token` вебхука Telegram |
+| `stack/group-watcher/` | потребности в WhatsApp-группах → предложение в личку (путь A), каталог услуг, датасет |
+| `stack/agent/` | промпты: бот поддержки (`system-prompt.md`, `knowledge.md`) и продавец (`seller-prompt.md`) |
+| `stack/tickets/`, `stack/stt/`, `stack/tg-userbot/` | тестовая диспетчерская, распознавание голосовых, Telegram-userbot |
+| `stack/patches/` | наши патчи к vendor (эмбеддинги, логи и вебхук Telegram) |
+| `stack/tests/` | сценарии через настоящий конвейер agents: бот поддержки и `--seller` |
 
-## Требования хоста
+## Что нужно на ноутбуке
 
-- CPU с VT-x/AMD-V, доступный `/dev/kvm`.
-- `sudo pacman -Syu --needed qemu-base passt libisoburn` (полное обновление: частичное на Arch не поддерживается;
-  при устаревших базах пакетов зеркала отдают 404).
-- libvirt, systemd-юниты и правила файрвола хоста **не нужны**.
+- `gcloud` с входом в учётную запись, у которой есть доступ к проекту (IAP-туннель и OS Login на ВМ; для
+  `deploy/secrets.sh` ещё `secretmanager.admin`).
+- `rsync`, `ssh`, `python3`. Больше ничего: сборка и запуск идут на ВМ.
 
-## Создание ВМ с нуля
-
-```sh
-# 1. образ Ubuntu 24.04 + проверка
-cd infra/vm/images
-curl -fLO https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img
-curl -fLO https://cloud-images.ubuntu.com/releases/noble/release/SHA256SUMS
-curl -fLO https://cloud-images.ubuntu.com/releases/noble/release/SHA256SUMS.gpg
-gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81
-gpg --verify SHA256SUMS.gpg SHA256SUMS && grep server-cloudimg-amd64.img$ SHA256SUMS | sha256sum -c -
-cd -
-# 2. диск (chattr +C на каталоге ДО создания qcow2 — btrfs) + cloud-init seed
-mkdir -p infra/vm && chattr +C infra/vm   # один раз, на пустом каталоге
-infra/vm.sh create
-# 3. запуск и ожидание cloud-init (~5–10 мин)
-infra/vm.sh start && infra/vm.sh wait
-```
-
-## Стек: сборка, запуск, первичная настройка
+## Первое развёртывание
 
 ```sh
-infra/sync.sh                                   # код хоста -> ВМ (~/work)
-infra/vm.sh ssh 'cd work/stack && ./gen-env.sh' # один раз: секреты стека -> stack/.env (600) в ВМ
-# ключ OpenRouter -> ВМ файлом (stdin, не argv, не печатается):
-grep '^OPENROUTER_API_KEY=' .env | infra/vm.sh ssh 'umask 077; mkdir -p ~/secrets; cat > ~/secrets/openrouter.env'
-infra/vm.sh ssh 'cd work/stack && docker compose build cw-rails && docker compose build agents'  # ~17 мин
-infra/vm.sh ssh 'cd work/stack && docker compose up -d'
-infra/vm.sh ssh 'cd work/stack && python3 -I bootstrap.py all'          # Chatwoot admin, agents /setup, vault, агент, связка
-infra/vm.sh ssh 'cd work/stack && python3 -I bootstrap.py playground'   # smoke-test без WhatsApp
+deploy/secrets.sh init                 # создать недостающие секреты, gen:* заполнить случайными значениями
+deploy/secrets.sh status               # какие секреты заполнены (только имена)
+deploy/sync.sh                         # stack/ и deploy/ -> ВМ
+deploy/ssh.sh 'sudo bash /srv/salesbot/deploy/vm/provision.sh "$USER"'   # один раз
+deploy/ssh.sh 'bash /srv/salesbot/deploy/vm/fetch-vendor.sh'             # vendor/ по vendor.lock + патчи
+deploy/ssh.sh 'cd /srv/salesbot/stack && ./render-env.sh && docker compose build && docker compose up -d'
+deploy/ssh.sh 'cd /srv/salesbot/stack && python3 -I bootstrap.py all'    # Chatwoot, agents, vault, бот поддержки, база, макрос
+deploy/ssh.sh 'cd /srv/salesbot/stack && python3 -I bootstrap.py group-watcher && python3 -I bootstrap.py seller'
+deploy/ssh.sh 'cd /srv/salesbot/stack && docker compose up -d --force-recreate group-watcher'  # прочитать GW_*
 ```
 
-`bootstrap.py` пишет учётные данные только в ВМ: `~/secrets/chatwoot-admin.env`, `~/secrets/agents-admin.env` (600).
-Посмотреть пароль — в своём терминале (не в чате с ИИ): `infra/vm.sh ssh cat secrets/chatwoot-admin.env`.
+Секреты с пометкой `manual` в `deploy/secrets.map` (токены Meta) вносятся руками через stdin:
+`printf %s '…' | gcloud secrets versions add <имя> --data-file=- --project=<проект>`. Значения никогда не
+передаются аргументом и не печатаются. `deploy/secrets.sh` не меняет уже заданные значения: новый
+`agents-encryption-key` сделал бы нечитаемым vault agents, новый пароль БД закрыл бы доступ к существующему тому.
 
-| Сервис | Адрес (после `infra/vm.sh tunnel`) | Health-check |
+`bootstrap.py` пишет учётные данные только на ВМ: `~/secrets/chatwoot-admin.env`, `~/secrets/agents-admin.env`
+(600). Посмотреть пароль: в своём терминале, не в чате с ИИ.
+
+## Обновление
+
+```sh
+deploy/sync.sh
+deploy/ssh.sh 'cd /srv/salesbot/stack && docker compose up -d'           # пересоздаёт изменившиеся сервисы
+```
+
+- Файлы, смонтированные в контейнер (`watcher.py`, `services.json`, `tickets/server.py`, `litellm/config.yaml`),
+  подхватываются только после `docker compose up -d --force-recreate <сервис>`.
+- Промпты, база знаний и настройки агентов живут в agents: после правки `stack/agent/*` или `services.json`
+  запустить нужный шаг (`agent`, `knowledge`, `seller`). Повторный запуск перезапишет ручные правки в консоли agents.
+- Новая версия vendor: поменять коммит в `deploy/vendor.lock`, `fetch-vendor.sh`, `docker compose build <сервис>`,
+  затем оба набора сценариев (ниже).
+- Новый секрет: `deploy/secrets.sh`, затем на ВМ `./render-env.sh` и `docker compose up -d`. `render-env.sh`
+  сохраняет ключи, которые записал `bootstrap.py` (`CW_TGU_*`, `GW_*`).
+
+## Доступ
+
+| Что | Как | Health-check |
 |---|---|---|
-| Chatwoot (форк) | http://localhost:3000 | `curl -s localhost:3000/api` → 200 |
-| agents (консоль, playground) | http://localhost:3100 | `curl -s localhost:3100/api/health` → `status: ok` |
-| Postgres ×2, Redis | только внутри docker-сети ВМ | `docker compose ps` → healthy |
+| Chatwoot (оператор) | `https://<PUBLIC_DOMAIN>` после A-записи; до неё туннель `deploy/ssh.sh -- -N -L 3000:127.0.0.1:3000` и http://localhost:3000 | `curl -s localhost:3000/api` → 200 |
+| agents (консоль, playground) | только туннель: `deploy/ssh.sh -- -N -L 3100:127.0.0.1:3100`, http://localhost:3100 | `curl -s localhost:3100/api/health` |
+| LiteLLM | только туннель: `deploy/ssh.sh -- -N -L 4000:127.0.0.1:4000`, ключ `LITELLM_MASTER_KEY` | `/health/liveliness` |
+| Postgres ×2, Redis, tickets, stt, group-watcher | только внутри docker-сети ВМ | `docker compose ps` → healthy |
 
-Ежедневно: `infra/vm.sh start` → `infra/vm.sh tunnel` (держать открытым) … `infra/vm.sh stop`.
-Стек поднимается сам (`restart: unless-stopped`). Логи: `infra/vm.sh ssh 'cd work/stack && docker compose logs -f agents'`.
+Наружу открыты только 80 и 443 (Caddy). Сертификат Caddy получит, когда `PUBLIC_DOMAIN` начнёт указывать на
+внешний IP ВМ. Логи: `deploy/ssh.sh 'cd /srv/salesbot/stack && docker compose logs -f agents'`. Стек
+поднимается сам после перезагрузки (`restart: unless-stopped`).
 
-### Кому отвечает бот
+## Модели (LiteLLM → Vertex AI)
 
-Агент в `mode: production` — отвечает сам, без `/teste`, но **только тестировщикам**: контактам с галочкой
-«Тестировщик бота» (атрибут контакта `salesbot_tester` в Chatwoot). Остальным — молча ничего (правило допуска
-agents `contactAuth`, отказ без копии и без handoff): номер WhatsApp — настоящая SIM, Telegram-бота может найти кто
-угодно, а данные в стеке только тестовые.
+Все вызовы Gemini идут через LiteLLM: agents и group-watcher знают только `http://litellm:4000/v1` и
+`LITELLM_MASTER_KEY`. LiteLLM ходит в Vertex AI от сервисного аккаунта ВМ, ключей API нет.
+
+| Модель | Кто вызывает | Лимит (config.yaml) |
+|---|---|---|
+| `gemini-3.8-flash` | ответы бота поддержки и продавца, чтение фото | 40 rpm, 1000 rpd |
+| `gemini-3.5-flash-lite` | поиск потребностей (group-watcher), проверка фактов, запасная модель агентов | 50 rpm, 3000 rpd |
+| `gemini-4-argon` | только офлайн-задачи (разбор сложных случаев), в боевом конвейере не вызывается | 5 rpm, 30 rpd |
+| `gemini-embedding-001` | база знаний (RAG), 1536 измерений | 300 rpm, 5000 rpd |
+
+- **Запасная модель.** Gemini Flash иногда тратит токены на размышление и не возвращает ни текста, ни вызова
+  инструмента (`finishReason: STOP` без частей). LiteLLM отдаёт это как `choices: []`, agents повторяет запрос на той
+  же модели и получает то же. Поэтому у обоих агентов `settings.modelFallback` = Flash-Lite (`bootstrap.py`,
+  `FALLBACK_MODEL`). Туда же уходят 429 и таймаут основной модели.
+- **Проверка фактов** (guardrail agents «factual grounding»): перед отправкой Flash-Lite сверяет ответ с тем, что
+  вернули инструменты-источники (`search_knowledge`, инструменты заявок). Цифра, телефон или обещание без
+  источника → ответ переписывается (`action: revise`). Сбой рецензента не блокирует ответ (`onFailure: pass`),
+  сценарии помечают такой ход `UNCHECKED`.
+- **Эмбеддинги.** Колонка векторов в agents 1536, поэтому патч `agents-embedding-dimensions.patch` передаёт
+  `dimensions`. Патч `agents-embedding-internal-targets.patch` разрешает эмбеддингам адрес `litellm:4000` внутри
+  docker-сети (без него индексация падает с `ssrfBlocked`). `PUT /v1/tenant-settings/embedding` сохраняет только
+  `credentialRef`, адрес берётся из записи vault (kind `openai_compatible`).
+- После смены модели, промпта или инструментов: оба набора сценариев (раздел «Проверки»).
+
+## Кому отвечают агенты
+
+Оба агента в `mode: production` отвечают сами, но **только тестировщикам** и **только в личке**: правило допуска
+agents `contactAuth` = атрибут контакта `salesbot_tester` («Тестировщик бота») **и** тип диалога `individual`.
+Остальным молча ничего (без копии и без handoff). В WhatsApp-группе агенты не пишут никогда: группы читает
+group-watcher.
+
 - Добавить тестировщика: Chatwoot → контакт → «Атрибуты контакта» → «Тестировщик бота» ✓, или
-  `python3 -I bootstrap.py testers <contact_id>...` (только явные id: «всем сразу» впустило бы и постороннего).
-- Вернуть режим «молчит до `/teste`»: `AGENT_MODE=test python3 -I bootstrap.py agent`.
-- Открыть всем: `BOT_AUDIENCE=everyone` — bootstrap откажется, пока в `knowledge.md` тестовые заглушки. Любое
-  другое значение (опечатка) — отказ; после записи bootstrap читает агента обратно и падает, если гейт не включён.
-- Оговорка: правило по атрибуту контакта надёжно, пока к агенту не привязан web-widget inbox (там посетитель сам
-  задаёт атрибуты через SDK).
+  `python3 -I bootstrap.py testers <contact_id>...` (только явные id).
+- Режим «молчит до `/teste`»: `AGENT_MODE=test python3 -I bootstrap.py agent` (то же для `seller`).
+- Открыть всем: `BOT_AUDIENCE=everyone`. bootstrap откажется, пока в `knowledge.md` тестовые заглушки, и после
+  записи читает агента обратно: если гейт не включён, падает.
 - `/reset` в диалоге сбрасывает память бота.
 
-### Оператор ↔ бот
+Привязка inbox: один inbox = один агент. WhatsApp-номер (Chatwoot inbox 2) привязан к продавцу:
+`python3 -I bootstrap.py bind-cw 2 seller`. Бот поддержки остаётся для Telegram. Автоназначение в inbox должно
+быть выключено (`bind-cw` делает это сам), иначе Chatwoot назначает диалог оператору и бот молчит (`taken_over`).
 
-- **Бот передал оператору** (`handoff_to_human`) или **оператор сам ответил** в диалоге (публичный ответ из Chatwoot
-  agents считает перехватом) → диалог `open`, бот в нём молчит (лог: `reason=taken_over`). Приватные заметки
-  перехватом не считаются.
-- **Вернуть боту в любой момент:** в диалоге Chatwoot → «Макросы» → **🤖 Вернуть боту** (снимает назначение,
-  ставит `pending`, оставляет заметку). Бот ответит на следующее сообщение жильца и **помнит переписку**, включая
-  ответы оператора (agents дописывает их в память диалога). То же в консоли agents: Conversations → диалог →
-  **Return to AI**. «Завершить» (resolve) тоже возвращает: следующее сообщение жильца откроет диалог как `pending`.
-- Макрос и атрибут создаёт `python3 -I bootstrap.py operator` (входит в `all`).
-Автоназначение в inbox должно быть **выключено** (`bootstrap.py bind` делает это сам): иначе Chatwoot сразу
-назначает каждый новый диалог оператору, и бот молчит с первого сообщения (`taken_over`).
+## Оператор и бот
 
-Ротация токена/секрета бота (если засветились): удалить Agent Bot в Chatwoot (Settings → Bots или
-`DELETE /api/v1/accounts/1/agent_bots/<id>`), затем `POST /api/v1/chatwoot/inboxes/<id>/reconnect` в agents —
-он создаст нового бота с новыми токеном, HMAC-секретом и route-токеном.
+- **Бот передал диалог** (`handoff_to_human`) или **оператор ответил публично** → диалог `open`, бот в нём молчит.
+  Приватные заметки перехватом не считаются.
+- **Вернуть боту:** в диалоге Chatwoot → «Макросы» → **🤖 Вернуть боту** (снимает назначение, ставит `pending`).
+  Бот помнит переписку, включая ответы оператора. То же в консоли agents: Conversations → **Return to AI**.
+- Диалог, который ведёт бот, имеет статус «Ожидающие» (pending). Список диалогов Chatwoot по умолчанию открыт
+  на «Открытые»: `bootstrap.py operator` ставит администратору фильтр «Все», новым операторам переключить вручную.
+- Ротация токена бота: удалить Agent Bot в Chatwoot, затем `POST /api/v1/chatwoot/inboxes/<id>/reconnect` в agents.
 
-### Снапшоты
+## WhatsApp
 
-| Снапшот | Состояние |
+- Коннектор **whatsmeow** (`fazer-ai/whatsapp-connector`), встроен в `cw-sidekiq`, бинарник из закреплённого
+  образа. Подключение: Chatwoot → Settings → Inboxes → Add Inbox → WhatsApp → **WhatsApp (native)** → номер → QR.
+  Затем `python3 -I bootstrap.py bind-cw <inbox_id> [seller]`.
+- **Группы:** `WHATSAPP_GROUPS_ENABLED=true` в compose. Коннектор запоминает флаг групп при подключении сессии,
+  поэтому после включения сессию нужно переподключить (в rails console:
+  `Whatsapp::Session::Facade.new(channel).reassert_desired_state`). Группа появляется в Chatwoot отдельным
+  диалогом с первым сообщением после этого.
+- Неподписанные вебхуки Cloud API отклоняются: `WHATSAPP_ACCEPT_UNSIGNED_WEBHOOKS=false`.
+- **Сессия WhatsApp = секрет.** БД `chatwoot_production_whatsapp_connector` даёт полный доступ к номеру как
+  связанное устройство. Её не выгружают ни в бэкап, ни куда-либо ещё. После потери: в телефоне отвязать устройство,
+  в Chatwoot переподключить inbox, заново QR (около минуты).
+- Только тестовая SIM: неофициальное подключение несёт риск блокировки номера.
+
+## group-watcher: потребности в группах (путь A)
+
+```
+сообщение в группе ─ вебхук Chatwoot (HMAC) ─ group-watcher ─ фильтр по корням ru/kk ─ Flash-Lite (пачка до 20 + 6 контекста)
+   └─ потребность ─ карточка 💡 приватной заметкой в группе ─ правила ─ личное сообщение с услугой ─ «🤖 Вернуть боту» ─ продавец
+```
+
+- Читает только группы с меткой `salesbot-watch` (ставит оператор в Chatwoot). Сообщения до метки не учитываются.
+- Правила отправки (по порядку): отказ «стоп» → уверенность ≥ 0,7 → одно предложение человеку в 7 дней → лимит в
+  день (`GW_DAILY_SEND_CAP`, 20) → режим. Тихие часы 21–09 (Астана): предложение ждёт утра до 14 ч.
+- Режимы `GW_SEND_MODE`: `auto` отправляет сам; `approve` ждёт оператора (`/offer N` или `/skip N` приватной
+  заметкой); `dry` только карточки.
+- «стоп» (стоп, stop, тоқта, отписаться…) в группе или в личке: отметка `salesbot_optout` у контакта, его
+  сообщения удаляются из базы сервиса, ответ «Хорошо, больше не побеспокою».
+- Каталог услуг: `stack/group-watcher/services.json` (7 услуг eknot.me и Аудитор ЖКХ). Из него же `bootstrap.py
+  seller` собирает базу знаний продавца: после правки каталога `--force-recreate group-watcher` и `seller`.
+
+Команды (на ВМ, `docker compose exec group-watcher python3 -I /app/watcher.py …`):
+
+| Команда | Что |
 |---|---|
-| `base-clean` | чистая ВМ после cloud-init, без секретов и стека |
-| `stack-ready` | стек собран и настроен, секреты внутри, **WhatsApp не сопряжён** |
+| `stats` | счётчики за всё время |
+| `report [дней]` | цифры для ежедневного отчёта: воронка от сообщения до лида, доставка, ответы за 24 ч, отказы |
+| `eval /app/samples.json` | точность и полнота распознавания на размеченных сообщениях |
+| `forget <contact_id>` | для тестов: снять отказ, предложения и паузу 7 дней у контакта |
 
-`infra/vm.sh stop && infra/vm.sh revert <имя> && infra/vm.sh start`. После сопряжения — см. политику ниже.
+## Продавец e-KNOT
 
-## Сеть и изоляция
+Агент «Продавец e-KNOT (тест)» (`bootstrap.py seller`) ведёт личку после предложения. Пишет как «помощник e-KNOT»,
+коротко, ответ дробится на сообщения до 280 знаков с «печатает…» (`settings.split`, 90 слов в минуту). Факты
+только из базы знаний «Услуги e-KNOT (eknot.me)». Цены не называет. На цену и подключение ставит метку `lead` и
+передаёт диалог менеджеру e-KNOT. Жилищные споры направляет в бесплатный Аудитор ЖКХ (zhkh.zerde.site). На
+прямой вопрос «вы бот?» отвечает «цифровой помощник e-KNOT». Настройки голосовых и фото копирует у бота поддержки.
 
-- `passt --no-map-gw --ipv4-only`: гость **не** видит loopback хоста; IPv6 выключен.
-- Наружу проброшен только SSH: `127.0.0.1:2222` хоста → 22 гостя. Веб-интерфейсы — только через
-  `infra/vm.sh tunnel` (ssh -L на 127.0.0.1 хоста): Chatwoot `http://localhost:3000`, agents `http://localhost:3100`.
-- DNS гостя: 1.1.1.1, 9.9.9.9 (резолвер хоста недоступен намеренно).
-- ufw в госте: входящие — только 22/tcp.
-- Исходящие (`infra/guest/egress-fw.sh`, systemd-юнит `sales-bot-egress-fw`):
-  - `OUTPUT` → цепочка `SALESBOT-OUT`: ESTABLISHED,RELATED, `lo`, `-o docker0`, `-o br-+`, DHCP → разрешено;
-    затем DROP на 10/8, 172.16/12, 192.168/16, 100.64/10 (Tailscale), 169.254/16.
-  - `DOCKER-USER` → цепочка `SALESBOT-FWD`: ESTABLISHED,RELATED, `-i br-+ -o br-+`, `-i docker0 -o docker0`
-    → разрешено; затем те же DROP. Мосты разрешены по интерфейсу, а не по подсети: подсети 172.x совпадают
-    с docker-сетями хоста.
-  - Интернет (DNS, apt, docker pull, OpenRouter, WhatsApp) работает.
+## Бот поддержки: заявки, голосовые, фото, справочник
 
-## WhatsApp-коннектор
-
-- Библиотека: **whatsmeow** (`go.mau.fi/whatsmeow`), сервис `fazer-ai/whatsapp-connector` (Go, MIT). Не Baileys:
-  Baileys/Z-API в форке помечены «замороженными» (legacy), `baileys-api` не используется.
-- Режим: встроенный (embedded) в контейнер `cw-sidekiq`; бинарник берётся из готового образа
-  `ghcr.io/fazer-ai/whatsapp-connector:0.9.0@sha256:995a580c61364141fae139e476f62d29f32f7d08a87aac3f236c85d0c90df1bc`
-  при сборке Chatwoot (не из исходников).
-- Подключение: Chatwoot → Settings → Inboxes → Add Inbox → WhatsApp → **WhatsApp (native)** → номер → QR
-  (или код сопряжения, если WhatsApp требует passkey и QR не проходит). Затем привязать inbox к агенту:
-  `python3 -I bootstrap.py inboxes` → `python3 -I bootstrap.py bind <id>`.
-- Сессия (связанное устройство, ключи Signal/Noise) хранится в Postgres Chatwoot, в отдельной БД
-  `chatwoot_production_whatsapp_connector` (создаётся автоматически; пользователю БД нужен CREATEDB).
-  Владелец сессии определяется арендой в Redis; события/команды ходят через Redis Streams.
-- Медиа коннектора — том `wac_media` (`WAC_MEDIA_ROOT=/app/wac-media`); исходящие вложения коннектор забирает
-  у Rails по `INTERNAL_HOST_URL=http://cw-rails:3000`.
-- Звонки (UDP) выключены.
-
-### ⚠️ Сессия WhatsApp = секрет. Политика снапшотов
-
-- Содержимое БД `*_whatsapp_connector` (и тома Postgres целиком) даёт полный доступ к номеру как связанное устройство.
-  Не копировать из ВМ, не коммитить, не делиться дампами.
-- Снапшот `base-clean` делается **до** установки секретов и **до** сканирования QR.
-- **После сопряжения снапшоты ВМ не откатывать**: откат вернёт старое состояние ключей (ratchet), возможна
-  рассинхронизация, потеря сообщений и разлогин. Вместо отката: отвязать устройство в телефоне
-  (WhatsApp → Связанные устройства), в Chatwoot переподключить inbox и **заново отсканировать QR**.
-- Использовать только вторую SIM: неофициальное подключение несёт риск блокировки номера.
-
-## LLM (OpenRouter)
-
-- Ключ хранится на хосте в `./.env` (`OPENROUTER_API_KEY`, в .gitignore). В ВМ передаётся файлом
-  `~/secrets/openrouter.env` (chmod 600) и заносится в зашифрованное хранилище (vault) agents через REST изнутри ВМ.
-  Значение ключа нигде не печатается.
-- Бесплатные модели (`:free`) — $0 (проверено: `usage: 0`); на ключе лимит трат $5.
-- Основная: `nvidia/nemotron-3-ultra-550b-a55b:free`. Запасные: `nvidia/nemotron-3.5-super-vl:free`,
-  `google/gemma-4-31b-it:free` (часто 429).
-- Жёсткое правило в промпте: суммы, тарифы, даты, юридические формулировки — только из ответов инструментов
-  (включая `search_knowledge`), иначе «Уточню у оператора…» + `handoff_to_human`. Проверяет это не промпт, а
-  guardrail agents «factual grounding» (см. «Справочник УК»).
-- **При каждой смене модели, промпта или инструментов** в ВМ: `python3 -I tests/scenarios.py` (из `~/work/stack`).
-  Сценарии идут через playground agents — та же модель, промпт, инструменты, база знаний и guardrail, что у живого
-  бота; сценарий лишь говорит, какие инструменты должны (или не должны) быть вызваны. Playground не создаёт
-  диалога, поэтому заявки из сценариев — без телефона. `say` может быть списком реплик (один диалог, `threadId`).
-  Handoff в playground только симулируется, и модель пишет после него ещё строку; в бою же `customerMessage`
-  handoff — последнее, что видит жилец, поэтому прогон проверяет именно его.
-
-## Внешние обращения стека
-
-- agents: `FAZER_AI_HUB_URL=""` — к app.fazer.ai не ходит.
-- Chatwoot: `DISABLE_TELEMETRY=true`.
-- Сборка Chatwoot скачивает официальный `enterprise/` с GitHub только для сверки хеша и сборки ассетов;
-  в итоговый образ он не попадает, Enterprise не активируется (нет `CW_EDITION=ee`).
-- Установщик fazer.ai (`install.sh` → `bunx @fazer-ai/agents@latest`) **не используется**: он требует OAuth-входа
-  на app.fazer.ai и глобально ставит плагин Claude Code.
-
-## Проверено end-to-end (2026-11-12)
-
-Телефон → вторая SIM (WhatsApp native) → Chatwoot → agents (`nemotron-3-ultra:free`) → ответ в WhatsApp и в Chatwoot.
-`/teste` включает диалог; заявка на домофон — бот собирает адрес; вопрос о цене — личная заметка с причиной +
-`handoff_to_human` (диалог переоткрыт и назначен оператору). Импорт истории при сопряжении: 0 диалогов.
-
-## Заявки (тестовая диспетчерская)
-
-Kanban в открытом форке Chatwoot — только заглушка Pro, поэтому заявки ведёт отдельный мок-сервис `tickets`
-(`stack/tickets/server.py`: stdlib Python + SQLite, том `tickets_data`). Порт наружу не публикуется, доступ только
-из docker-сети по Bearer-токену `TICKETS_API_TOKEN` (`stack/.env`, в vault agents — запись «Tickets (test dispatcher)»,
-kind `bearer_token`). В agents он разрешён через `SSRF_INTERNAL_TARGETS=…,tickets:8080` + `allowedHosts: ["tickets"]`.
-
-| Инструмент агента | Что делает | Откуда данные |
-|---|---|---|
-| `create_ticket` | POST заявки, ответ: номер `ГГГГ-NNNNN`, статус, срок (`sla_text`) — только данные, без указаний боту | модель: категория, срочность, адрес, квартира, суть; сервер: `conversation_id`, телефон, имя из контекста |
-| `get_my_tickets` | последние 5 заявок **этого** телефона | телефон только из контекста диалога, модель его не задаёт |
-| `add_ticket_note` | дополнение к **своей** заявке (уточнение, что на фото, время доступа) | модель: номер, текст; сервер проверяет владельца по диалогу, телефону или контакту — чужая заявка → 404, закрытая → 409 |
-| `submit_meter_reading` | приём показаний счётчика, номер приёма `П-ГГГГ-NNNNN`, предыдущее показание и расход | модель: тип, показание, зав. номер, адрес, квартира; сервер: контекст диалога |
-
-- Повтор в том же диалоге (та же категория, адрес и квартира, 24 ч) возвращает открытую заявку (`duplicate: true`);
-  если повтор аварийный, а открытая заявка обычная — она повышается до аварийной (эскалация).
-- Заявки жильца ищутся по телефону **или** `contact_id` Chatwoot (у WhatsApp-контакта без телефона — по контакту).
-- Окно приёма показаний проверяет сервис, а не бот: `READINGS_WINDOW` (по умолчанию `20-25`, дни включительно) по
-  местному времени УК `UK_UTC_OFFSET` (по умолчанию `5`, Казахстан). Вне окна — HTTP 422 `outside_window` с окном и
-  датой следующего приёма (`next_window_text`, «20 ноября»); бот называет их из ответа. Справочник
-  (`agent/knowledge.md`) говорит то же окно словами — меняя `READINGS_WINDOW`, поправьте и его.
-- Показания: тот же счётчик = тип + адрес/квартира (+ зав. номер, если есть у обоих). Меньше предыдущего — HTTP 409
-  (`expectedStatuses: [409, 422]`, бот просит перепроверить); то же значение за 24 ч — `duplicate: true`. Цифры с фото
-  бот сначала подтверждает у жильца, набранные текстом передаёт сразу. Список: `server.py readings`.
-- Сроки (`SLA` в `server.py`) вымышленные; модель вправе их называть только потому, что они пришли из инструмента.
-- Встроенные инструменты агента ограничены явным списком: `handoff_to_human`, `private_note`, `set_labels`,
-  `get_current_time` (без явной строки NATIVE agents выдаёт все, включая `resolve_conversation` и `send_image`).
-- Настройка: `./gen-env.sh` (допишет токен в существующий `.env`), `docker compose up -d tickets agents`,
-  `python3 -I bootstrap.py agent && python3 -I bootstrap.py tickets`.
-- «Добавил к заявке» бот говорит только при `added: true`. Посмотреть дополнения: `server.py notes 2026-00006`.
-- Оператору: `docker compose exec tickets python3 -I /app/server.py list` и
-  `… set-status 2026-00001 in_progress|done|cancelled`.
-- В playground нет телефона и `conversation_id`: `get_my_tickets` честно отвечает «телефон неизвестен».
-
-## Голосовые (локальный STT)
-
-Голосовые распознаёт сервис `stt` в ВМ: `stack/stt/` (faster-whisper 1.2.1, модель `large-v3-turbo` int8,
-скачивается **при сборке** образа и вшивается в него; в работе `HF_HUB_OFFLINE=1`). Голос жильцов не покидает ВМ,
-денег не стоит. Отвечает в формате OpenAI `/v1/audio/transcriptions`, в agents подключён как провайдер
-`openai-compatible` (vault «STT (local whisper)», `baseUrl http://stt:8000/v1`, Bearer `STT_API_TOKEN` из `stack/.env`).
-
-- Скорость: ~0,75× реального времени на 4 vCPU (7 с аудио → ~5 с). Таймаут STT в agents — 60 с, значит голосовые
-  длиннее ~75 с не распознаются (бот получит пометку «аудио не разобрано»). Модель `small` в 4 раза быстрее,
-  но заметно хуже по-русски: `WHISPER_MODEL=small docker compose build stt` + `STT_MODEL_ID=whisper-small`.
-- Память: ~1,8 ГБ (`mem_limit: 2560m`). Образ 3,9 ГБ.
-- `av==18.1.0` закреплён: в av 19 убран аргумент `metadata_errors`, который передаёт faster-whisper 1.2.1.
-- Вложения agents скачивает сам: `data_url` от `localhost:3000` переписывается на `cw-rails:3000`
-  (`attachmentFetchTarget`, потому что `cw-rails:3000` объявлен в `SSRF_INTERNAL_TARGETS`).
-- `/v1/vault/test` для этой записи всегда отвечает `blocked_url` (проба идёт через SSRF-guard) — это норма.
-  Проверка целиком: `POST /api/v1/agents/1/playground/audio/transcribe` (multipart `file`).
-- Настройка: `./gen-env.sh`, `docker compose build stt && docker compose up -d stt`, `python3 -I bootstrap.py stt`.
-
-**Внутренняя сеть `internal` (`internal: true`, без выхода в интернет):** в ней `stt` и `tickets`; `agents`
-подключён к обеим сетям. Причина: внутри faster-whisper есть onnxruntime с кодом телеметрии Microsoft
-(в логе `telemetry_1ds`), а этим двум сервисам интернет не нужен. Проверено: из `stt` наружу — `URLError`,
-из `agents` доступны `stt`, `tickets`, `cw-rails` и OpenRouter.
-
-## Изображения (vision)
-
-Фото и документы во входящих читает `nvidia/nemotron-3.5-super-vl:free` через OpenRouter (vault «OpenRouter»,
-`bootstrap.py vision`), промпт извлечения русский и про ЖКХ (`VISION_PROMPT`: счётчики, повреждения, квитанции;
-«не додумывай, неразборчивое отметь»). Картинки уходят в OpenRouter, как и текст диалога, — данные только тестовые.
-~3–25 с на фото (очередь free-модели), $0.
-`reasoningEffort: "none"` обязателен: модель рассуждающая и без него тратит 400–700 токенов на «мысли», а agents
-даёт одной картинке 20 с (`VISION_IMAGE_CEILING_MS`) — в WhatsApp фото падало по таймауту. Проверка: `POST /api/v1/agents/1/playground/file/extract` (multipart `file`); у
-`playground/file` нет подписи к файлу — адрес передавайте следующим сообщением.
-
-## Справочник УК (база знаний)
-
-`stack/agent/knowledge.md` — справочник: экстренные номера (112/101/103/104 — настоящие), вымышленные АДС, офис,
-часы приёма, окно приёма показаний, цены 4 платных услуг. Это **база знаний agents** («Справочник УК (тест)»,
-`bootstrap.py knowledge` пересоздаёт её из файла), а не текст в промпте: бот ищет в ней инструментом
-`search_knowledge` (RAG), в промпте только правила. Править можно и в консоли agents → Knowledge, но следующий
-`bootstrap.py knowledge` вернёт содержимое файла. При `BOT_AUDIENCE=everyone` bootstrap откажется загружать
-справочник с тестовыми заглушками (`000-00-0`, `.example`, «Тестовая»).
-
-**Проверка фактов — guardrail agents «factual grounding»** (`settings.guardrails.factualGrounding`, задаёт
-`bootstrap.py agent`): перед отправкой отдельная модель-рецензент (`GROUNDING_MODEL`, по умолчанию
-`nvidia/nemotron-3-ultra-550b-a55b:free`) сверяет ответ с тем, что вернули `search_knowledge`, `create_ticket`,
-`get_my_tickets`, `add_ticket_note`, `submit_meter_reading`; цифра, телефон или обещание без источника → бот пишет
-ответ заново (`action: revise`). Модерация входа/выхода выключена. Вердикт виден в trace playground и в логах agents
-(`check: factual_grounding`). Пример находки: «оператор подключится через минуту» — такого срока нет в источниках.
-- Рецензенту agents даёт 30 с (`REVIEW_TIMEOUT_MS`, не настраивается). На бесплатных моделях это предел: проверено
-  2026-11-12 — `google/gemma-4-26b-a4b-it:free` 429 на каждый запрос, `nvidia/nemotron-3.5-lightning:free` то 429,
-  то таймаут; лучше всех держится основная ultra (≈1 сбой на 13 ходов). Сбой проверки не блокирует ответ
-  (`onFailure: pass`) — ответ уходит непроверенным; сценарный прогон помечает такой ход `UNCHECKED`. С платной
-  моделью (грант) рецензента стоит сделать другого семейства, чем основную.
-- Guardrail проверяет только ходы, где вызывался инструмент-источник. Обещание без инструментов («оператор
-  подключится через несколько секунд» при простой просьбе позвать человека) он не видит — это остаётся на промпте.
-
-**Эмбеддинги (RAG):**
-- Колонка векторов в agents жёстко 1536, а бесплатные `nvidia/nemotron-3.5-embed-*:free` по умолчанию отдают
-  2048/4096. Патч `stack/patches/agents-embedding-dimensions.patch` добавляет `dimensions: 1536` в запрос при
-  `EMBEDDING_SEND_DIMENSIONS=true` (задано в compose). vendor/ не в git, поэтому после `git pull` в vendor/agents:
-  `stack/patches/apply.sh`, затем `docker compose build agents`.
-- `python3 -I bootstrap.py knowledge`: эмбеддинги `nvidia/nemotron-3.5-embed-8b:free`, база «Справочник УК (тест)»
-  из `agent/knowledge.md` (пересоздаётся из файла), проверочный поиск.
-- ⚠️ `PUT /v1/tenant-settings/embedding` сохраняет **только** `credentialRef` (provider/model/baseURL молча
-  отбрасываются), а адрес берётся из записи vault, **только если её kind `openai_compatible`**. С записью kind
-  `openrouter` agents отправляет ключ на `api.openai.com` (так и случилось 2026-11-12: 2 запроса, ответ 401).
-  Поэтому для эмбеддингов отдельная запись «OpenRouter (embeddings)» kind `openai_compatible`, baseUrl
-  `https://openrouter.ai/api/v1`; bootstrap проверяет kind и адрес и иначе отказывается. Модель задаётся на базе
-  (`embeddingModel`), не в настройках.
-Форматирование: `**жирный**` Chatwoot сам переводит в WhatsApp-разметку, а строка `---` уходит отдельным
-сообщением — промпт её запрещает.
-
-Грант Google: что запросить и как это ляжет на agents — [GOOGLE-GRANT-REQUEST.md](GOOGLE-GRANT-REQUEST.md).
+- **Заявки** ведёт мок-сервис `tickets` (`stack/tickets/server.py`), инструменты агента `create_ticket`,
+  `get_my_tickets`, `add_ticket_note`, `submit_meter_reading`. Сроки (`SLA`) вымышленные, модель называет их только
+  потому, что они пришли из инструмента; аварийная заявка возвращает и телефон аварийно-диспетчерской службы.
+  Оператору: `docker compose exec tickets python3 -I /app/server.py list | set-status <номер> <статус>`.
+- **Голосовые** распознаёт `stt` на ВМ (faster-whisper `large-v3-turbo` int8, модель вшита в образ, работа
+  офлайн). Голос жильцов не покидает ВМ. Таймаут STT в agents 60 с: голосовые длиннее ~75 с не распознаются.
+- **Фото и документы** читает Gemini Flash (`bootstrap.py vision`) с русским промптом про ЖКХ.
+- **Справочник УК** (`stack/agent/knowledge.md`) загружается в базу знаний agents (`bootstrap.py knowledge`),
+  бот ищет в ней через `search_knowledge`. Номера 112/101/103/104 настоящие, остальное тестовое.
+- Встроенные инструменты агентов ограничены явным списком (`handoff_to_human`, `private_note`, `set_labels`,
+  `get_current_time`).
+- `stt` и `tickets` в сети `internal` без выхода в интернет.
 
 ## Telegram
 
-Inbox Chatwoot «Telegram» на бота из @BotFather. Chatwoot для Telegram регистрирует вебхук на `FRONTEND_URL`, а
-Telegram ходит только на публичный HTTPS — у ВМ его нет. Поэтому вебхук не ставится, а сервис `tg-bridge`
-(`stack/tg-bridge/bridge.py`, stdlib) опрашивает `getUpdates` и передаёт каждое обновление в собственный маршрут
-Chatwoot `POST http://cw-rails:3000/webhooks/telegram/<token>` внутри docker-сети. Ответы Chatwoot отправляет сам
-через `api.telegram.org`. Мост наружу ходит только в `api.telegram.org` и токен не пишет в лог. Chatwoot писал бы
-токен из пути вебхука в лог запросов и в аргументы задания — это закрывает патч
-`stack/patches/chatwoot-telegram-token-logs.patch` (маска пути, `bot_token` в filter_parameters,
-`log_arguments = false`); после `git pull` в vendor/chatwoot: `stack/patches/apply.sh` и пересборка cw-rails.
-Обновление подтверждается Telegram только после ответа Chatwoot 2xx: перезапуск Chatwoot ничего не теряет, но
-таймаут после уже принятого обновления даст одно повторное сообщение.
+- **Бот** (`bootstrap.py telegram`): Chatwoot ставит вебхук на `https://<PUBLIC_DOMAIN>/webhooks/telegram/<token>` с
+  `secret_token`; Caddy пропускает только вызовы с этим заголовком. Патчи Chatwoot маскируют токен в логах.
+  **Нужна A-запись домена**: без публичного HTTPS Telegram вебхук не примет.
+- **Userbot** (`stack/tg-userbot/`, профиль compose `tg-userbot`): спайк S2 на Telethon, заморожен до 06.12.
+  Telethon архивирован, замена на Kurigram в бэклоге.
 
-1. @BotFather → `/newbot` → токен. Записать на хосте в `./.env`: `TELEGRAM_BOT_TOKEN=…` (**не в чат**).
-2. `infra/push-secret.sh TELEGRAM_BOT_TOKEN` — переносит одну строку в `~/work/stack/.env` ВМ через stdin ssh.
-3. В ВМ: `docker compose --profile telegram up -d tg-bridge`, затем `python3 -I bootstrap.py telegram` (inbox
-   без вебхука, автоназначение выключено, привязка к агенту).
-4. Написать боту в Telegram; в Chatwoot у нового контакта поставить «Тестировщик бота» (или
-   `bootstrap.py testers <id>`), написать ещё раз — бот ответит.
+## Проверки
 
-- Сохранение inbox в настройках Chatwoot снова ставит вебхук (и падает на http-адресе). Мост сам снимает вебхук,
-  если Telegram ответит 409, но настройки Telegram-inbox в UI лучше не трогать.
-- У Telegram-контакта нет телефона: `get_my_tickets` ищет заявки по `contact_id`.
+```sh
+python3 -I stack/group-watcher/test_watcher.py                       # ноутбук, логика без сети
+deploy/ssh.sh 'cd /srv/salesbot/stack && python3 -I tests/scenarios.py'            # бот поддержки, 14 сценариев
+deploy/ssh.sh 'cd /srv/salesbot/stack && python3 -I tests/scenarios.py --seller'   # продавец, 12 сценариев
+deploy/ssh.sh 'cd /srv/salesbot/stack && docker compose exec -T group-watcher python3 -I /app/watcher.py eval /app/samples.json'
+```
 
-## Telegram userbot (v2, спайк S2)
+Сценарии идут через playground agents: та же модель, промпт, инструменты, база знаний и проверка фактов, что у
+живого бота. Playground не создаёт диалога Chatwoot, поэтому заявки из сценариев без телефона, а handoff только
+симулируется: прогон проверяет `customerMessage` handoff, как увидит жилец. Ответы продавца дополнительно
+проверяются на шаблонные ИИ-фразы, markdown и «я бот».
 
-Обычный Telegram-аккаунт со своим номером, а не бот: жильцы видят человека с username. Сервис `tg-userbot`
-(`stack/tg-userbot/`, Telethon 1.45, зависимости закреплены хэшами) — профиль compose `tg-userbot`:
-- личка → API-inbox Chatwoot «Telegram (userbot)» через публичный client API (контакт `tg:<user_id>`); фото,
-  голосовые и файлы — вложениями (голосовые распознаёт локальный STT агента). Ответы бота или оператора приходят
-  вебхуком (HMAC `X-Chatwoot-Signature`) и уходят от имени аккаунта: «прочитано», «печатает…» (1,5–6 с по длине),
-  затем текст и вложения; по каждому жильцу строго по порядку;
-- то, что владелец пишет жильцу **с телефона**, попадает в тот же диалог как сообщение пользователя «Оператор
-  (телефон Telegram)» (agent только этого inbox, токен `CW_TGU_OPERATOR_TOKEN`); агент видит вмешательство
-  человека и переводит диалог в open; обратно в Telegram такое сообщение не уходит (`source_id` `tgm:`);
-- группы → таблица `group_messages` в `/data/userbot.db` — очередь для будущего profiler (V2-GROUPS-PLAN.md);
-- первый контакт: `python3 -I bootstrap.py tg-outreach <tg_user_id> "<текст>"` — диалог и исходящее сообщение в
-  Chatwoot; мост отправит его, только если человек писал в разрешённой группе, и дальше ведёт эту личку
-  (`allowed_chats.kind = outreach`).
+## Бэкап
 
-**По умолчанию ничего не читается.** Аккаунт личный, в нём есть чужие переписки. Сервис обрабатывает только
-чаты, разрешённые самим владельцем: написать **с этого аккаунта** в нужном чате (тестовая группа или личка с
-тестировщиком) `/salesbot allow`; `/salesbot deny` — запретить; `/salesbot status` — ответ придёт в «Избранное».
-Командное сообщение сразу удаляется. В логах только id и длины, без текста.
+Ночью (03:15 UTC, таймер `salesbot-backup`) `deploy/vm/backup.sh` выгружает базы Chatwoot (`chatwoot_production`) и agents прямо в бакет,
+без записи на диск. БД WhatsApp-коннектора не выгружается (это секрет, см. выше). Восстановление из бэкапа ещё не
+проверялось.
 
-Запуск:
-1. `TG_API_ID`, `TG_API_HASH` (my.telegram.org) в `./.env` хоста → `infra/push-secret.sh TG_API_ID`, то же для
-   `TG_API_HASH`.
-2. В ВМ: `python3 -I bootstrap.py tg-userbot` — API-inbox, `CW_TGU_INBOX_IDENTIFIER` / `CW_TGU_WEBHOOK_SECRET` в
-   `stack/.env`, привязка агента. Chatwoot должен пускать вебхук внутрь сети: `tg-userbot:8080` в
-   `SAFE_FETCH_PRIVATE_TARGETS` (compose), после правки — `docker compose up -d cw-rails cw-sidekiq`.
-3. Вход (один раз, интерактивно — номер, код из Telegram, пароль 2FA) в своём терминале:
-   `infra/vm.sh ssh -t 'cd ~/work/stack && docker compose --profile tg-userbot run --rm tg-userbot login'`.
-   Сессия — секрет, как сессия WhatsApp: лежит в томе `tgu_data`, в git и логи не попадает.
-4. `docker compose --profile tg-userbot up -d tg-userbot`; в тестовом чате `/salesbot allow`; отметить новый
-   контакт тестировщиком (`bootstrap.py testers <id>`), иначе агент ему не ответит.
+## Внешние обращения стека
 
-Риски: антиспам Telegram (`PEER_FLOOD`, `FLOOD_WAIT`, заморозка аккаунта). Сервис отправляет только в
-разрешённые чаты, не чаще раза в `SEND_MIN_INTERVAL` (3 с) на чат и не больше `SEND_MAX_PER_HOUR` (30) в час.
-Холодное сообщение незнакомцу — главный триггер `PEER_FLOOD`: для первого контакта держать лимит ниже, чем для
-ответов (замер — следующий шаг). Медиа с телефона владельца без подписи в Chatwoot не зеркалируются.
-
-## Админ-панели
-
-| Где | Адрес (через `infra/vm.sh tunnel`) | Для чего |
-|---|---|---|
-| Chatwoot | http://localhost:3000 (`admin@salesbot.test`, пароль в ВМ `~/secrets/chatwoot-admin.env`) | рабочее место оператора: диалоги, макрос «🤖 Вернуть боту», контакты и галочка «Тестировщик бота», inbox'ы (WhatsApp, Telegram), личные заметки бота |
-| agents | http://localhost:3100 (пароль в ВМ `~/secrets/agents-admin.env`, интерфейс на английском) | настройка бота: промпт, модель, инструменты, голос/фото, правило допуска; Conversations (+ **Return to AI**), Knowledge, Logs (почему бот молчал: `taken_over`, `contact_auth`…), Playground |
-
-- Диалог, который ведёт бот, имеет статус **«Ожидающие» (pending)**, а список диалогов Chatwoot по умолчанию
-  открыт на «Открытые» — без фильтра «Все» кажется, что диалоги пропали. `bootstrap.py operator` ставит
-  администратору фильтр статуса «Все»; новым операторам — переключить статус в шапке списка.
-- Telegram-контакты (без телефона и e-mail) не видны в общем списке «Контакты» — искать через диалог.
-
-Всё, что настраивает `bootstrap.py`, при повторном запуске перезапишет ручные правки в консоли agents
-(промпт, режим, допуск) — постоянные изменения вносить в `stack/agent/*.md` и `bootstrap.py`.
+- agents: `FAZER_AI_HUB_URL=""`, к app.fazer.ai не ходит. Chatwoot: `DISABLE_TELEMETRY=true`.
+- Наружу ходят: LiteLLM в Vertex AI, коннектор в WhatsApp, Chatwoot в api.telegram.org, Caddy в Let's Encrypt.
+- Установщик fazer.ai (`install.sh`) не используется: он требует OAuth-входа на app.fazer.ai.
 
 ## Открытые задачи
-- [ ] При запахе газа handoff происходит только после адреса (номера 104/112 бот теперь берёт из справочника).
-- [ ] Перепроверить фото из WhatsApp после `reasoningEffort: none` (до этого — таймаут). Голосовое — проверено.
-- [ ] Окно приёма показаний 20–25 инструмент не проверяет (бот может «принять» 3-го числа).
-- [ ] Upstream (fazer-ai/chatwoot): маска токена Telegram в логах (наш патч).
-- [ ] Upstream (fazer-ai/agents): issue/PR на `dimensions` и на молчаливый fallback эмбеддингов к api.openai.com.
-- [ ] Dev-режим Chatwoot с горячей перезагрузкой для правок админ-панели (сейчас — полная пересборка образа).
+
+- [ ] A-запись `PUBLIC_DOMAIN` → сертификат, Telegram-бот, публичная ссылка для ментора.
+- [ ] Путь B (WhatsApp Cloud API): приложение Meta, тестовый номер, шаблоны ru/kk, inbox `whatsapp_cloud`.
+- [ ] Проверить восстановление из бэкапа на пустой копии.
+- [ ] Окно приёма показаний 20–25 инструмент не проверяет.
+- [ ] Upstream: маска токена Telegram в логах (fazer-ai/chatwoot), `dimensions` эмбеддингов (fazer-ai/agents).
