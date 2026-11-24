@@ -1,6 +1,8 @@
-# sales-bot test stack: Chatwoot fork (+ embedded native WhatsApp connector) + fazer.ai agents.
-# Built from ../vendor sources INSIDE the VM. Secrets come from ./.env (gen-env.sh), never from this file.
-# All published ports bind to 127.0.0.1 of the VM; the host reaches them via `infra/vm.sh tunnel`.
+# sales-bot stack on the Google Cloud VM: Chatwoot fork (+ embedded native WhatsApp connector) + fazer.ai agents,
+# Gemini on Vertex AI through LiteLLM, HTTPS through Caddy.
+# Built from ../vendor (deploy/vm/fetch-vendor.sh) ON the VM. Secrets come from ./.env, which render-env.sh builds
+# from Secret Manager; never from this file. Only Caddy is public (80/443); everything else binds to 127.0.0.1
+# of the VM or stays inside docker networks (the agents console: deploy/ssh.sh -- -N -L 3100:127.0.0.1:3100).
 name: salesbot
 
 x-cw-env: &cw-env
@@ -10,10 +12,10 @@ x-cw-env: &cw-env
   RAILS_LOG_TO_STDOUT: "true"
   LOG_LEVEL: info
   DEFAULT_LOCALE: ru
-  # Browser address (through the SSH tunnel) and the in-network address the connector fetches media from.
-  FRONTEND_URL: http://localhost:3000
+  # Public address (Caddy, HTTPS) and the in-network address the connector fetches media from.
+  FRONTEND_URL: https://${PUBLIC_DOMAIN:?run render-env.sh}
   INTERNAL_HOST_URL: http://cw-rails:3000
-  SECRET_KEY_BASE: ${SECRET_KEY_BASE:?run gen-env.sh}
+  SECRET_KEY_BASE: ${SECRET_KEY_BASE:?run render-env.sh}
   POSTGRES_HOST: cw-postgres
   POSTGRES_PORT: "5432"
   POSTGRES_USERNAME: postgres
@@ -25,6 +27,8 @@ x-cw-env: &cw-env
   DISABLE_TELEMETRY: "true"
   # Agent Bot webhooks to the agents service on the private docker network.
   SAFE_FETCH_PRIVATE_TARGETS: agents:3000,tg-userbot:8080
+  # Telegram setWebhook carries this secret_token; Caddy refuses webhook calls without it.
+  TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:?}
   # Native WhatsApp connector (whatsmeow), embedded in Sidekiq. Calls/UDP stay off.
   WHATSAPP_CONNECTOR_ENABLED: "true"
   WHATSAPP_CONNECTOR_EMBEDDED: "true"
@@ -74,7 +78,7 @@ services:
     restart: unless-stopped
 
   cw-postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f
     environment:
       POSTGRES_DB: chatwoot_production
       POSTGRES_USER: postgres
@@ -89,7 +93,7 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
     command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?}
@@ -120,9 +124,9 @@ services:
       MIGRATION_DATABASE_URL: postgres://postgres:${AGENTS_POSTGRES_PASSWORD:?}@agents-postgres:5432/fazerai_agents_db
       DATABASE_URL: postgres://fazerai_app:${AGENTS_APP_DB_PASSWORD:?}@agents-postgres:5432/fazerai_agents_db
       LANGGRAPH_DATABASE_URL: postgres://fazerai_app:${AGENTS_APP_DB_PASSWORD:?}@agents-postgres:5432/fazerai_agents_db
-      # Internal services reachable over http with the SSRF guard ON (host:port only):
-      # Chatwoot, and the mock dispatcher used by the ticket HTTP tools (tool allowedHosts must name it).
-      SSRF_INTERNAL_TARGETS: cw-rails:3000,tickets:8080
+      # Internal services reachable over http with the SSRF guard ON (host:port only): Chatwoot, the mock
+      # dispatcher used by the ticket HTTP tools (tool allowedHosts must name it), the LiteLLM gateway to Gemini.
+      SSRF_INTERNAL_TARGETS: cw-rails:3000,tickets:8080,litellm:4000
       # stack/patches/agents-embedding-dimensions.patch: ask Matryoshka embedders for 1536-wide vectors.
       EMBEDDING_SEND_DIMENSIONS: "true"
       # No calls to app.fazer.ai (announcements / update check).
@@ -138,6 +142,54 @@ services:
       - agents_storage:/app/storage
     depends_on:
       agents-postgres: { condition: service_healthy }
+      litellm: { condition: service_healthy }
+    restart: unless-stopped
+
+  # Gemini on Vertex AI behind one OpenAI-compatible endpoint (http://litellm:4000/v1, key LITELLM_MASTER_KEY).
+  # Vertex auth = the VM service account via the metadata server; hard per-model rpm/rpd limits in the config.
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.83.14-stable.patch.3@sha256:f12d528d4a05add56cb09e54c5126088f2edc6bdf3a2f943bcd3a32b08769da2
+    command: [--config, /app/config.yaml, --port, "4000", --num_workers, "1"]
+    networks: [default]
+    environment:
+      GCP_PROJECT: ${GCP_PROJECT:?run render-env.sh}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?}
+      LITELLM_LOG: WARNING
+      LITELLM_TELEMETRY: "False"
+      DISABLE_SCHEMA_UPDATE: "true"
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=3)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  # Public HTTPS entry (Let's Encrypt for PUBLIC_DOMAIN) in front of Chatwoot: UI, WhatsApp Cloud and Telegram webhooks.
+  caddy:
+    image: caddy:2.11.8-alpine@sha256:f6228111e5fafa1a5238258d0858e103f10599b8d1659a146e7726681a002bb9
+    networks: [default]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:?}
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:?}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    depends_on: [cw-rails]
     restart: unless-stopped
 
   # Mock dispatcher (ticket) service: stdlib Python + SQLite, internal network only (no published port).
@@ -146,7 +198,7 @@ services:
     command: [python3, -I, -u, /app/server.py]
     networks: [internal]
     environment:
-      TICKETS_API_TOKEN: ${TICKETS_API_TOKEN:?run gen-env.sh}
+      TICKETS_API_TOKEN: ${TICKETS_API_TOKEN:?run render-env.sh}
       TICKETS_DB: /data/tickets.db
       # Monthly window for meter readings (days, inclusive) in the УК's local time; keep agent/knowledge.md in step.
       READINGS_WINDOW: ${READINGS_WINDOW:-20-25}
@@ -163,26 +215,6 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
-    restart: unless-stopped
-
-  # Telegram inbox: long polling -> Chatwoot's own webhook route (Telegram only calls public HTTPS webhooks and
-  # the VM has none). Off until a BotFather token is in stack/.env: `docker compose --profile telegram up -d`.
-  tg-bridge:
-    image: python:3.13-alpine@sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e
-    profiles: [telegram]
-    command: [python3, -I, -u, /app/bridge.py]
-    networks: [default]
-    environment:
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}  # empty: the bridge exits with a message
-      CHATWOOT_URL: http://cw-rails:3000
-    volumes:
-      - ./tg-bridge/bridge.py:/app/bridge.py:ro
-    read_only: true
-    user: "65534:65534"
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    mem_limit: 64m
-    depends_on: [cw-rails]
     restart: unless-stopped
 
   # Telegram userbot (a real account, MTProto) <-> Chatwoot API inbox; groups -> /data queue (plan v2, spike S2).
@@ -222,7 +254,7 @@ services:
     image: salesbot/stt:local
     networks: [internal]
     environment:
-      STT_API_TOKEN: ${STT_API_TOKEN:?run gen-env.sh}
+      STT_API_TOKEN: ${STT_API_TOKEN:?run render-env.sh}
       STT_THREADS: "4"
     read_only: true
     tmpfs: [/tmp]
@@ -238,7 +270,7 @@ services:
     restart: unless-stopped
 
   agents-postgres:
-    image: pgvector/pgvector:pg17
+    image: pgvector/pgvector:pg17@sha256:b513c48566e4777cd3370451400000c78eda6a08131d68f4c31d4a76f27bd8fd
     command: [postgres, -c, shared_preload_libraries=pg_stat_statements, -c, pg_stat_statements.track=top, -c, pg_stat_statements.track_utility=off]
     environment:
       POSTGRES_DB: fazerai_agents_db
@@ -268,3 +300,5 @@ volumes:
   agents_postgres:
   tickets_data:
   tgu_data:
+  caddy_data:
+  caddy_config:

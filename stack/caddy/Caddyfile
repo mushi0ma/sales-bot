@@ -1,0 +1,25 @@
+# Public entry: HTTPS (Let's Encrypt) for Chatwoot only. The agents console is NOT published:
+# reach it through IAP (deploy/ssh.sh -- -N -L 3100:127.0.0.1:3100). No access log: webhook paths carry tokens.
+{
+	admin off
+}
+
+{$PUBLIC_DOMAIN} {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+
+	# Telegram webhook: only calls that carry our secret_token (Secret Manager: webhook-secret).
+	@telegram path /webhooks/telegram/*
+	handle @telegram {
+		@forged not header X-Telegram-Bot-Api-Secret-Token {$TELEGRAM_WEBHOOK_SECRET}
+		respond @forged 403
+		reverse_proxy cw-rails:3000
+	}
+
+	handle {
+		reverse_proxy cw-rails:3000
+	}
+}

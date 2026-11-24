@@ -1,0 +1,31 @@
+# LiteLLM: the one OpenAI-compatible door from the stack to Gemini on Vertex AI.
+# Auth to Vertex = the VM's service account through the metadata server (ADC): no keys anywhere.
+# rpm/rpd are HARD limits (enforce_model_rate_limits): a looping agent gets 429, it cannot burn the budget.
+# Generation together: 40 + 50 + 10 = 100 requests per minute (the mentor's 60-100 per minute); daily caps keep a
+# runaway day well under the $300 test budget. Raise rpd only with a reason (e.g. a scenario-run day).
+x-vertex: &vertex
+  vertex_project: os.environ/GCP_PROJECT
+  vertex_location: global
+
+model_list:
+  - model_name: gemini-3.8-flash          # replies of the agents, vision
+    litellm_params: { <<: *vertex, model: vertex_ai/gemini-3.8-flash, rpm: 40, rpd: 1000 }
+  - model_name: gemini-3.5-flash-lite     # need detection, fact checking, bulk scenario runs
+    litellm_params: { <<: *vertex, model: vertex_ai/gemini-3.5-flash-lite, rpm: 50, rpd: 3000 }
+  - model_name: gemini-4-argon            # Pro class: automatic answer evaluation only
+    litellm_params: { <<: *vertex, model: vertex_ai/gemini-4-argon, rpm: 10, rpd: 100 }
+  - model_name: gemini-embedding-001      # knowledge base; `dimensions` -> outputDimensionality (1536)
+    litellm_params: { <<: *vertex, model: vertex_ai/gemini-embedding-001, rpm: 300, rpd: 5000 }
+
+router_settings:
+  optional_pre_call_checks: [enforce_model_rate_limits]
+  num_retries: 2
+  timeout: 120
+
+litellm_settings:
+  drop_params: true                 # OpenAI-only knobs (e.g. reasoning effort) are dropped, not rejected
+  turn_off_message_logging: true    # no prompt or reply text in LiteLLM logs
+  telemetry: false
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
