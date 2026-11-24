@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
-"""First-run configuration of the stack. Runs INSIDE the VM (python3 -I stack/bootstrap.py <step>).
+"""First-run configuration of the stack. Runs ON the GCP VM (cd /srv/salesbot/stack && python3 -I bootstrap.py <step>).
 
 Steps (idempotent where possible; secrets go to ~/secrets/*.env with mode 600 and are never printed):
   chatwoot   create test account + admin user in Chatwoot, mint its API token
   agents     first-run /setup of agents (token read from container logs), store admin credentials
-  vault      store the OpenRouter key (from ~/secrets/openrouter.env) in the agents vault
-  agent      create/update the "ЖКХ ассистент" agent (OpenRouter model, system prompt, test mode)
+  vault      agents vault entry for Gemini: the LiteLLM gateway (http://litellm:4000/v1, LITELLM_MASTER_KEY)
+  agent      create/update the "ЖКХ ассистент" agent (Gemini Flash, system prompt, fact check on Flash-Lite)
   connect    connect agents to Chatwoot (private docker network) and select the account
   stt        local speech-to-text (whisper in the VM) for voice notes: vault entry + agent stt settings
   operator   Chatwoot: macro «🤖 Вернуть боту» + contact attribute «Тестировщик бота»
   testers    testers <contact_id>...: tick «Тестировщик бота» (the bot answers only them)
-  telegram   Telegram inbox from TELEGRAM_BOT_TOKEN (stack/.env) + bind to the agent; needs the tg-bridge profile
+  telegram   Telegram inbox from TELEGRAM_BOT_TOKEN + bind to the agent; Chatwoot sets the public HTTPS webhook
+             (with secret_token = TELEGRAM_WEBHOOK_SECRET, checked by Caddy)
   tg-userbot API inbox «Telegram (userbot)» for the tg-userbot service (a real account, plan v2 spike S2):
              writes CW_TGU_* (inbox identifier, webhook secret, account id, operator token) to stack/.env,
              binds the agent; operator user «Оператор (телефон Telegram)» = owner's phone messages
   tg-outreach TG_USER_ID TEXT   first message from Chatwoot to a member of an allowed group (via tg-userbot),
              then the hand-back macro: the agent answers the resident's reply
   return-to-bot CONV_ID   apply the hand-back macro to a Chatwoot conversation
-  knowledge  RAG: OpenRouter embeddings + knowledge base from agent/knowledge.md, attached to the agent
+  knowledge  RAG: gemini-embedding-001 (1536) + knowledge base from agent/knowledge.md, attached to the agent
              (search_knowledge), search smoke test
-  vision     image/document reading for incoming photos (OpenRouter free VL model, Russian extraction prompt)
+  vision     image/document reading for incoming photos (Gemini Flash, Russian extraction prompt)
   tickets    ticket HTTP tools (create_ticket, get_my_tickets) on the mock dispatcher + least-privilege grants
   bind INBOX_ID   bind a Chatwoot inbox (mirror id from `inboxes`) to the agent
   inboxes    list inboxes known to agents
@@ -32,7 +33,18 @@ HOME = pathlib.Path.home()
 STACK = pathlib.Path(__file__).resolve().parent
 SECRETS = HOME / "secrets"
 AGENTS = "http://127.0.0.1:3100/api"
-MODEL = os.environ.get("AGENT_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
+MODEL = os.environ.get("AGENT_MODEL", "gemini-3.8-flash")
+# Every model call goes to the LiteLLM gateway (stack/litellm/config.yaml): Gemini on Vertex AI, hard rate limits.
+LLM_PROVIDER = "openai-compatible"
+LLM_BASE = "http://litellm:4000/v1"
+def _domain():
+    env = STACK / ".env"
+    lines = env.read_text().splitlines() if env.exists() else []
+    return next((l.split("=", 1)[1] for l in lines if l.startswith("PUBLIC_DOMAIN=")), "") or sys.exit(
+        "bootstrap: no PUBLIC_DOMAIN in stack/.env; run ./render-env.sh")
+
+
+PUBLIC_URL = "https://" + _domain()
 # production: the bot answers by itself (no /teste). Who it answers is BOT_AUDIENCE:
 #   testers  (default) only contacts whose Chatwoot attribute "Тестировщик бота" (salesbot_tester) is ticked;
 #   everyone no gate at all — refused while agent/knowledge.md still holds test placeholders.
@@ -41,10 +53,10 @@ BOT_AUDIENCE = os.environ.get("BOT_AUDIENCE", "testers")
 if AGENT_MODE not in ("test", "production") or BOT_AUDIENCE not in ("testers", "everyone"):
     sys.exit("AGENT_MODE must be test|production and BOT_AUDIENCE testers|everyone")
 TESTER_ATTR = "salesbot_tester"
-GROUNDING_MODEL = os.environ.get("GROUNDING_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
+GROUNDING_MODEL = os.environ.get("GROUNDING_MODEL", "gemini-3.5-flash-lite")
 GROUNDING_SOURCES = ["search_knowledge", "create_ticket", "get_my_tickets", "add_ticket_note", "submit_meter_reading"]
 AGENT_NAME = "ЖКХ ассистент (тест)"
-VAULT_NAME = "OpenRouter"
+VAULT_NAME = "Gemini (Vertex via LiteLLM)"
 CW_ACCOUNT = "УК Тестовая (ЖКХ)"
 CW_EMAIL = "admin@salesbot.test"
 AG_EMAIL = "admin@salesbot.test"
@@ -109,7 +121,7 @@ puts 'BS_JSON:' + JSON.generate({ account_id: acc.id, user_id: u.id, created: cr
 
 def step_chatwoot():
     cur = read_env("chatwoot-admin.env")
-    pw = cur.get("CW_ADMIN_PASSWORD") or gen_password()
+    pw = stack_env("CW_ADMIN_PASSWORD") or cur.get("CW_ADMIN_PASSWORD") or gen_password()
     # Secrets travel via stdin into a file inside the container, never via argv.
     script = "ENV['BS_EMAIL']=%s\nENV['BS_PASS']=%s\nENV['BS_ACCOUNT']=%s\n" % (
         json.dumps(CW_EMAIL), json.dumps(pw), json.dumps(CW_ACCOUNT)) + CW_RUBY
@@ -120,7 +132,7 @@ def step_chatwoot():
     if r.returncode != 0 or not m:
         die("chatwoot bootstrap failed:\n" + (r.stderr or r.stdout)[-1500:])
     res = json.loads(m.group(1))
-    write_env("chatwoot-admin.env", {"CW_URL": "http://localhost:3000", "CW_ADMIN_EMAIL": CW_EMAIL,
+    write_env("chatwoot-admin.env", {"CW_URL": PUBLIC_URL, "CW_ADMIN_EMAIL": CW_EMAIL,
                                      "CW_ADMIN_PASSWORD": pw, "CW_ACCOUNT_ID": str(res["account_id"]),
                                      "CW_API_TOKEN": res["token"]})
     print(f"  chatwoot: account {res['account_id']} '{CW_ACCOUNT}', admin {CW_EMAIL} (created={res['created']})")
@@ -188,7 +200,7 @@ def step_agents():
     tok = setup_token_from_logs()
     if not tok:
         die("setup token not found in agents logs (is the container up? already set up?)")
-    pw = gen_password()
+    pw = stack_env("AGENTS_ADMIN_PASSWORD") or gen_password()
     a = Agents()
     st, b = a.req("POST", "/auth/setup", {"email": AG_EMAIL, "password": pw, "name": "Test Admin",
                                          "companyName": "УК Тестовая", "token": tok})
@@ -223,19 +235,27 @@ def find_vault(a):
 
 
 def step_vault():
+    """The one model credential: the LiteLLM gateway's master key, kind openai_compatible, baseUrl LLM_BASE.
+    Refreshed from stack/.env (Secret Manager) on every run. No /v1/vault/test: that probe runs behind the SSRF
+    guard and answers blocked_url for an internal host; the real check is the 'playground' step."""
     a = Agents().login()
-    if find_vault(a):
-        print(f"  vault: '{VAULT_NAME}' already exists")
-        return
-    key = read_env("openrouter.env").get("OPENROUTER_API_KEY")
-    if not key:
-        die("no OPENROUTER_API_KEY in ~/secrets/openrouter.env")
-    st, b = a.req("POST", "/v1/vault/test", {"kind": "openrouter", "value": key})
-    print(f"  vault test: HTTP {st} {json.dumps(b, ensure_ascii=False)[:160] if b else ''}")
-    st, b = a.req("POST", "/v1/vault", {"name": VAULT_NAME, "kind": "openrouter", "value": key})
-    if st not in (200, 201):
-        die(f"vault create failed: {st} {str(b)[:300]}")
-    print(f"  vault: '{VAULT_NAME}' stored (kind=openrouter)")
+    key = stack_env("LITELLM_MASTER_KEY") or die("no LITELLM_MASTER_KEY in stack/.env; run ./render-env.sh")
+    v = find_vault(a)
+    if v:
+        st, r = a.req("PUT", f"/v1/vault/{v['id']}", {"value": key, "baseUrl": LLM_BASE})
+        if st >= 300:
+            die(f"vault update failed: {st} {str(r)[:300]}")
+        print(f"  vault: '{VAULT_NAME}' refreshed")
+    else:
+        st, b = a.req("POST", "/v1/vault", {"name": VAULT_NAME, "kind": "openai_compatible", "value": key,
+                                            "baseUrl": LLM_BASE})
+        if st not in (200, 201):
+            die(f"vault create failed: {st} {str(b)[:300]}")
+        print(f"  vault: '{VAULT_NAME}' stored (kind=openai_compatible, {LLM_BASE})")
+    v = find_vault(a) or die("vault entry missing after create")
+    if v.get("kind") != "openai_compatible" or (v.get("baseUrl") or "").rstrip("/") != LLM_BASE:
+        die(f"vault '{VAULT_NAME}' must be kind openai_compatible with baseUrl {LLM_BASE}; got kind={v.get('kind')} "
+            f"baseUrl={v.get('baseUrl')} — refusing (the key would go elsewhere)")
 
 
 def find_agent(a):
@@ -293,7 +313,7 @@ def step_stt():
     print(f"  agent: stt -> {stt['provider']} {stt['model']} lang=ru")
 
 
-VISION_MODEL = os.environ.get("VISION_MODEL", "nvidia/nemotron-3.5-super-vl:free")
+VISION_MODEL = os.environ.get("VISION_MODEL", "gemini-3.8-flash")
 VISION_PROMPT = (
     "Опиши объективно содержимое изображения или документа от жильца многоквартирного дома. "
     "Перепиши весь видимый текст и цифры дословно. Если это счётчик — тип (вода холодная/горячая, электричество, газ, "
@@ -306,16 +326,13 @@ VISION_PROMPT = (
 def step_vision():
     a = Agents().login()
     ag = find_agent(a) or die("agent missing; run 'agent'")
-    v = find_vault(a) or die("OpenRouter vault entry missing; run 'vault'")
-    # reasoningEffort none: nemotron-VL otherwise spends 400-700 tokens thinking before a 40-token transcript, and
-    # agents gives one image 20 s (VISION_IMAGE_CEILING_MS); the free queue alone can take 4-30 s.
-    vision = {"enabled": True, "provider": "openrouter", "model": VISION_MODEL,
-              "credentialRef": f"vault:{v['id']}", "extractionPrompt": VISION_PROMPT,
-              "reasoningEffort": "none", "maxOutputTokens": 1000}
+    v = find_vault(a) or die("vault entry missing; run 'vault'")
+    vision = {"enabled": True, "provider": LLM_PROVIDER, "model": VISION_MODEL,
+              "credentialRef": f"vault:{v['id']}", "extractionPrompt": VISION_PROMPT, "maxOutputTokens": 1000}
     st, r = a.req("PATCH", f"/v1/agents/{ag['id']}", {"settings": merged_settings(a, ag["id"], {"vision": vision})})
     if st >= 300:
         die(f"agent vision settings failed: {st} {str(r)[:400]}")
-    print(f"  agent: vision -> openrouter {VISION_MODEL}")
+    print(f"  agent: vision -> {LLM_PROVIDER} {VISION_MODEL}")
 
 
 def step_agent():
@@ -328,7 +345,7 @@ def step_agent():
         "enabled": True,
         "mode": AGENT_MODE,  # test: silent until /teste in each conversation; production: answers by itself
         "kind": "text",
-        "modelConfig": {"provider": "openrouter", "model": MODEL, "credentialRef": f"vault:{v['id']}",
+        "modelConfig": {"provider": LLM_PROVIDER, "model": MODEL, "credentialRef": f"vault:{v['id']}",
                         "temperature": 0.3},
         "settings": {
             "handoff": {"mode": "route", "instructions":
@@ -341,7 +358,7 @@ def step_agent():
             "guardrails": {"enabled": True, "input": {"enabled": False}, "output": {"enabled": False},
                            "onFailure": "pass",
                            "factualGrounding": {"enabled": True, "action": "revise", "contextMessages": 6,
-                                                "sourceTools": GROUNDING_SOURCES, "provider": "openrouter",
+                                                "sourceTools": GROUNDING_SOURCES, "provider": LLM_PROVIDER,
                                                 "model": GROUNDING_MODEL, "credentialRef": f"vault:{v['id']}"}},
             # Contact gate: the WhatsApp number is a real SIM and the Telegram bot is findable by anyone, so a
             # stranger's message must not reach the model (test data only). The rule refusal is silent.
@@ -569,7 +586,7 @@ def step_connect():
     cw = read_env("chatwoot-admin.env") or die("run 'chatwoot' first")
     st, b = a.req("GET", "/v1/chatwoot/deployment")
     body = {"baseUrl": "http://cw-rails:3000", "adminToken": cw["CW_API_TOKEN"],
-            "webhookBaseUrl": "http://agents:3000", "publicUrl": "http://localhost:3000"}
+            "webhookBaseUrl": "http://agents:3000", "publicUrl": PUBLIC_URL}
     if st == 200 and (b or {}).get("deployment"):
         st, b = a.req("PATCH", "/v1/chatwoot/deployment", body)
     else:
@@ -604,34 +621,18 @@ def step_bind(inbox_id):
             print(f"  chatwoot inbox {cw_inbox}: auto-assignment off (HTTP {resp.status})")
 
 
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "nvidia/nemotron-3.5-embed-8b:free")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "gemini-embedding-001")
 KB_NAME = "Справочник УК (тест)"
-EMBED_VAULT = "OpenRouter (embeddings)"
-OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
 
 def step_knowledge():
-    """RAG: OpenRouter embeddings (needs stack/patches/agents-embedding-dimensions.patch + EMBEDDING_SEND_DIMENSIONS),
-    a knowledge base mirrored from agent/knowledge.md and attached to the agent, then a search smoke test."""
+    """RAG: gemini-embedding-001 through LiteLLM (1536 wide: stack/patches/agents-embedding-dimensions.patch +
+    EMBEDDING_SEND_DIMENSIONS, LiteLLM maps `dimensions` to outputDimensionality), a knowledge base mirrored from
+    agent/knowledge.md and attached to the agent, then a search smoke test."""
     a = Agents().login()
-    # PUT /v1/tenant-settings/embedding stores ONLY credentialRef (provider/model/baseURL are dropped), and the
-    # endpoint then comes from the vault entry — but only for kind openai_compatible. With the "openrouter" kind
-    # the SDK falls back to api.openai.com and sends it the OpenRouter key. Hence a dedicated entry, checked.
-    key = read_env("openrouter.env").get("OPENROUTER_API_KEY") or die("no OPENROUTER_API_KEY in ~/secrets/openrouter.env")
-    st, b = a.req("GET", "/v1/vault")
-    v = next((x for x in as_list(b) if x.get("name") == EMBED_VAULT), None)
-    if v:
-        st, r = a.req("PUT", f"/v1/vault/{v['id']}", {"value": key, "baseUrl": OPENROUTER_BASE})
-    else:
-        st, v = a.req("POST", "/v1/vault", {"name": EMBED_VAULT, "kind": "openai_compatible", "value": key,
-                                            "baseUrl": OPENROUTER_BASE})
-        v = one(v)
-    st, b = a.req("GET", "/v1/vault")
-    v = next((x for x in as_list(b) if x.get("name") == EMBED_VAULT), {})
-    if v.get("kind") != "openai_compatible" or (v.get("baseUrl") or "").rstrip("/") != OPENROUTER_BASE:
-        die(f"vault '{EMBED_VAULT}' must be kind openai_compatible with baseUrl {OPENROUTER_BASE}; "
-            f"got kind={v.get('kind')} baseUrl={v.get('baseUrl')} — refusing (the key would go to api.openai.com)")
-    print(f"  vault: '{EMBED_VAULT}' kind=openai_compatible baseUrl={OPENROUTER_BASE}")
+    # PUT /v1/tenant-settings/embedding stores ONLY credentialRef; the endpoint then comes from the vault entry, and
+    # only for kind openai_compatible (step 'vault' checks the kind and the address).
+    v = find_vault(a) or die("vault entry missing; run 'vault'")
     st, b = a.req("PUT", "/v1/tenant-settings/embedding", {"credentialRef": f"vault:{v['id']}"})
     if st >= 300:
         die(f"embedding settings failed: {st} {str(b)[:300]}")
@@ -754,8 +755,8 @@ token = ENV.fetch('TG_TOKEN'); acc = Account.find(ENV.fetch('CW_ACCOUNT_ID').to_
 ch = Channel::Telegram.find_by(bot_token: token)
 created = false
 unless ch
-  # The webhook callback would register FRONTEND_URL (http://localhost) with Telegram and fail; tg-bridge polls.
-  Channel::Telegram.skip_callback(:save, :before, :setup_telegram_webhook)
+  # The save callback calls setWebhook with FRONTEND_URL (public HTTPS through Caddy) and the secret_token
+  # (stack/patches/chatwoot-telegram-webhook-secret.patch).
   ch = Channel::Telegram.create!(account: acc, bot_token: token)
   Inbox.create!(account: acc, channel: ch, name: ENV.fetch('TG_INBOX_NAME'), enable_auto_assignment: false)
   created = true

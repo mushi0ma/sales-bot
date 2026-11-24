@@ -1,0 +1,20 @@
+--- a/src/modules/rag/embeddings.ts
++++ b/src/modules/rag/embeddings.ts
+@@ -5,6 +5,7 @@
+   statusOf,
+   throughProvider,
+ } from "@/lib/provider-failure";
++import appConfig from "@/config";
+ import { assertSafeOutboundUrl, SsrfError } from "@/lib/ssrf";
+ import { clipText } from "@/lib/text";
+ 
+@@ -296,6 +297,9 @@
+   // allows it: these endpoints are self-hosted and routinely plain http on a private network.
+   const safeUrl = await (deps.assertSafe ?? assertSafeOutboundUrl)(endpoint, {
+     allowHttp: true,
++    // salesbot: the embeddings server is a declared internal target (SSRF_INTERNAL_TARGETS, e.g. the
++    // LiteLLM gateway), as for the HTTP tool and the Chatwoot client; any other private address stays blocked.
++    internalTargets: appConfig.ssrf.internalTargets,
+   });
+   return safeUrl.toString();
+ }
