@@ -747,6 +747,9 @@ def step_seller():
                     "Передай менеджеру e-KNOT, если человек хочет подключить услугу или узнать цену, он председатель "
                     "или представитель УК, просит человека, жалуется, или нужен факт, которого нет в базе знаний."},
         "debounce": {"enabled": True, "windowSeconds": 4, "maxWindowSeconds": 30, "maxMessagesPerBurst": 10},
+        # Paced like a person on a phone: short balloons, "typing..." for a time proportional to the words.
+        "split": {"enabled": True, "maxChars": 280, "typingWpm": 90, "minDelayMs": 1500, "maxDelayMs": 9000,
+                  "maxChunks": 4},
         "guardrails": {"enabled": True, "input": {"enabled": False}, "output": {"enabled": False}, "onFailure": "pass",
                        "factualGrounding": {"enabled": True, "action": "revise", "contextMessages": 6,
                                             "sourceTools": ["search_knowledge"], "provider": LLM_PROVIDER,

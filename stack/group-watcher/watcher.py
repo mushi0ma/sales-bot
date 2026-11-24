@@ -239,9 +239,9 @@ def offer_text(need, catalog=CATALOG):
     first = (need.get("author") or "").split()[0] if need.get("author") else ""
     hello = f"Здравствуйте, {first}!" if first and not first.lstrip("+").isdigit() else "Здравствуйте!"
     group = f" «{need['group_name']}»" if need.get("group_name") else ""
-    return (f"{hello} Это тестовый бот e-KNOT. В группе{group} вы писали: «{need['quote']}».\n\n"
+    return (f"{hello} Это помощник e-KNOT. Вы писали в группе{group}: «{need['quote']}».\n\n"
             f"{s['offer']}\nПодробнее: {s['url']}\n\n"
-            "Если интересно, ответьте здесь, расскажу подробнее. Не хотите таких сообщений, напишите «стоп».")
+            "Если интересно, напишите, расскажу подробнее. Если неактуально, просто ответьте «стоп».")
 
 
 # ---------------------------------------------------------------- HTTP clients
@@ -373,7 +373,7 @@ def opt_out(contact_id, conv_id=None, individual=False):
     if individual and conv_id:
         # A public reply from us also makes the agent step aside in this chat (a person answered).
         st, _ = cw("POST", f"/conversations/{conv_id}/messages", {
-            "content": "Хорошо, больше не буду писать. Ваши сообщения из группы удалены из анализа."})
+            "content": "Хорошо, больше не побеспокою. Хорошего дня!"})
         if st not in (200, 201):
             log.warning("optout reply conversation=%s HTTP %s", conv_id, st)
     log.info("optout contact=%s", contact_id)
