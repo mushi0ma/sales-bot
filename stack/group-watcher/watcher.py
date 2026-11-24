@@ -16,6 +16,7 @@ Chatwoot account webhook (message_created, HMAC-signed) -> this service:
 
 Stdlib only. State: SQLite at DB_PATH. Logs carry ids, lengths and statuses, never message text or names.
 CLI: watcher.py serve | stats | eval SAMPLES.json (classifier precision/recall on labelled sample messages)
+     | forget CONTACT_ID (tests: drop the contact's opt-out, offers and cooldown, untick the Chatwoot attribute)
 """
 import hashlib, hmac, json, logging, os, re, sqlite3, statistics, sys, threading, time, urllib.error, urllib.request
 from datetime import datetime, timedelta, timezone
@@ -571,6 +572,14 @@ def evaluate(path):
     print(f"\nprecision {p:.2f}  recall {r:.2f}  (tp {tp}, fp {fp}, fn {fn}, n {len(samples)}, model {LLM_MODEL})")
 
 
+def forget(contact_id):
+    x("DELETE FROM optout WHERE contact_id=?", (contact_id,))
+    x("DELETE FROM needs WHERE contact_id=?", (contact_id,))
+    x("DELETE FROM messages WHERE contact_id=?", (contact_id,))
+    st, _ = cw("PATCH", f"/contacts/{contact_id}", {"custom_attributes": {OPTOUT_ATTR: False}})
+    print(f"contact {contact_id}: opt-out, offers and cooldown cleared; Chatwoot attribute HTTP {st}")
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
@@ -578,6 +587,8 @@ def main():
         print(json.dumps(stats(), ensure_ascii=False, indent=2))
     elif cmd == "eval" and len(sys.argv) == 3:
         evaluate(sys.argv[2])
+    elif cmd == "forget" and len(sys.argv) == 3 and sys.argv[2].isdigit():
+        forget(int(sys.argv[2]))
     elif cmd == "serve":
         if not (CW_TOKEN and WEBHOOK_SECRET and LLM_KEY):
             log.warning("CW_API_TOKEN / WEBHOOK_SECRET / LLM_KEY missing: run bootstrap.py group-watcher; "
