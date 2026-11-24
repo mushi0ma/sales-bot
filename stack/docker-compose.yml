@@ -32,6 +32,8 @@ x-cw-env: &cw-env
   # Native WhatsApp connector (whatsmeow), embedded in Sidekiq. Calls/UDP stay off.
   WHATSAPP_CONNECTOR_ENABLED: "true"
   WHATSAPP_CONNECTOR_EMBEDDED: "true"
+  # Group chats (the sales task reads a test group). Off by default in the fork: group messages are dropped.
+  WHATSAPP_GROUPS_ENABLED: "true"
   WAC_MEDIA_ROOT: /app/wac-media
   # Legacy Baileys/Z-API providers not offered.
   WHATSAPP_LEGACY_PROVIDERS_CREATABLE: "false"

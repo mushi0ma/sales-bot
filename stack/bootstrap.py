@@ -26,6 +26,7 @@ Steps (idempotent where possible; secrets go to ~/secrets/*.env with mode 600 an
   vision     image/document reading for incoming photos (Gemini Flash, Russian extraction prompt)
   tickets    ticket HTTP tools (create_ticket, get_my_tickets) on the mock dispatcher + least-privilege grants
   bind INBOX_ID   bind a Chatwoot inbox (mirror id from `inboxes`) to the agent
+  bind-cw CW_INBOX_ID   same by the Chatwoot inbox id (e.g. a WhatsApp inbox just paired in the UI); syncs first
   inboxes    list inboxes known to agents
   playground smoke test of the agent through the playground (no WhatsApp)
   all        chatwoot agents vault agent connect tickets stt vision
@@ -1010,6 +1011,8 @@ if __name__ == "__main__":
             print(f"== {s}"); STEPS[s]()
     elif cmd == "bind":
         step_bind(sys.argv[2])
+    elif cmd == "bind-cw":
+        bind_cw_inbox(sys.argv[2])
     elif cmd == "tg-outreach":
         len(sys.argv) == 4 or die("usage: tg-outreach TG_USER_ID TEXT")
         step_tg_outreach(sys.argv[2], sys.argv[3])
