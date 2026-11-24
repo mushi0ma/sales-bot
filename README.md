@@ -34,5 +34,7 @@ WhatsApp-группа ─ WhatsApp Web (whatsmeow) ─ Chatwoot ─ вебхук
 Проверки: `python3 -I stack/group-watcher/test_watcher.py` (логика без сети);
 на ВМ `docker compose exec group-watcher python3 -I /app/watcher.py eval /app/samples.json` (точность и полнота
 распознавания), `python3 -I tests/scenarios.py` (бот поддержки) и `python3 -I tests/scenarios.py --seller` (продавец).
+Цифры для ежедневного отчёта: `docker compose exec group-watcher python3 -I /app/watcher.py report [дней]` (воронка от
+сообщения в группе до лида, доставка, ответы за 24 ч, отказы).
 
 Секреты только в Google Secret Manager. В репозитории их нет.

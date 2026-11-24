@@ -17,6 +17,8 @@ Chatwoot account webhook (message_created, HMAC-signed) -> this service:
 Stdlib only. State: SQLite at DB_PATH. Logs carry ids, lengths and statuses, never message text or names.
 CLI: watcher.py serve | stats | eval SAMPLES.json (classifier precision/recall on labelled sample messages)
      | forget CONTACT_ID (tests: drop the contact's opt-out, offers and cooldown, untick the Chatwoot attribute)
+     | report [DAYS] (metrics for the daily report over the last DAYS days, default 1: funnel from group message to
+       lead, delivery and read status, replies within 24 h, opt-outs; reads offer conversations from Chatwoot)
 """
 import hashlib, hmac, json, logging, os, re, sqlite3, statistics, sys, threading, time, urllib.error, urllib.request
 from datetime import datetime, timedelta, timezone
@@ -572,6 +574,57 @@ def evaluate(path):
     print(f"\nprecision {p:.2f}  recall {r:.2f}  (tp {tp}, fp {fp}, fn {fn}, n {len(samples)}, model {LLM_MODEL})")
 
 
+SERVICE_NAMES = {k: s["name"] for k, s in CATALOG.items()}
+
+
+def offer_outcome(n, optout_at):
+    """What happened to one sent offer, read back from its Chatwoot conversation."""
+    st, msgs = cw("GET", f"/conversations/{n['offer_conv_id']}/messages")
+    _, conv = cw("GET", f"/conversations/{n['offer_conv_id']}")
+    msgs = (msgs or {}).get("payload") or [] if st == 200 else []
+    public = [m for m in msgs if not m.get("private")]
+    offer = next((m for m in public if m.get("message_type") == 1), {})
+    replies = [m for m in public if m.get("message_type") == 0 and m.get("created_at", 0) <= n["sent_at"] + 86400]
+    labels = (conv or {}).get("labels") or []
+    return {"delivery": offer.get("status") or "unknown", "replied": bool(replies),
+            "optout": bool(optout_at and optout_at >= n["sent_at"]), "lead": "lead" in labels,
+            "handoff": (conv or {}).get("status") == "open"}
+
+
+def report(days=1.0):
+    since = time.time() - days * 86400
+    msgs = q("SELECT COUNT(*) AS n FROM messages WHERE created_at >= ?", (since,))[0]["n"]
+    needs = q("SELECT * FROM needs WHERE found_at >= ? ORDER BY id", (since,))
+    optouts = {r["contact_id"]: r["at"] for r in q("SELECT * FROM optout")}
+    sent = [n for n in needs if n["status"] == "sent" and n["offer_conv_id"]]
+    outs = [offer_outcome(n, optouts.get(n["contact_id"])) for n in sent]
+    lat = sorted(n["sent_at"] - n["message_at"] for n in sent)
+    count = lambda k: sum(o[k] for o in outs)  # noqa: E731
+    by_status, by_service = {}, {}
+    for n in needs:
+        by_status[n["status"]] = by_status.get(n["status"], 0) + 1
+        by_service[n["service"]] = by_service.get(n["service"], 0) + 1
+    delivery = {}
+    for o in outs:
+        delivery[o["delivery"]] = delivery.get(o["delivery"], 0) + 1
+    pct = lambda a: f"{a} ({round(100 * a / len(outs))}%)" if outs else str(a)  # noqa: E731
+    lines = [
+        f"group-watcher за {days:g} сут. (режим {SEND_MODE}, модель {LLM_MODEL})",
+        f"Сообщений в группах: {msgs}. Найдено потребностей: {len(needs)}. Отправлено предложений: {len(sent)}.",
+        "По услугам: " + (", ".join(f"{SERVICE_NAMES.get(k, k)} {v}" for k, v in
+                                     sorted(by_service.items(), key=lambda kv: -kv[1])) or "нет"),
+        "Решения: " + (", ".join(f"{k} {v}" for k, v in sorted(by_status.items())) or "нет"),
+        f"От сообщения в группе до предложения: медиана {round(statistics.median(lat))} с, "
+        f"максимум {round(lat[-1])} с." if lat else "От сообщения до предложения: нет отправок.",
+        "Доставка: " + (", ".join(f"{k} {v}" for k, v in sorted(delivery.items())) or "нет"),
+        f"Ответили за 24 ч: {pct(count('replied'))}. Отказ «стоп»: {pct(count('optout'))}. "
+        f"Лид (метка lead): {pct(count('lead'))}. Передано менеджеру: {pct(count('handoff'))}.",
+    ]
+    print("\n".join(lines))
+    return {"messages": msgs, "needs": len(needs), "sent": len(sent), "by_status": by_status,
+            "by_service": by_service, "delivery": delivery, "outcomes": outs}
+
+
 def forget(contact_id):
     x("DELETE FROM optout WHERE contact_id=?", (contact_id,))
     x("DELETE FROM needs WHERE contact_id=?", (contact_id,))
@@ -587,6 +640,8 @@ def main():
         print(json.dumps(stats(), ensure_ascii=False, indent=2))
     elif cmd == "eval" and len(sys.argv) == 3:
         evaluate(sys.argv[2])
+    elif cmd == "report" and len(sys.argv) <= 3:
+        report(float(sys.argv[2]) if len(sys.argv) == 3 else 1.0)
     elif cmd == "forget" and len(sys.argv) == 3 and sys.argv[2].isdigit():
         forget(int(sys.argv[2]))
     elif cmd == "serve":
