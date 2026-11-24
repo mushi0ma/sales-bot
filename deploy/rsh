@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Remote shell for rsync over IAP: rsync -e deploy/rsh SRC vm:DEST. rsync calls it as `rsh <host> <command...>`.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+source "$here/gcp.env"
+shift  # the host part of vm:DEST; the VM comes from gcp.env
+exec gcloud compute ssh "$GCP_VM" --project="$GCP_PROJECT" --zone="$GCP_ZONE" --tunnel-through-iap --quiet \
+  --command="$*" 2> >(grep -v -e 'NumPy' -e 'increasing_the_tcp_upload_bandwidth' -e '^WARNING:' -e '^$' >&2)

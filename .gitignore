@@ -10,9 +10,6 @@ id_*
 # Локальные настройки Claude Code
 .claude/settings.local.json
 
-# Артефакты ВМ (диски, образы, cloud-init seed с ключами)
-infra/vm/
-
 # Клонированные upstream-репозитории (если окажутся внутри)
 vendor/
 
