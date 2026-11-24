@@ -720,7 +720,8 @@ def seller_knowledge_text():
     """The seller's knowledge base from the same catalog group-watcher matches needs against (one source)."""
     d = json.loads((STACK / "group-watcher" / "services.json").read_text(encoding="utf-8"))
     c = d["company"]
-    parts = ["УСЛУГИ E-KNOT (по сайту eknot.me, прочитано 24.11.2026).", f"Цены. {c['prices']}",
+    parts = ["УСЛУГИ И ПРОДУКТЫ E-KNOT (по сайтам eknot.me и zhkh.zerde.site, прочитано 24.11.2026).",
+             f"Цены. {c['prices']}",
              f"Контакты e-KNOT. Сайт {c['site']}; связаться: {c['contact']}; поддержка в Telegram: "
              f"{c['support_telegram']}. Приложение E-KNOT: Android {c['app_android']}, iPhone {c['app_ios']}."]
     for sv in d["services"]:
