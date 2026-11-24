@@ -61,6 +61,14 @@ if AGENT_MODE not in ("test", "production") or BOT_AUDIENCE not in ("testers", "
     sys.exit("AGENT_MODE must be test|production and BOT_AUDIENCE testers|everyone")
 TESTER_ATTR = "salesbot_tester"
 GROUNDING_MODEL = os.environ.get("GROUNDING_MODEL", "gemini-3.5-flash-lite")
+# Second model for a failed turn. Gemini Flash now and then thinks and returns no text at all (finishReason STOP,
+# no parts; LiteLLM passes it on as choices=[]), the same again on agents' one same-model retry: the turn needs
+# another model. Also takes a 429 or timeout of the primary.
+FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "gemini-3.5-flash-lite")
+
+
+def model_fallback(vault_id):
+    return {"provider": LLM_PROVIDER, "model": FALLBACK_MODEL, "credentialRef": f"vault:{vault_id}"}
 GROUNDING_SOURCES = ["search_knowledge", "create_ticket", "get_my_tickets", "add_ticket_note", "submit_meter_reading"]
 AGENT_NAME = "ЖКХ ассистент (тест)"
 VAULT_NAME = "Gemini (Vertex via LiteLLM)"
@@ -359,6 +367,7 @@ def step_agent():
                         "Передай оператору, если клиент просит человека, жалуется, нужна точная сумма/тариф/дата/"
                         "юридическая формулировка, которой нет в инструментах, или аварийная ситуация."},
             "debounce": {"enabled": True, "windowSeconds": 4, "maxWindowSeconds": 30, "maxMessagesPerBurst": 10},
+            "modelFallback": model_fallback(v["id"]),
             # Factual grounding (agents' own output check): before a reply goes out, a reviewer model compares it
             # with what the source tools returned; a price/date/phone they do not support makes the agent write
             # the reply again. Moderation (input/output) stays off: it is not what this bot needs and costs a call.
@@ -748,6 +757,7 @@ def step_seller():
                     "Передай менеджеру e-KNOT, если человек хочет подключить услугу или узнать цену, он председатель "
                     "или представитель УК, просит человека, жалуется, или нужен факт, которого нет в базе знаний."},
         "debounce": {"enabled": True, "windowSeconds": 4, "maxWindowSeconds": 30, "maxMessagesPerBurst": 10},
+        "modelFallback": model_fallback(v["id"]),
         # Paced like a person on a phone: short balloons, "typing..." for a time proportional to the words.
         "split": {"enabled": True, "maxChars": 280, "typingWpm": 90, "minDelayMs": 1500, "maxDelayMs": 9000,
                   "maxChunks": 4},

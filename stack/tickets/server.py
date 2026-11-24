@@ -47,8 +47,11 @@ STATUS = {
 }
 OPEN = ("new", "in_progress")
 # Fictional service levels of the test УК. The agent may quote them ONLY because they come from here.
+# The emergency line repeats the phone from agent/knowledge.md: the reply after an emergency ticket must carry it,
+# and a figure the tool just returned is repeated far more reliably than one from an earlier search.
 SLA = {
-    "emergency": "аварийная бригада выезжает в течение 2 часов",
+    "emergency": "аварийная бригада выезжает в течение 2 часов; "
+                 "круглосуточная аварийно-диспетчерская служба: +7 700 000-00-01",
     "normal": "мастер свяжется с вами в течение 1 рабочего дня",
 }
 METERS = {
