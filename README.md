@@ -28,11 +28,11 @@ WhatsApp-группа ─ WhatsApp Web (whatsmeow) ─ Chatwoot ─ вебхук
 | `stack/litellm/config.yaml` | единый вход к Gemini, жёсткие лимиты запросов в минуту и в день на каждую модель |
 | `stack/bootstrap.py` | настройка Chatwoot и agents: агент, инструменты, база знаний, вебхуки |
 | `stack/agent/` | промпт и справочник бота поддержки |
-| `stack/tests/` | 14 сценариев бота поддержки через настоящий конвейер agents |
+| `stack/tests/` | сценарии через настоящий конвейер agents: 14 для бота поддержки, 12 для продавца |
 | `deploy/` | деплой на ВМ Google Cloud через IAP, секреты из Secret Manager, ночной бэкап в Cloud Storage |
 
 Проверки: `python3 -I stack/group-watcher/test_watcher.py` (логика без сети);
 на ВМ `docker compose exec group-watcher python3 -I /app/watcher.py eval /app/samples.json` (точность и полнота
-распознавания) и `python3 -I tests/scenarios.py` (бот поддержки).
+распознавания), `python3 -I tests/scenarios.py` (бот поддержки) и `python3 -I tests/scenarios.py --seller` (продавец).
 
 Секреты только в Google Secret Manager. В репозитории их нет.

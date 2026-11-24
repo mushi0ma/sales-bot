@@ -3,13 +3,17 @@
 base and factual-grounding guardrail). Nothing is re-implemented here: a scenario only states what the pipeline
 must DO (which tools it calls or must not call) and that the reply survived the agent's own grounding check.
 
-    python3 -I tests/scenarios.py [name ...]        # inside the VM, from ~/work/stack
+    python3 -I tests/scenarios.py [name ...]           # support agent, scenarios.json (inside the VM, from the stack dir)
+    python3 -I tests/scenarios.py --seller [name ...]  # seller agent, seller-scenarios.json
 
-scenarios.json fields:
+Scenario fields:
   say                 resident message, or a list of messages sent in turn to the same playground thread
   calls[], not_calls[] tools that must / must not be called (over the whole thread)
   no_numbers          the last reply (after a handoff: its customerMessage, as in production) states no figure except phones and figures the resident wrote
   reply_has_from_tool tool name or list: the last reply repeats at least one figure each of these tools returned
+  reply_has           list; each item a substring, or a list of alternatives, the last reply must contain (case-insensitive)
+  reply_not           list of substrings no reply in the thread may contain (case-insensitive)
+The seller's replies are also checked for stock AI phrases and markdown (SELLER_STYLE): it must read like a person.
 Run it after every change of model, prompt or tools. Playground has no Chatwoot conversation, so tickets it
 creates carry no phone (test data).
 """
@@ -20,15 +24,17 @@ import bootstrap as b  # noqa: E402
 
 FIGURE = re.compile(r"\d[\d\s:.,-]*\d|\d")
 PHONE = re.compile(r"\+?\d[\d\s\-()]{8,}\d|\b1\d\d\b")
+SELLER_STYLE = ["отличный вопрос", "безусловно", "надеюсь, это поможет", "обращайтесь, если", "я понимаю ваше",
+                "---", "**", "я бот", "я — бот", "искусственный интеллект", "языковая модель"]
 
 
 def figures(text):
     return {re.sub(r"\D", "", f) for f in FIGURE.findall(text or "") if len(re.sub(r"\D", "", f)) >= 2}
 
 
-def run(a, agent_id, sc):
+def run(a, agent_id, sc, style=()):
     says = sc["say"] if isinstance(sc["say"], list) else [sc["say"]]
-    trace, reply, thread = [], "", None
+    trace, reply, thread, replies = [], "", None, []
     for msg in says:
         st, r = a.req("POST", f"/v1/agents/{agent_id}/playground",
                       {"message": msg, **({"threadId": thread} if thread else {})})
@@ -44,6 +50,7 @@ def run(a, agent_id, sc):
         handoff = [t for t in turn if t.get("type") == "tool_call" and t.get("name") == "handoff_to_human"]
         if handoff and (handoff[-1].get("args") or {}).get("customerMessage"):
             reply = handoff[-1]["args"]["customerMessage"]
+        replies.append(reply)
     called = [t["name"] for t in trace if t.get("type") == "tool_call"]
     errs = [f"no {t} call" for t in sc.get("calls", []) if t not in called]
     errs += [f"called {t}" for t in sc.get("not_calls", []) if t in called]
@@ -61,6 +68,12 @@ def run(a, agent_id, sc):
             errs.append(f"guardrail {g.get('outcome')}")
     if sc.get("no_numbers") and figures(PHONE.sub(" ", reply)) - figures(" ".join(says)):
         errs.append("reply states a figure")
+    for want in sc.get("reply_has", []):
+        alts = want if isinstance(want, list) else [want]
+        if not any(x.lower() in reply.lower() for x in alts):
+            errs.append(f"reply lacks {alts}")
+    every = " ".join(replies).lower()
+    errs += [f"reply says {x!r}" for x in [*sc.get("reply_not", []), *style] if x.lower() in every]
     srcs = sc.get("reply_has_from_tool") or []
     for src in [srcs] if isinstance(srcs, str) else srcs:
         out = " ".join(str(t.get("output")) for t in trace if t.get("type") == "tool_result" and t.get("name") == src)
@@ -70,14 +83,17 @@ def run(a, agent_id, sc):
 
 
 def main():
-    only = set(sys.argv[1:])
-    cases = json.loads((pathlib.Path(__file__).parent / "scenarios.json").read_text())
+    args = sys.argv[1:]
+    seller = "--seller" in args
+    only = set(args) - {"--seller"}
+    cases = json.loads((pathlib.Path(__file__).parent / ("seller-scenarios.json" if seller else "scenarios.json"))
+                       .read_text())
     cases = [c for c in cases if not only or c["name"] in only]
     a = b.Agents().login()
-    ag = b.find_agent(a) or b.die("agent missing")
+    ag = b.find_agent(a, b.SELLER_NAME if seller else None) or b.die("agent missing")
     failed = unchecked = 0
     for sc in cases:
-        errs, reply, called, notes = run(a, ag["id"], sc)
+        errs, reply, called, notes = run(a, ag["id"], sc, SELLER_STYLE if seller else ())
         failed += bool(errs)
         print(f"  {sc['name']:16} {'PASS' if not errs else 'FAIL: ' + '; '.join(errs)} | {called} | "
               f"{reply[:90].replace(chr(10), ' ')}", flush=True)
