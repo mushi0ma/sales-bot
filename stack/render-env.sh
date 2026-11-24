@@ -24,6 +24,13 @@ while read -r name var src; do
   fi
 done < <(grep -vE '^\s*(#|$)' "$root/deploy/secrets.map")
 unset v
+# Keep what bootstrap.py wrote (CW_TGU_*, GW_*: ids and tokens minted inside Chatwoot), unless a secret now sets it.
+if [[ -f "$stack/.env" ]]; then
+  while IFS= read -r line; do
+    [[ "$line" =~ ^([A-Z0-9_]+)= ]] || continue
+    grep -q "^${BASH_REMATCH[1]}=" "$tmp" || printf '%s\n' "$line" >> "$tmp"
+  done < "$stack/.env"
+fi
 if (( ${#missing[@]} )); then echo "empty required secrets: ${missing[*]} (run deploy/secrets.sh init)" >&2; exit 1; fi
 chmod 600 "$tmp"; mv "$tmp" "$stack/.env"; trap - EXIT
 echo "wrote $stack/.env (600): $(grep -c '=' "$stack/.env") variables, empty: $(grep -cE '^[A-Z_]+=$' "$stack/.env")"
