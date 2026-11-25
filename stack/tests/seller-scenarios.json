@@ -7,7 +7,7 @@
    "calls": ["handoff_to_human"], "no_numbers": true,
    "reply_not": ["в ближайшее время", "скоро", "в течение"]},
   {"name": "chairman-lead", "say": "Я председатель ОСИ, хотим подключить цифровую диспетчерскую",
-   "calls": ["set_labels", "handoff_to_human"], "no_numbers": true,
+   "calls": ["set_labels", "private_note", "handoff_to_human"], "no_numbers": true,
    "reply_not": ["в ближайшее время", "скоро", "в течение"]},
   {"name": "resident", "say": ["Расскажите про онлайн-голосование", "Я просто жилец, не председатель"],
    "calls": ["search_knowledge"], "not_calls": ["set_labels"]},
