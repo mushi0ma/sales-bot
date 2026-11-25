@@ -47,6 +47,21 @@ UTC_OFFSET = int(E("UTC_OFFSET", "5"))  # Kazakhstan
 HOLD_MAX_HOURS = int(E("HOLD_MAX_HOURS", "14"))  # a need held for quiet hours expires after this
 HANDBACK_MACRO = E("HANDBACK_MACRO", "🤖 Вернуть боту")
 OPTOUT_ATTR = "salesbot_optout"
+# Path A: WhatsApp Web session of the group's number (whatsmeow inbox). Path B: official WhatsApp Cloud API inbox,
+# first message as an approved Meta template. SPLIT sends B to odd contact ids and A to even ones (stable per
+# person) for the A/B comparison the mentor asked for. Without CLOUD_INBOX_ID everything goes by A.
+SEND_PATH = E("SEND_PATH", "A").upper()
+CLOUD_INBOX_ID = int(E("CLOUD_INBOX_ID", "0") or 0)
+TEMPLATES = {"ru": E("TEMPLATE_RU", "eknot_offer_ru"), "kk": E("TEMPLATE_KK", "eknot_offer_kk")}
+# What the approved templates say, {{1}} name, {{2}} service, {{3}} link (texts submitted to Meta: docs/SETUP.md).
+TEMPLATE_TEXT = {
+    "ru": "Здравствуйте, {1}! Это помощник e-KNOT. Вы писали в чате дома о проблеме, и у нас есть подходящий "
+          "сервис: {2}. Подробнее: {3}. Если интересно, ответьте на это сообщение. Чтобы больше не получать "
+          "сообщения, ответьте «стоп».",
+    "kk": "Сәлеметсіз бе, {1}! Бұл e-KNOT көмекшісі. Сіз үй чатында мәселе туралы жаздыңыз, бізде лайықты қызмет "
+          "бар: {2}. Толығырақ: {3}. Қызықты болса, осы хабарламаға жауап беріңіз. Хабарламалар алмау үшін «стоп» "
+          "деп жазыңыз.",
+}
 TESTER_ATTR = "salesbot_tester"
 # Test environment: whoever writes in a watched group (whose description says a test bot reads it) becomes a tester,
 # so the seller answers them in private without an operator ticking each classmate by hand. Off outside tests.
@@ -240,10 +255,33 @@ def parse_needs(content, new_rows, catalog=CATALOG):
     return out
 
 
+def choose_path(contact_id, mode=None, cloud_inbox=None):
+    mode = SEND_PATH if mode is None else mode
+    cloud_inbox = CLOUD_INBOX_ID if cloud_inbox is None else cloud_inbox
+    if not cloud_inbox or mode not in ("B", "SPLIT"):
+        return "A"
+    return "B" if mode == "B" or contact_id % 2 else "A"
+
+
+def first_name(need):
+    first = (need.get("author") or "").split()[0] if need.get("author") else ""
+    return first if first and not first.lstrip("+").isdigit() else ""
+
+
+def offer_template(need, catalog=CATALOG):
+    """Chatwoot message body for path B: the template call and, as content, the text the resident will see."""
+    s = catalog[need["service"]]
+    lang = "kk" if need.get("lang") == "kk" else "ru"
+    args = [first_name(need) or ("көрші" if lang == "kk" else "сосед"), s["name"], s["url"]]
+    return {"content": TEMPLATE_TEXT[lang].format(None, *args),
+            "template_params": {"name": TEMPLATES[lang], "language": lang, "category": "MARKETING",
+                                "processed_params": {"body": {str(i + 1): a for i, a in enumerate(args)}}}}
+
+
 def offer_text(need, catalog=CATALOG):
     s = catalog[need["service"]]
-    first = (need.get("author") or "").split()[0] if need.get("author") else ""
-    hello = f"Здравствуйте, {first}!" if first and not first.lstrip("+").isdigit() else "Здравствуйте!"
+    first = first_name(need)
+    hello = f"Здравствуйте, {first}!" if first else "Здравствуйте!"
     group = f" «{need['group_name']}»" if need.get("group_name") else ""
     return (f"{hello} Это помощник e-KNOT. Вы писали в группе{group}: «{need['quote']}».\n\n"
             f"{s['offer']}\nПодробнее: {s['url']}\n\n"
@@ -323,22 +361,28 @@ def handback(conv_id):
 
 def send_offer(need_id):
     n = q("SELECT * FROM needs WHERE id=?", (need_id,))[0]
+    path = choose_path(n["contact_id"])
+    inbox = CLOUD_INBOX_ID if path == "B" else n["inbox_id"]
     st, b = cw("GET", f"/contacts/{n['contact_id']}/contactable_inboxes")
     entries = (b or {}).get("payload", []) if isinstance(b, dict) else []
-    src = next((e.get("source_id") for e in entries if (e.get("inbox") or {}).get("id") == n["inbox_id"]), None)
+    src = next((e.get("source_id") for e in entries if (e.get("inbox") or {}).get("id") == inbox), None)
     if not src:
-        x("UPDATE needs SET status='failed:no_contact_inbox' WHERE id=?", (need_id,))
-        log.warning("need=%s contact=%s: no contact inbox in inbox %s (HTTP %s)", need_id, n["contact_id"],
-                    n["inbox_id"], st)
+        # Path B needs the phone number; a group member known only by a WhatsApp LID has none. Not re-routed to A:
+        # the A/B split would stop being random.
+        x("UPDATE needs SET status=?, path=? WHERE id=?", (f"failed:no_contact_inbox_{path}", path, need_id))
+        log.warning("need=%s contact=%s: no contact inbox in inbox %s (path %s, HTTP %s)", need_id, n["contact_id"],
+                    inbox, path, st)
         return False
-    st, c = cw("POST", "/conversations", {"inbox_id": n["inbox_id"], "contact_id": n["contact_id"], "source_id": src,
-                                          "message": {"content": offer_text(dict(n))}})
+    message = offer_template(dict(n)) if path == "B" else {"content": offer_text(dict(n))}
+    st, c = cw("POST", "/conversations", {"inbox_id": inbox, "contact_id": n["contact_id"], "source_id": src,
+                                          "message": message})
     if st not in (200, 201) or not isinstance(c, dict) or not c.get("id"):
-        x("UPDATE needs SET status=? WHERE id=?", (f"failed:http_{st}", need_id))
-        log.warning("need=%s: create conversation HTTP %s", need_id, st)
+        x("UPDATE needs SET status=?, path=? WHERE id=?", (f"failed:http_{st}", path, need_id))
+        log.warning("need=%s: create conversation HTTP %s (path %s)", need_id, st, path)
         return False
-    x("UPDATE needs SET status='sent', path='A', offer_conv_id=?, sent_at=? WHERE id=?", (c["id"], time.time(), need_id))
-    log.info("need=%s sent: conversation=%s service=%s", need_id, c["id"], n["service"])
+    x("UPDATE needs SET status='sent', path=?, offer_conv_id=?, sent_at=? WHERE id=?",
+      (path, c["id"], time.time(), need_id))
+    log.info("need=%s sent: conversation=%s service=%s path=%s", need_id, c["id"], n["service"], path)
     threading.Thread(target=handback, args=(c["id"],), daemon=True).start()
     return True
 
@@ -642,6 +686,15 @@ def report(days=1.0):
         f"Ответили за 24 ч: {pct(count('replied'))}. Отказ «стоп»: {pct(count('optout'))}. "
         f"Лид (метка lead): {pct(count('lead'))}. Передано менеджеру: {pct(count('handoff'))}.",
     ]
+    paths = sorted({n["path"] or "A" for n in sent})
+    if len(paths) > 1:  # A/B comparison: same funnel per send path
+        for path in paths:
+            po = [o for n, o in zip(sent, outs) if (n["path"] or "A") == path]
+            pl = sorted(n["sent_at"] - n["message_at"] for n in sent if (n["path"] or "A") == path)
+            share = lambda k: f"{sum(o[k] for o in po)}/{len(po)}"  # noqa: E731
+            lines.append(f"Путь {path}: отправлено {len(po)}, медиана до предложения {round(statistics.median(pl))} с, "
+                         f"ответили {share('replied')}, стоп {share('optout')}, лид {share('lead')}, "
+                         f"менеджеру {share('handoff')}.")
     print("\n".join(lines))
     return {"messages": msgs, "needs": len(needs), "sent": len(sent), "by_status": by_status,
             "by_service": by_service, "delivery": delivery, "outcomes": outs}

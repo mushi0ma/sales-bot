@@ -84,6 +84,23 @@ class Logic(unittest.TestCase):
         self.assertTrue(w.offer_text({"service": "payments", "author": "+77001234567", "quote": "x"})
                         .startswith("Здравствуйте! "), "a phone is not a name")
 
+    def test_choose_path(self):
+        self.assertEqual(w.choose_path(7, "B", 0), "A", "no cloud inbox: always A")
+        self.assertEqual(w.choose_path(7, "A", 5), "A")
+        self.assertEqual(w.choose_path(8, "B", 5), "B")
+        self.assertEqual([w.choose_path(i, "SPLIT", 5) for i in (7, 8, 7)], ["B", "A", "B"], "stable per contact")
+
+    def test_offer_template(self):
+        n = {"service": "dispatcher", "author": "Айгерим Б.", "lang": "kk", "quote": "лифт"}
+        m = w.offer_template(n)
+        tp = m["template_params"]
+        self.assertEqual((tp["name"], tp["language"]), (w.TEMPLATES["kk"], "kk"))
+        self.assertEqual(tp["processed_params"]["body"]["1"], "Айгерим")
+        self.assertIn(w.CATALOG["dispatcher"]["url"], m["content"])
+        self.assertNotIn("{", m["content"])
+        n.update(author="+77001234567", lang="ru")
+        self.assertEqual(w.offer_template(n)["template_params"]["processed_params"]["body"]["1"], "сосед")
+
 
 class Intake(unittest.TestCase):
     def payload(self, **k):

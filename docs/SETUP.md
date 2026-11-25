@@ -224,7 +224,7 @@ group-watcher.
 ```sh
 python3 -I stack/group-watcher/test_watcher.py                       # ноутбук, логика без сети
 deploy/ssh.sh 'cd /srv/salesbot/stack && python3 -I tests/scenarios.py'            # бот поддержки, 14 сценариев
-deploy/ssh.sh 'cd /srv/salesbot/stack && python3 -I tests/scenarios.py --seller'   # продавец, 12 сценариев
+deploy/ssh.sh 'cd /srv/salesbot/stack && python3 -I tests/scenarios.py --seller'   # продавец, 15 сценариев
 deploy/ssh.sh 'cd /srv/salesbot/stack && docker compose exec -T group-watcher python3 -I /app/watcher.py eval /app/samples.json'
 ```
 
@@ -232,6 +232,36 @@ deploy/ssh.sh 'cd /srv/salesbot/stack && docker compose exec -T group-watcher py
 живого бота. Playground не создаёт диалога Chatwoot, поэтому заявки из сценариев без телефона, а handoff только
 симулируется: прогон проверяет `customerMessage` handoff, как увидит жилец. Ответы продавца дополнительно
 проверяются на шаблонные ИИ-фразы, markdown и «я бот».
+
+## Путь B: официальный WhatsApp Cloud API
+
+Путь A пишет в личку с того же номера WhatsApp, что читает группу. Путь B пишет с номера Cloud API: первое
+сообщение только одобренным шаблоном Meta (категория Marketing, в Казахстане около $0.06 за доставку).
+group-watcher уже умеет оба пути, нужен только inbox.
+
+1. Нужна A-запись: Meta шлёт вебхуки на `https://PUBLIC_DOMAIN/webhooks/whatsapp/<номер>`.
+2. В Meta for Developers: приложение типа Business, продукт WhatsApp, тестовый номер (или свой), постоянный
+   токен системного пользователя. Токен и App Secret кладём в Secret Manager, не в чат и не в файлы.
+3. Chatwoot: «Входящие» → WhatsApp → WhatsApp Cloud, ручная настройка (WABA id, phone number id, токен, App Secret).
+   Chatwoot сам подпишет вебхук.
+4. В WhatsApp Manager подать два шаблона, категория Marketing, параметры `{{1}}` имя, `{{2}}` услуга, `{{3}}` ссылка.
+   Тексты должны совпадать с `TEMPLATE_TEXT` в `stack/group-watcher/watcher.py`:
+   - `eknot_offer_ru` (ru): «Здравствуйте, {{1}}! Это помощник e-KNOT. Вы писали в чате дома о проблеме, и у нас
+     есть подходящий сервис: {{2}}. Подробнее: {{3}}. Если интересно, ответьте на это сообщение. Чтобы больше не
+     получать сообщения, ответьте «стоп».»
+   - `eknot_offer_kk` (kk): «Сәлеметсіз бе, {{1}}! Бұл e-KNOT көмекшісі. Сіз үй чатында мәселе туралы жаздыңыз,
+     бізде лайықты қызмет бар: {{2}}. Толығырақ: {{3}}. Қызықты болса, осы хабарламаға жауап беріңіз. Хабарламалар
+     алмау үшін «стоп» деп жазыңыз.»
+   Цитату из группы в шаблон не ставим: Meta не пропускает произвольный текст жильца в шаблон рекламы.
+5. После одобрения: Chatwoot подтягивает шаблоны сам (`sync_templates`). Привязать продавца:
+   `bootstrap.py bind-cw <id нового inbox> seller`.
+6. В `stack/.env`: `GW_CLOUD_INBOX_ID=<id>`, `GW_SEND_PATH=SPLIT` (нечётные id контактов по B, чётные по A,
+   один человек всегда на одном пути) или `B`. Затем `docker compose up -d group-watcher`.
+7. `watcher.py report 7` при двух путях печатает воронку отдельно по A и по B.
+
+Ограничение: участник группы, которого WhatsApp показывает только по LID (без номера), по пути B недоступен.
+Такая потребность получает статус `failed:no_contact_inbox_B` и на путь A не перекладывается, чтобы деление A/B
+оставалось случайным.
 
 ## Бэкап
 
