@@ -107,6 +107,20 @@ class Intake(unittest.TestCase):
         self.assertEqual(w.intake(self.payload(id=103, message_type="outgoing")), "ignored:not_incoming")
         self.assertEqual(w.intake({"event": "conversation_created"}), "ignored:event")
 
+    def test_auto_testers(self):
+        calls = []
+        old = (w.AUTO_TESTERS, w.cw, w._spawn)
+        w.AUTO_TESTERS, w._spawn = True, lambda fn, *a: fn(*a)
+        w.cw = lambda method, path, body=None: (calls.append((method, path, body)), (200, {}))[1]
+        try:
+            w.intake(self.payload(id=110, sender={"id": 8, "name": "B", "type": "contact"}))
+            w.intake(self.payload(id=111, sender={"id": 8, "name": "B", "type": "contact"}))
+            w.intake(self.payload(id=112, sender={"id": 9, "name": "C", "type": "contact",
+                                                  "custom_attributes": {w.TESTER_ATTR: True}}))
+        finally:
+            w.AUTO_TESTERS, w.cw, w._spawn = old
+        self.assertEqual(calls, [("PATCH", "/contacts/8", {"custom_attributes": {w.TESTER_ATTR: True}})])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

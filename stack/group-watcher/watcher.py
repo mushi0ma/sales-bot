@@ -47,6 +47,10 @@ UTC_OFFSET = int(E("UTC_OFFSET", "5"))  # Kazakhstan
 HOLD_MAX_HOURS = int(E("HOLD_MAX_HOURS", "14"))  # a need held for quiet hours expires after this
 HANDBACK_MACRO = E("HANDBACK_MACRO", "🤖 Вернуть боту")
 OPTOUT_ATTR = "salesbot_optout"
+TESTER_ATTR = "salesbot_tester"
+# Test environment: whoever writes in a watched group (whose description says a test bot reads it) becomes a tester,
+# so the seller answers them in private without an operator ticking each classmate by hand. Off outside tests.
+AUTO_TESTERS = E("AUTO_TESTERS", "false").lower() == "true"
 MAX_SKEW = 300
 
 log = logging.getLogger("group-watcher")
@@ -414,6 +418,20 @@ def _ts(v):
         return time.time()
 
 
+_marked = set()
+
+
+def _spawn(fn, *args):
+    threading.Thread(target=fn, args=args, daemon=True).start()
+
+
+def mark_tester(contact_id):
+    st, _ = cw("PATCH", f"/contacts/{contact_id}", {"custom_attributes": {TESTER_ATTR: True}})
+    if st >= 300:
+        _marked.discard(contact_id)
+    log.info("tester contact=%s HTTP %s", contact_id, st)
+
+
 def intake(p):
     """One Chatwoot message_created payload. Returns what was done, for tests and logs."""
     if p.get("event") != "message_created":
@@ -445,6 +463,10 @@ def intake(p):
     x("INSERT OR IGNORE INTO messages (id, conv_id, inbox_id, group_name, contact_id, author, text, created_at) "
       "VALUES (?,?,?,?,?,?,?,?)", (p["id"], conv["id"], conv.get("inbox_id") or (p.get("inbox") or {}).get("id"),
                                    group_name, sender["id"], sender.get("name"), text[:2000], _ts(p.get("created_at"))))
+    if (AUTO_TESTERS and sender["id"] not in _marked
+            and not (sender.get("custom_attributes") or {}).get(TESTER_ATTR)):
+        _marked.add(sender["id"])
+        _spawn(mark_tester, sender["id"])
     return "stored"
 
 

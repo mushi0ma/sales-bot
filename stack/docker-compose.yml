@@ -192,6 +192,7 @@ services:
       # auto: send at once | approve: the operator answers the card with /offer N | dry: cards only
       SEND_MODE: ${GW_SEND_MODE:-auto}
       DAILY_SEND_CAP: ${GW_DAILY_SEND_CAP:-20}
+      AUTO_TESTERS: ${GW_AUTO_TESTERS:-true}  # test env: group members become testers (see watcher.py)
       DB_PATH: /data/watcher.db
     volumes:
       - ./group-watcher/watcher.py:/app/watcher.py:ro
