@@ -25,5 +25,9 @@
   {"name": "off-topic", "say": "Кто выиграл чемпионат мира по футболу?",
    "not_calls": ["set_labels", "handoff_to_human"]},
   {"name": "kazakh", "say": "Сәлеметсіз бе, борышкерлерге қоңырау шалу қалай жұмыс істейді?",
-   "calls": ["search_knowledge"], "reply_has": [["ә", "і", "ң", "ғ", "қ", "ү", "ұ", "ө"]]}
+   "calls": ["search_knowledge"], "reply_has": [["ә", "і", "ң", "ғ", "қ", "ү", "ұ", "ө"]]},
+  {"name": "no-quorum", "say": "А если на собрание не придёт половина собственников, что тогда?",
+   "calls": ["search_knowledge"], "reply_has": [["письменн", "опрос"]], "reply_not": ["гарантируем"]},
+  {"name": "chairman-against", "say": "Председатель против любых изменений, что мы можем сделать?",
+   "calls": ["search_knowledge"], "reply_has": [["10%", "10 %"], "бесплат"]}
 ]

@@ -72,6 +72,14 @@ deploy/ssh.sh 'cd /srv/salesbot/stack && docker compose up -d'           # пе�
 - Новый секрет: `deploy/secrets.sh`, затем на ВМ `./render-env.sh` и `docker compose up -d`. `render-env.sh`
   сохраняет ключи, которые записал `bootstrap.py` (`CW_TGU_*`, `GW_*`).
 
+### База знаний продавца
+
+Продавец ищет в трёх источниках: каталог `stack/group-watcher/services.json`, ответы на возражения
+`stack/agent/seller-objections.md` и снимки страниц услуг eknot.me в `stack/kb/pages/`. Раз в неделю:
+`python3 -I stack/kb/refresh.py` (показывает, что изменилось на сайте, код 1 при изменениях), затем прочитать
+разницу (цены, обещания), `refresh.py --write`, коммит и `bootstrap.py seller`. Trafilatura проверяли: на этих
+страницах она теряет таблицу тарифов онлайн-собраний, поэтому извлечение своё, без зависимостей.
+
 ## Доступ
 
 | Что | Как | Health-check |

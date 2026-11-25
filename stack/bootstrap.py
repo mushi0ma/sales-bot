@@ -666,7 +666,7 @@ def step_knowledge():
     # nowhere). Real data replaces the file before the bot answers everyone.
     if BOT_AUDIENCE != "testers" and re.search(r"000-00-0|\.example|«Тестовая»", text):
         die("agent/knowledge.md still has TEST placeholders; keep BOT_AUDIENCE=testers until it is replaced")
-    kb = upsert_kb(a, KB_NAME, "agent/knowledge.md", "Справочник УК", text)
+    kb = upsert_kb(a, KB_NAME, "agent/knowledge.md", [("Справочник УК", text)])
     ag = find_agent(a) or die("agent missing; run 'agent'")
     grant_rag(a, ag, kb)
     for q in ("куда звонить если пахнет газом", "сколько стоит сантехник", "когда сдавать показания воды"):
@@ -679,8 +679,9 @@ def search_smoke(a, kb, q):
     print(f"  search {q!r}: HTTP {st} | {(hit.get('content') or hit.get('text') or str(r))[:90]!r}")
 
 
-def upsert_kb(a, name, description, title, text):
-    """A knowledge base that mirrors one text (documents replaced on every run), indexed before returning."""
+def upsert_kb(a, name, description, docs):
+    """A knowledge base that mirrors the given [(title, text), ...] (documents replaced on every run), indexed
+    before returning."""
     st, b = a.req("GET", "/v1/knowledge/bases")
     kb = next((k for k in as_list(b) if k.get("name") == name), None)
     if not kb:
@@ -694,16 +695,22 @@ def upsert_kb(a, name, description, title, text):
     st, b = a.req("GET", f"/v1/knowledge/bases/{kb['id']}/documents")
     for d in as_list(b):  # replace, so the base always mirrors the file
         a.req("DELETE", f"/v1/knowledge/documents/{d['id']}")
-    st, doc = a.req("POST", f"/v1/knowledge/bases/{kb['id']}/documents", {"title": title, "text": text})
-    doc = one(doc)
-    print(f"  document: HTTP {st} status={doc.get('status') if isinstance(doc, dict) else doc}")
-    for _ in range(30):
-        st, d = a.req("GET", f"/v1/knowledge/documents/{doc['id']}")
-        d = one(d)
-        if d.get("status") not in ("PENDING", "PROCESSING", "INDEXING"):
-            break
-        time.sleep(2)
-    print(f"  indexed: status={d.get('status')} chunks={d.get('chunkCount', d.get('chunks'))} {str(d.get('error') or '')[:200]}")
+    ids = []
+    for title, text in docs:
+        st, doc = a.req("POST", f"/v1/knowledge/bases/{kb['id']}/documents", {"title": title, "text": text})
+        doc = one(doc)
+        if st >= 300 or not isinstance(doc, dict) or "id" not in doc:
+            die(f"document '{title}': HTTP {st} {str(doc)[:200]}")
+        ids.append((title, doc["id"]))
+    for title, doc_id in ids:
+        for _ in range(30):
+            st, d = a.req("GET", f"/v1/knowledge/documents/{doc_id}")
+            d = one(d)
+            if d.get("status") not in ("PENDING", "PROCESSING", "INDEXING"):
+                break
+            time.sleep(2)
+        print(f"  indexed '{title}': status={d.get('status')} chunks={d.get('chunkCount', d.get('chunks'))} "
+              f"{str(d.get('error') or '')[:200]}")
     return kb
 
 
@@ -723,6 +730,16 @@ def grant_rag(a, ag, kb):
 SELLER_NAME = "Продавец e-KNOT (тест)"
 SELLER_KB = "Услуги e-KNOT (eknot.me)"
 SELLER_NATIVE = ["handoff_to_human", "private_note", "set_labels", "get_current_time"]
+
+
+def seller_knowledge_docs():
+    """Catalog (one source with group-watcher), page snapshots of eknot.me (stack/kb/refresh.py) and objections."""
+    docs = [("Услуги e-KNOT: каталог", seller_knowledge_text()),
+            ("Возражения и ответы", (STACK / "agent" / "seller-objections.md").read_text(encoding="utf-8"))]
+    for page in sorted((STACK / "kb" / "pages").glob("*.md")):
+        text = page.read_text(encoding="utf-8")
+        docs.append((f"Страница сайта: {text.splitlines()[0].lstrip('# ').strip()}", text))
+    return docs
 
 
 def seller_knowledge_text():
@@ -789,7 +806,7 @@ def step_seller():
     ag = find_agent(a, SELLER_NAME) or die("seller agent not found after save")
     print(f"  seller agent id={ag['id']} model={MODEL} copied={sorted(copied)} HTTP {st}")
     check_gate(a, SELLER_NAME)
-    kb = upsert_kb(a, SELLER_KB, "stack/group-watcher/services.json", "Услуги e-KNOT", seller_knowledge_text())
+    kb = upsert_kb(a, SELLER_KB, "services.json + stack/kb/pages + agent/seller-objections.md", seller_knowledge_docs())
     st, cur = a.req("GET", f"/v1/agents/{ag['id']}/tool-selections")
     keep = [g for g in (cur or {}).get("grants", []) if g.get("source") not in ("NATIVE", "RAG")]
     st, r = a.req("PUT", f"/v1/agents/{ag['id']}/tool-selections", {"grants": keep + [
@@ -803,7 +820,8 @@ def step_seller():
         st, _ = cw_api("POST", "/labels", {"title": "lead", "color": "#F57C00", "show_on_sidebar": True,
                                            "description": "Продавец: человек хочет подключение или расчёт"})
     print(f"  label 'lead': HTTP {st}")
-    for q in ("как работает обзвон должников", "сколько стоит онлайн голосование", "как скачать приложение"):
+    for q in ("как работает обзвон должников", "сколько стоит онлайн собрание расширенный",
+              "что делать если не собирается кворум", "председатель против"):
         search_smoke(a, kb, q)
 
 
