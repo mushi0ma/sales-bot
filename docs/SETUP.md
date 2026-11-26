@@ -240,8 +240,8 @@ group-watcher.
 ## Telegram
 
 - **Канал Telegram: userbot** (решение ментора): бот читает группы и пишет в личку от обычного аккаунта, как в
-  WhatsApp. Bot API (`bootstrap.py telegram`) не используется: шаг остался в коде, но не запускать. 26.11 бот
-  @oknewsales_bot подключили по ошибке и в тот же день отключили (вебхук снят, входящие удалены).
+  WhatsApp. Bot API не используется: 26.11 бота @oknewsales_bot подключили по ошибке и в тот же день убрали
+  (вебхук снят, входящие удалены, секрет `telegram-bot-token` и шаг `bootstrap.py telegram` удалены).
 - **Userbot** (`stack/tg-userbot/`, профиль compose `tg-userbot`): спайк S2 на Telethon, заморожен до 06.12.
   Telethon архивирован, замена на Kurigram в бэклоге.
 

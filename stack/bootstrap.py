@@ -10,9 +10,6 @@ Steps (idempotent where possible; secrets go to ~/secrets/*.env with mode 600 an
   stt        local speech-to-text (whisper in the VM) for voice notes: vault entry + agent stt settings
   operator   Chatwoot: macro «🤖 Вернуть боту» + contact attribute «Тестировщик бота»
   testers    testers <contact_id>...: tick «Тестировщик бота» (the bot answers only them)
-  telegram   NOT USED (the mentor chose the userbot for Telegram). Telegram Bot API inbox from TELEGRAM_BOT_TOKEN
-             + bind to the agent; Chatwoot sets the public HTTPS webhook
-             (with secret_token = TELEGRAM_WEBHOOK_SECRET, checked by Caddy)
   tg-userbot API inbox «Telegram (userbot)» for the tg-userbot service (a real account, plan v2 spike S2):
              writes CW_TGU_* (inbox identifier, webhook secret, account id, operator token) to stack/.env,
              binds the agent; operator user «Оператор (телефон Telegram)» = owner's phone messages
@@ -891,38 +888,6 @@ def step_testers(ids):
         print(f"  contact {cid}: tester HTTP {st}")
 
 
-TG_RUBY = r'''
-require 'json'
-token = ENV.fetch('TG_TOKEN'); acc = Account.find(ENV.fetch('CW_ACCOUNT_ID').to_i)
-ch = Channel::Telegram.find_by(bot_token: token)
-created = false
-unless ch
-  # The save callback calls setWebhook with FRONTEND_URL (public HTTPS through Caddy) and the secret_token
-  # (stack/patches/chatwoot-telegram-webhook-secret.patch).
-  ch = Channel::Telegram.create!(account: acc, bot_token: token)
-  Inbox.create!(account: acc, channel: ch, name: ENV.fetch('TG_INBOX_NAME'), enable_auto_assignment: false)
-  created = true
-end
-puts 'TG_JSON:' + JSON.generate({ inbox_id: ch.inbox.id, bot: ch.bot_name, created: created })
-'''
-
-
-def step_telegram():
-    token = stack_env("TELEGRAM_BOT_TOKEN") or die("no TELEGRAM_BOT_TOKEN in stack/.env (see docs/SETUP.md, Telegram)")
-    cw = read_env("chatwoot-admin.env") or die("run 'chatwoot' first")
-    env = dict(os.environ, TG_TOKEN=token, CW_ACCOUNT_ID=cw["CW_ACCOUNT_ID"], TG_INBOX_NAME="Telegram")
-    r = subprocess.run(["docker", "compose", "exec", "-T", "-e", "TG_TOKEN", "-e", "CW_ACCOUNT_ID", "-e",
-                        "TG_INBOX_NAME", "cw-rails", "sh", "-c",
-                        "umask 077; cat > /tmp/tg.rb && bundle exec rails runner /tmp/tg.rb; rc=$?; rm -f /tmp/tg.rb; "
-                        "exit $rc"], cwd=STACK, input=TG_RUBY, capture_output=True, text=True, env=env)
-    m = re.search(r"^TG_JSON:(.*)$", r.stdout, re.M)
-    if r.returncode != 0 or not m:
-        die("telegram inbox failed:\n" + (r.stderr or r.stdout).replace(token, "<token>")[-1500:])
-    res = json.loads(m.group(1))
-    print(f"  chatwoot: Telegram inbox {res['inbox_id']} for @{res['bot']} (created={res['created']})")
-    bind_cw_inbox(res["inbox_id"])
-
-
 def bind_cw_inbox(cw_inbox_id, name=None):
     """Make agents see a Chatwoot inbox it has not mirrored yet, then bind it to the agent."""
     a = Agents().login()
@@ -1131,7 +1096,7 @@ def step_playground():
 
 STEPS = {"chatwoot": step_chatwoot, "agents": step_agents, "vault": step_vault, "agent": step_agent,
          "connect": step_connect, "tickets": step_tickets, "stt": step_stt, "vision": step_vision, "inboxes": step_inboxes,
-         "operator": step_operator, "telegram": step_telegram, "tg-userbot": step_tg_userbot,
+         "operator": step_operator, "tg-userbot": step_tg_userbot,
          "knowledge": step_knowledge, "group-watcher": step_group_watcher, "seller": step_seller,
          "playground": step_playground}
 
