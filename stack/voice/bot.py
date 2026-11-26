@@ -98,7 +98,7 @@ class ConnectorSerializer(FrameSerializer):
 
     def __init__(self):
         super().__init__()
-        self.peer, self.call_id, self.answered = None, None, asyncio.Event()
+        self.peer, self.call_id, self.answered, self.ended = None, None, asyncio.Event(), asyncio.Event()
 
     async def serialize(self, frame: Frame):
         if isinstance(frame, (EndFrame, CancelFrame)):
@@ -121,6 +121,8 @@ class ConnectorSerializer(FrameSerializer):
             self.call_id, self.peer = m.get("call_id"), m.get("peer")
         elif ev == "answered":
             self.answered.set()
+        elif ev == "stop":  # the call ended: rejected or unanswered before anybody picked up, or hung up
+            self.ended.set()
         return None
 
 
@@ -129,7 +131,7 @@ class BrowserSerializer(FrameSerializer):
 
     def __init__(self):
         super().__init__()
-        self.peer, self.call_id, self.answered = "browser", None, asyncio.Event()
+        self.peer, self.call_id, self.answered, self.ended = "browser", None, asyncio.Event(), asyncio.Event()
         self.answered.set()
 
     async def serialize(self, frame: Frame):
@@ -254,10 +256,13 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
 
     @transport.event_handler("on_client_connected")
     async def _connected(_, __):
-        try:
-            # An outbound call rings until the person picks up (or WhatsApp gives up, ~60 s).
-            await asyncio.wait_for(serializer.answered.wait(), 90 if campaign else 30)
-        except asyncio.TimeoutError:
+        # An outbound call rings until the person picks up, rejects it, or WhatsApp gives up (~60 s).
+        waits = [asyncio.create_task(serializer.answered.wait()), asyncio.create_task(serializer.ended.wait())]
+        await asyncio.wait(waits, timeout=90 if campaign else 30, return_when=asyncio.FIRST_COMPLETED)
+        for w in waits:
+            w.cancel()
+        if not serializer.answered.is_set():
+            log.info("call=%s not answered (%s)", call_id, "ended" if serializer.ended.is_set() else "timeout")
             await task.cancel()
             return
         await task.queue_frame(LLMRunFrame())
