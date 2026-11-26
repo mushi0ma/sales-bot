@@ -29,8 +29,14 @@ x-cw-env: &cw-env
   SAFE_FETCH_PRIVATE_TARGETS: agents:3000,tg-userbot:8080,group-watcher:8080
   # Telegram setWebhook carries this secret_token; Caddy refuses webhook calls without it.
   TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:?}
-  # Native WhatsApp connector (whatsmeow), embedded in Sidekiq. Calls/UDP stay off.
+  # Native WhatsApp connector (whatsmeow), embedded in Sidekiq.
   WHATSAPP_CONNECTOR_ENABLED: "true"
+  # WhatsApp calls to the test number go to the voice agent (stack/voice, patch chatwoot-whatsapp-voice-agent):
+  # the connector dials this stream on the docker network. Empty VOICE_AGENT_URL in .env turns it off.
+  WHATSAPP_VOICE_AGENT_URL: ${VOICE_AGENT_URL-ws://voice:8090/wa}
+  # Call voice to WhatsApp's relays leaves through this UDP port (outbound; replies come back on it).
+  WAC_CALLS_UDP_PORT: "40000"
+  WAC_CALLS_PUBLIC_IP: ${PUBLIC_IP:-34.187.89.79}
   WHATSAPP_CONNECTOR_EMBEDDED: "true"
   # Group chats (the sales task reads a test group). Off by default in the fork: group messages are dropped.
   WHATSAPP_GROUPS_ENABLED: "true"
@@ -69,6 +75,7 @@ services:
     pull_policy: never
     environment: *cw-env
     command: [bundle, exec, sidekiq, -C, config/sidekiq.yml]
+    ports: ["40000:40000/udp"]  # WhatsApp call voice (WAC_CALLS_UDP_PORT)
     volumes:
       - cw_storage:/app/storage
       - wac_media:/app/wac-media
@@ -216,6 +223,36 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Voice agent (Pipecat + Gemini Live): WhatsApp calls handed over by the connector (/wa) and a browser test page.
+  # Only on the VM's loopback until PUBLIC_DOMAIN has its A record: ssh -L 8090:localhost:8090 to try it.
+  voice:
+    build: ./voice
+    image: salesbot/voice:local
+    networks: [default]
+    ports: ["127.0.0.1:8090:8090"]
+    environment:
+      GCP_PROJECT: ${GCP_PROJECT:?run render-env.sh}
+      VOICE_LOCATION: ${VOICE_LOCATION:-eu}
+      VOICE_NAME: ${VOICE_NAME:-Kore}
+      MAX_CALLS: ${VOICE_MAX_CALLS:-2}
+      MAX_CALL_SECS: ${VOICE_MAX_CALL_SECS:-600}
+      DAILY_CALLS: ${VOICE_DAILY_CALLS:-40}
+    volumes:
+      - ./group-watcher/services.json:/app/services.json:ro
+      - ./kb/pages:/app/kb:ro
+      - voice_data:/data
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 768m
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   # Public HTTPS entry (Let's Encrypt for PUBLIC_DOMAIN) in front of Chatwoot: UI, WhatsApp Cloud and Telegram webhooks.
   caddy:
     image: caddy:2.11.8-alpine@sha256:f6228111e5fafa1a5238258d0858e103f10599b8d1659a146e7726681a002bb9
@@ -349,3 +386,4 @@ volumes:
   caddy_data:
   caddy_config:
   gw_data:
+  voice_data:

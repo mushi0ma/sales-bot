@@ -251,6 +251,37 @@ deploy/ssh.sh 'cd /srv/salesbot/stack && docker compose exec -T group-watcher py
 симулируется: прогон проверяет `customerMessage` handoff, как увидит жилец. Ответы продавца дополнительно
 проверяются на шаблонные ИИ-фразы, markdown и «я бот».
 
+## Голос: звонки помощнику e-KNOT
+
+Сервис `voice` (`stack/voice`): Pipecat 1.15 + Gemini Live (`gemini-3.8-live`, Vertex AI, регион `eu`, голос Kore,
+ru-RU). Тот же промпт по смыслу, что у продавца, но для речи: короткие фразы, числа словами, ссылки не диктует.
+Инструменты: `service_info` (страница услуги со снимка eknot.me), `save_lead` (заявка менеджеру), `end_call`.
+Звонки и стенограммы в `voice.db` (том `voice_data`); логи без текста разговора.
+
+Два входа в один и тот же разговор:
+
+- **Звонок в WhatsApp на тестовый номер.** Коннектор WhatsApp внутри Chatwoot принимает голосовой звонок 1:1 и
+  передаёт его голосом агенту по WebSocket `ws://voice:8090/wa` (16 кГц PCM, протокол `call.accept` со `stream` из
+  `vendor/whatsapp-connector/contract/PROTOCOL.md`). В Chatwoot этого не было: патч
+  `stack/patches/chatwoot-whatsapp-voice-agent.patch` при заданном `WHATSAPP_VOICE_AGENT_URL` подключает сессию с
+  `calls.answer` и отдаёт каждый звонок агенту. Голос к серверам WhatsApp идёт по UDP 40000 (исходящий). A-запись
+  для этого не нужна. Выключить: `VOICE_AGENT_URL=` в `stack/.env`, пересоздать `cw-sidekiq`.
+- **Браузер** (отладка): на ноутбуке `deploy/ssh.sh -- -N -L 8090:127.0.0.1:8090`, затем http://localhost:8090.
+  localhost считается защищённым адресом, поэтому микрофон работает без HTTPS. Нужны наушники.
+
+Лимиты (против зацикливания и расхода): 2 звонка одновременно, 10 минут на звонок, 40 звонков в день
+(`VOICE_MAX_CALLS`, `VOICE_MAX_CALL_SECS`, `VOICE_DAILY_CALLS`). Казахского в Gemini Live нет: на казахскую речь
+агент по-казахски предлагает продолжить по-русски или написать в WhatsApp.
+
+Замер (симуляция звонка коннектора, 26.11): приветствие через 1,2 с после ответа на звонок, ответ на вопрос о цене
+через 1,2–2,0 с после конца фразы, включая поход в `service_info`.
+
+```bash
+deploy/ssh.sh 'cd /srv/salesbot/stack && docker compose exec -T voice python3 -c "
+import sqlite3; c=sqlite3.connect(\"/data/voice.db\")
+print(c.execute(\"SELECT id, door, round(ended_at-started_at), transcript FROM calls ORDER BY id DESC LIMIT 3\").fetchall())"'
+```
+
 ## Путь B: официальный WhatsApp Cloud API
 
 Путь A пишет в личку с того же номера WhatsApp, что читает группу. Путь B пишет с номера Cloud API: первое
@@ -297,6 +328,7 @@ group-watcher уже умеет оба пути, нужен только inbox.
 
 - [ ] A-запись `PUBLIC_DOMAIN` → сертификат, Telegram-бот, публичная ссылка для ментора.
 - [ ] Путь B (WhatsApp Cloud API): приложение Meta, тестовый номер, шаблоны ru/kk, inbox `whatsapp_cloud`.
+- [ ] Голос: заявки из `voice.db` в Chatwoot (диалог контакта, метка `lead`); исходящий звонок после «я председатель».
 - [ ] Проверить восстановление из бэкапа на пустой копии.
 - [ ] Окно приёма показаний 20–25 инструмент не проверяет.
 - [ ] Upstream: маска токена Telegram в логах (fazer-ai/chatwoot), `dimensions` эмбеддингов (fazer-ai/agents).

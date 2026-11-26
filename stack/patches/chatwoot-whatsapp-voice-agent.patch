@@ -1,0 +1,93 @@
+diff --git a/app/services/whatsapp/session/backends/connector/backend.rb b/app/services/whatsapp/session/backends/connector/backend.rb
+index 92e980c..499c2d5 100644
+--- a/app/services/whatsapp/session/backends/connector/backend.rb
++++ b/app/services/whatsapp/session/backends/connector/backend.rb
+@@ -268,6 +268,11 @@ class Whatsapp::Session::Backends::Connector::Backend < Whatsapp::Session::Backe
+     client.publish(command, timeout: DEFERRABLE_TIMEOUT)
+   end
+ 
++  def accept_call(command)
++    client.call(command)
++    nil
++  end
++
+   def mark_unread(command)
+     client.publish(command, timeout: DEFERRABLE_TIMEOUT)
+   end
+diff --git a/app/services/whatsapp/session/facade.rb b/app/services/whatsapp/session/facade.rb
+index 76346ff..dd7bca9 100644
+--- a/app/services/whatsapp/session/facade.rb
++++ b/app/services/whatsapp/session/facade.rb
+@@ -82,7 +82,8 @@ class Whatsapp::Session::Facade
+     backend.connect(
+       model::Commands::SessionConnect.new(
+         pairing: 'resume', phone: channel.phone_number.to_s.delete('+'),
+-        groups: capability?('groups'), history_sync: history_on_connect?, proxy: proxy
++        groups: capability?('groups'), history_sync: history_on_connect?, proxy: proxy,
++        calls: voice_agent_calls
+       )
+     )
+   end
+@@ -215,8 +216,20 @@ class Whatsapp::Session::Facade
+     { 'jid' => model::Address.phone(check.phone.presence || digits).to_jid, 'exists' => check.exists }
+   end
+ 
++  # A 1:1 voice call handed to the voice agent's media stream (WHATSAPP_VOICE_AGENT_URL). The connector dials
++  # the URL and answers on WhatsApp once it is open.
++  def accept_call_with_stream(call_id, url)
++    backend.accept_call(model::Commands::CallAccept.new(call_id: call_id, sdp: nil, stream: { 'url' => url }))
++  end
++
+   private
+ 
++  # The connector carries the voice of a call only for a session that asked for it on connect, and every
++  # connect states the whole request: so it is asked here, on both connects, whenever a voice agent is set.
++  def voice_agent_calls
++    ENV['WHATSAPP_VOICE_AGENT_URL'].present? ? { 'answer' => true } : nil
++  end
++
+   def capability?(capability)
+     channel.session_capabilities.include?(capability)
+   end
+@@ -276,7 +289,8 @@ class Whatsapp::Session::Facade
+     backend.connect(
+       model::Commands::SessionConnect.new(
+         pairing: mode, phone: channel.phone_number.to_s.delete('+'),
+-        groups: capability?('groups'), history_sync: history_on_connect?, proxy: proxy
++        groups: capability?('groups'), history_sync: history_on_connect?, proxy: proxy,
++        calls: voice_agent_calls
+       )
+     )
+   rescue Whatsapp::Session::Errors::Error
+diff --git a/app/services/whatsapp/session/inbound/handlers/call_offer.rb b/app/services/whatsapp/session/inbound/handlers/call_offer.rb
+index 96443e0..eaadfc2 100644
+--- a/app/services/whatsapp/session/inbound/handlers/call_offer.rb
++++ b/app/services/whatsapp/session/inbound/handlers/call_offer.rb
+@@ -11,11 +11,26 @@ class Whatsapp::Session::Inbound::Handlers::CallOffer < Whatsapp::Session::Inbou
+     return :ignored unless capability?(:calls)
+     return :ignored if payload.from.blank?
+ 
+-    inbound::Locks.with_chat_lock(inbox, payload.from.source_id) { write_the_line }
++    result = inbound::Locks.with_chat_lock(inbox, payload.from.source_id) { write_the_line }
++    hand_to_voice_agent if result == :handled
++    result
+   end
+ 
+   private
+ 
++  # WHATSAPP_VOICE_AGENT_URL set: the voice agent takes every 1:1 voice call instead of the operator's phone.
++  # Outside the chat lock: the connector waits up to 5 s for the agent's socket. A failure leaves the call
++  # ringing, which is what happens without an agent.
++  def hand_to_voice_agent
++    url = ENV.fetch('WHATSAPP_VOICE_AGENT_URL', '')
++    return if url.blank? || payload.video || payload.call_id.blank? || payload.from.group?
++
++    channel.provider_service.accept_call_with_stream(payload.call_id, url)
++    Rails.logger.info("[whatsapp] call #{payload.call_id} handed to the voice agent")
++  rescue StandardError => e
++    Rails.logger.warn("[whatsapp] call #{payload.call_id} not handed to the voice agent: #{e.class}: #{e.message}")
++  end
++
+   # Prefixed, and not the raw call id: this shares a column with WhatsApp's message ids,
+   # and the prefix is what keeps a call from ever being the target of an edit, a revoke
+   # or a reaction that names the same string.
