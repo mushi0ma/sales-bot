@@ -15,7 +15,7 @@ Knowledge: the e-KNOT catalog (services.json) in the prompt, page snapshots (kb/
 tool. Leads go to SQLite (/data/voice.db) with the call's transcript.
 Limits (the mentor's "no runaway spend"): MAX_CALLS at once, MAX_CALL_SECS per call, DAILY_CALLS per day.
 """
-import asyncio, base64, json, logging, os, sqlite3, sys, time
+import asyncio, base64, json, logging, os, re, sqlite3, sys, time
 from pathlib import Path
 
 from loguru import logger
@@ -188,8 +188,13 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
         await params.result_callback({"saved": True})
 
     async def end_call(params: FunctionCallParams):
+        asked = time.time()
         await params.result_callback({"ok": True})
-        await asyncio.sleep(4)  # let the goodbye play out
+        await asyncio.sleep(5)  # let the goodbye play out
+        # The person said something after the goodbye ("подождите", "вы куда?"): the conversation goes on.
+        if any(x["who"] == "user" and x["t"] > asked for x in transcript):
+            log.info("call=%s end_call skipped: the person spoke after the goodbye", call_id)
+            return
         await task.queue_frame(EndFrame())
 
     service_tool = FunctionSchema(
@@ -231,6 +236,7 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
                         idle_timeout_secs=120)
 
     async def said(who, text):
+        text = re.sub(r"<no speech>|\{pause\}", "", text or "").strip()  # Gemini Live's markers, not speech
         if not text:
             return
         transcript.append({"who": who, "text": text, "t": round(time.time(), 1)})
