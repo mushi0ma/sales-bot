@@ -10,7 +10,8 @@ Steps (idempotent where possible; secrets go to ~/secrets/*.env with mode 600 an
   stt        local speech-to-text (whisper in the VM) for voice notes: vault entry + agent stt settings
   operator   Chatwoot: macro «🤖 Вернуть боту» + contact attribute «Тестировщик бота»
   testers    testers <contact_id>...: tick «Тестировщик бота» (the bot answers only them)
-  telegram   Telegram inbox from TELEGRAM_BOT_TOKEN + bind to the agent; Chatwoot sets the public HTTPS webhook
+  telegram   NOT USED (the mentor chose the userbot for Telegram). Telegram Bot API inbox from TELEGRAM_BOT_TOKEN
+             + bind to the agent; Chatwoot sets the public HTTPS webhook
              (with secret_token = TELEGRAM_WEBHOOK_SECRET, checked by Caddy)
   tg-userbot API inbox «Telegram (userbot)» for the tg-userbot service (a real account, plan v2 spike S2):
              writes CW_TGU_* (inbox identifier, webhook secret, account id, operator token) to stack/.env,

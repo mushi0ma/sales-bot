@@ -239,9 +239,9 @@ group-watcher.
 
 ## Telegram
 
-- **Бот** (`bootstrap.py telegram`): Chatwoot ставит вебхук на `https://<PUBLIC_DOMAIN>/webhooks/telegram/<token>` с
-  `secret_token`; Caddy пропускает только вызовы с этим заголовком. Патчи Chatwoot маскируют токен в логах.
-  Публичный HTTPS обязателен: Telegram не примет вебхук без него. Бот: @oknewsales_bot (входящие 3).
+- **Канал Telegram: userbot** (решение ментора): бот читает группы и пишет в личку от обычного аккаунта, как в
+  WhatsApp. Bot API (`bootstrap.py telegram`) не используется: шаг остался в коде, но не запускать. 26.11 бот
+  @oknewsales_bot подключили по ошибке и в тот же день отключили (вебхук снят, входящие удалены).
 - **Userbot** (`stack/tg-userbot/`, профиль compose `tg-userbot`): спайк S2 на Telethon, заморожен до 06.12.
   Telethon архивирован, замена на Kurigram в бэклоге.
 
@@ -334,7 +334,7 @@ group-watcher уже умеет оба пути, нужен только inbox.
 
 ## Открытые задачи
 
-- [x] A-запись `sales-bot.eknot.kz` (зона eknot.kz у ps.kz) → сертификат, Telegram-бот, публичная ссылка.
+- [x] A-запись `sales-bot.eknot.kz` (зона eknot.kz у ps.kz) → сертификат, публичная ссылка.
 - [ ] Путь B (WhatsApp Cloud API): приложение Meta, тестовый номер, шаблоны ru/kk, inbox `whatsapp_cloud`.
 - [ ] Голос: заявки из `voice.db` в Chatwoot (диалог контакта, метка `lead`); исходящий звонок после «я председатель».
 - [ ] Проверить восстановление из бэкапа на пустой копии.
