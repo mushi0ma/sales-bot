@@ -60,7 +60,7 @@ index 76346ff..dd7bca9 100644
      )
    rescue Whatsapp::Session::Errors::Error
 diff --git a/app/services/whatsapp/session/inbound/handlers/call_offer.rb b/app/services/whatsapp/session/inbound/handlers/call_offer.rb
-index 96443e0..eaadfc2 100644
+index 96443e0..f3925aa 100644
 --- a/app/services/whatsapp/session/inbound/handlers/call_offer.rb
 +++ b/app/services/whatsapp/session/inbound/handlers/call_offer.rb
 @@ -11,11 +11,26 @@ class Whatsapp::Session::Inbound::Handlers::CallOffer < Whatsapp::Session::Inbou
@@ -80,7 +80,7 @@ index 96443e0..eaadfc2 100644
 +  # ringing, which is what happens without an agent.
 +  def hand_to_voice_agent
 +    url = ENV.fetch('WHATSAPP_VOICE_AGENT_URL', '')
-+    return if url.blank? || payload.video || payload.call_id.blank? || payload.from.group?
++    return if url.blank? || payload.video || payload.call_id.blank?
 +
 +    channel.provider_service.accept_call_with_stream(payload.call_id, url)
 +    Rails.logger.info("[whatsapp] call #{payload.call_id} handed to the voice agent")

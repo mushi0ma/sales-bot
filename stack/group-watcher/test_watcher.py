@@ -141,23 +141,30 @@ class Intake(unittest.TestCase):
 
 class GroupAnswers(unittest.TestCase):
     def setUp(self):
-        w.x("DELETE FROM faq"); w.x("DELETE FROM group_answers")
+        w.x("DELETE FROM faq"); w.x("DELETE FROM group_answers"); w.x("DELETE FROM messages")
         self.calls, self.posts = [], []
         vecs = {"Сколько стоит онлайн-голосование?": [1, 0, 0], "А голосование онлайн почём?": [0.95, 0.3, 0],
-                "Сколько стоит голосование в e-KNOT?": [0.97, 0.2, 0], "Где взять приложение e-KNOT?": [0, 1, 0]}
+                "Сколько стоит голосование в e-KNOT?": [0.97, 0.2, 0], "Где взять приложение e-KNOT?": [0, 1, 0],
+                "На какой счёт скидываться на домофон?": [0, 0, 1], "Куда переводить деньги за домофон?": [0, 0.3, 0.95],
+                "Кто знает, во сколько собрание?": [0.6, 0, 0.8]}
 
         def llm(path, body):
             self.calls.append(path)
             if path == "/embeddings":
-                return 200, {"data": [{"embedding": vecs[body["input"][0]]}]}
+                return 200, {"data": [{"embedding": vecs.get(body["input"][0], [0.3, 0.3, 0.3])}]}
             return 200, {"choices": [{"message": {"content": json.dumps(
                 {"answerable": True, "stable": True, "lang": "ru", "answer": "Lite 12 000 тенге."})}}]}
 
         self.f = w.faqmod.Faq(q=w.q, x=w.x, llm=llm, cw=lambda m, p, b=None: (self.posts.append(b), (200, {}))[1],
                               catalog_path=w.CATALOG_PATH, catalog_roots=["голосов"], log=w.log)
 
-    def row(self, i, text, conv=50):
-        return {"id": i, "conv_id": conv, "text": text, "created_at": time.time()}
+    def row(self, i, text, conv=50, contact=None, author=None, store=False, ago=0):
+        r = {"id": i, "conv_id": conv, "contact_id": contact or 100 + i, "author": author, "text": text,
+             "created_at": time.time() - ago}
+        if store:
+            w.x("INSERT INTO messages (id, conv_id, inbox_id, contact_id, author, text, created_at) VALUES (?,?,?,?,?,?,?)",
+                (r["id"], conv, 1, r["contact_id"], author, text, r["created_at"]))
+        return r
 
     def test_candidates(self):
         c = lambda t: w.faqmod.is_candidate(t, ["голосов"])  # noqa: E731
@@ -175,10 +182,52 @@ class GroupAnswers(unittest.TestCase):
         self.assertEqual(self.posts[-1]["content_attributes"], {"in_reply_to": 2})
         self.assertEqual(w.q("SELECT hits FROM faq")[0]["hits"], 1)
 
-    def test_no_repeat_in_same_chat(self):
+    def test_every_asker_answered(self):
         self.assertTrue(self.f.handle(self.row(1, "Сколько стоит онлайн-голосование?")))
-        self.assertFalse(self.f.handle(self.row(2, "Сколько стоит голосование в e-KNOT?")))
-        self.assertEqual(w.q("SELECT source FROM group_answers WHERE message_id=2")[0]["source"], "none:repeat")
+        self.assertTrue(self.f.handle(self.row(2, "Сколько стоит голосование в e-KNOT?")),
+                        "another person asking the same in a busy chat gets the answer too")
+        self.assertEqual(self.posts[-1]["content_attributes"], {"in_reply_to": 2})
+        self.assertFalse(self.f.handle(self.row(3, "А голосование онлайн почём?", contact=101)))
+        self.assertEqual(w.q("SELECT source FROM group_answers WHERE message_id=3")[0]["source"],
+                         "none:repeat_same_person")
+
+    def test_learns_chat_answer(self):
+        q1 = self.row(1, "На какой счёт скидываться на домофон?", store=True)
+        self.assertFalse(self.f.handle(q1), "not about e-KNOT and nothing learned yet")
+        ans = self.row(2, "Kaspi Gold 4400 4301 2222 1111, Айгуль Т.", author="Айгуль Т.", store=True)
+        self.assertTrue(self.f.learn(ans, q1))
+        self.posts.clear()
+        self.assertTrue(self.f.handle(self.row(3, "Куда переводить деньги за домофон?", contact=300)))
+        self.assertIn("Здесь уже отвечали (Айгуль)", self.posts[-1]["content"])
+        self.assertIn("Kaspi Gold", self.posts[-1]["content"])
+        self.assertFalse(self.f.handle(self.row(4, "Куда переводить деньги за домофон?", conv=51)),
+                         "learned answers stay in their own group")
+
+    def test_backfill_earlier_askers(self):
+        q1 = self.row(1, "На какой счёт скидываться на домофон?", store=True, ago=600)
+        self.f.handle(self.row(2, "Куда переводить деньги за домофон?", store=True, ago=300))
+        self.f.handle(self.row(3, "Кто знает, во сколько собрание?", store=True, ago=200))
+        self.posts.clear()
+        self.f.learn(self.row(4, "Kaspi Gold 4400 4301 2222 1111", author="Айгуль", store=True), q1)
+        self.assertEqual([p["content_attributes"]["in_reply_to"] for p in self.posts], [2],
+                         "the other asker of the same question gets the answer; the different question does not")
+
+    def test_not_learned(self):
+        q1 = self.row(1, "На какой счёт скидываться на домофон?", store=True)
+        self.assertFalse(self.f.learn(self.row(2, "+1", store=True), q1))
+        self.assertFalse(self.f.learn(self.row(3, "Тоже", store=True), q1))
+        self.assertFalse(self.f.learn(self.row(4, "не знаю", store=True), q1))
+        self.assertFalse(self.f.learn(self.row(5, "Kaspi 4400", contact=101, store=True), q1), "the asker themself")
+        self.assertFalse(self.f.learn(self.row(6, "А вы у кого спрашивали?", store=True), q1), "a question back")
+        self.f.learn(self.row(7, "Kaspi 4400", author="Айгуль", store=True), q1)
+        w.x("UPDATE faq SET author_contact_id=777 WHERE conv_id=50")
+        self.f.forget_contact(777)
+        self.assertEqual(w.q("SELECT COUNT(*) AS n FROM faq WHERE conv_id=50")[0]["n"], 0, "opt-out forgets it")
+
+    def test_quoted_id(self):
+        self.assertEqual(w.quoted_id({"content_attributes": {"in_reply_to": 42}}), 42)
+        self.assertEqual(w.quoted_id({"content_attributes": json.dumps({"in_reply_to": "43"})}), 43)
+        self.assertIsNone(w.quoted_id({"content_attributes": {}}))
 
     def test_stale_material_misses(self):
         self.f.handle(self.row(1, "Сколько стоит онлайн-голосование?"))

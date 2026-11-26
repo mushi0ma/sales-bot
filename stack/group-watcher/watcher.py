@@ -13,7 +13,9 @@ Chatwoot account webhook (message_created, HMAC-signed) -> this service:
      answers the reply.
   A question to the chat about e-KNOT (price, tariff, how a service works, Аудитор ЖКХ) is answered in the group
   itself, under the question, at once (faq.py: cached answers by meaning, else the knowledge material); no private
-  offer is sent for a message answered there.
+  offer is sent for a message answered there. What the group answers itself (a member's WhatsApp reply to a
+  question) is remembered for that group: everyone who asks the same later, and those who asked it in the last
+  hours, get that answer quoted with its author. Every asker gets a reply, not only the first.
   «стоп» / «тоқта» from a member, in the group or in private, opts them out and deletes their stored messages.
   SEND_MODE: auto (send), approve (the card asks for a private note `/offer N` or `/skip N`), dry (cards only).
 
@@ -130,6 +132,7 @@ def db():
         _db = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
         _db.row_factory = sqlite3.Row
         _db.executescript(SCHEMA + faqmod.SCHEMA)
+        faqmod.Faq.migrate(_db)
     return _db
 
 
@@ -445,6 +448,7 @@ def handle_need(need, mode=None):
 def opt_out(contact_id, conv_id=None, individual=False):
     x("INSERT OR IGNORE INTO optout (contact_id, at) VALUES (?,?)", (contact_id, time.time()))
     x("DELETE FROM messages WHERE contact_id=?", (contact_id,))
+    FAQ.forget_contact(contact_id)
     x("UPDATE needs SET status='skipped:optout', quote=NULL WHERE contact_id=? AND status IN ('awaiting','held')",
       (contact_id,))
     cw("PATCH", f"/contacts/{contact_id}", {"custom_attributes": {OPTOUT_ATTR: True}})
@@ -516,6 +520,26 @@ def answer_in_group(row):
         _faq_busy.discard(row["id"])
 
 
+def learn_from_reply(row, quoted_id):
+    question = q("SELECT * FROM messages WHERE id=? AND conv_id=?", (quoted_id, row["conv_id"]))
+    try:
+        FAQ.learn(row, dict(question[0]) if question else None)
+    except Exception as e:
+        log.warning("faq learn message=%s: %s", row["id"], str(e)[:200])
+
+
+def quoted_id(p):
+    """The Chatwoot id of the message this one replies to (WhatsApp "reply"), if any."""
+    attrs = p.get("content_attributes") or {}
+    if isinstance(attrs, str):
+        try:
+            attrs = json.loads(attrs)
+        except ValueError:
+            return None
+    v = attrs.get("in_reply_to") if isinstance(attrs, dict) else None
+    return int(v) if str(v or "").isdigit() else None
+
+
 def answered_in_group(message_id):
     return message_id in _faq_busy or bool(q(
         "SELECT 1 FROM group_answers WHERE message_id=? AND source IN ('cache','model')", (message_id,)))
@@ -559,9 +583,13 @@ def intake(p):
     x("INSERT OR IGNORE INTO messages (id, conv_id, inbox_id, group_name, contact_id, author, text, created_at) "
       "VALUES (?,?,?,?,?,?,?,?)", (p["id"], conv["id"], conv.get("inbox_id") or (p.get("inbox") or {}).get("id"),
                                    group_name, sender["id"], sender.get("name"), text[:2000], _ts(p.get("created_at"))))
-    if faqmod.FAQ_MODE == "auto" and faqmod.is_candidate(text, FAQ.roots):
-        _spawn(answer_in_group, {"id": p["id"], "conv_id": conv["id"], "text": text[:2000],
-                                 "created_at": _ts(p.get("created_at"))})
+    row = {"id": p["id"], "conv_id": conv["id"], "contact_id": sender["id"], "author": sender.get("name"),
+           "text": text[:2000], "created_at": _ts(p.get("created_at"))}
+    reply_to = quoted_id(p)
+    if faqmod.FAQ_MODE == "auto" and reply_to:
+        _spawn(learn_from_reply, row, reply_to)
+    if FAQ.wants(row):
+        _spawn(answer_in_group, row)
     if (AUTO_TESTERS and sender["id"] not in _marked
             and not (sender.get("custom_attributes") or {}).get(TESTER_ATTR)):
         _marked.add(sender["id"])
@@ -770,6 +798,7 @@ def forget(contact_id):
     x("DELETE FROM optout WHERE contact_id=?", (contact_id,))
     x("DELETE FROM needs WHERE contact_id=?", (contact_id,))
     x("DELETE FROM messages WHERE contact_id=?", (contact_id,))
+    FAQ.forget_contact(contact_id)
     st, _ = cw("PATCH", f"/contacts/{contact_id}", {"custom_attributes": {OPTOUT_ATTR: False}})
     print(f"contact {contact_id}: opt-out, offers and cooldown cleared; Chatwoot attribute HTTP {st}")
 
@@ -786,9 +815,10 @@ def main():
     elif cmd == "forget" and len(sys.argv) == 3 and sys.argv[2].isdigit():
         forget(int(sys.argv[2]))
     elif cmd == "faq":
-        for r in q("SELECT id, hits, kb_version, disabled, datetime(created_at,'unixepoch') AS at, question, answer "
-                   "FROM faq ORDER BY hits DESC, id DESC"):
-            print(f"#{r['id']} hits={r['hits']} kb={r['kb_version']}{' OFF' if r['disabled'] else ''} {r['at']}\n"
+        for r in q("SELECT id, hits, kb_version, disabled, datetime(created_at,'unixepoch') AS at, question, answer, "
+                   "conv_id, author FROM faq ORDER BY hits DESC, id DESC"):
+            where = f"chat group={r['conv_id']} by {r['author']}" if r["conv_id"] else f"kb={r['kb_version']}"
+            print(f"#{r['id']} hits={r['hits']} {where}{' OFF' if r['disabled'] else ''} {r['at']}\n"
                   f"  ? {r['question'][:150]}\n  > {r['answer'][:300]}")
     elif cmd == "faq-ask" and len(sys.argv) == 3:
         t = time.time()
