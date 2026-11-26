@@ -200,6 +200,8 @@ services:
       - ./group-watcher/watcher.py:/app/watcher.py:ro
       - ./group-watcher/services.json:/app/services.json:ro
       - ./group-watcher/samples.json:/app/samples.json:ro
+      - ./group-watcher/faq.py:/app/faq.py:ro
+      - ./kb/pages:/app/kb:ro
       - gw_data:/data
     read_only: true
     cap_drop: [ALL]

@@ -139,5 +139,54 @@ class Intake(unittest.TestCase):
         self.assertEqual(calls, [("PATCH", "/contacts/8", {"custom_attributes": {w.TESTER_ATTR: True}})])
 
 
+class GroupAnswers(unittest.TestCase):
+    def setUp(self):
+        w.x("DELETE FROM faq"); w.x("DELETE FROM group_answers")
+        self.calls, self.posts = [], []
+        vecs = {"Сколько стоит онлайн-голосование?": [1, 0, 0], "А голосование онлайн почём?": [0.95, 0.3, 0],
+                "Сколько стоит голосование в e-KNOT?": [0.97, 0.2, 0], "Где взять приложение e-KNOT?": [0, 1, 0]}
+
+        def llm(path, body):
+            self.calls.append(path)
+            if path == "/embeddings":
+                return 200, {"data": [{"embedding": vecs[body["input"][0]]}]}
+            return 200, {"choices": [{"message": {"content": json.dumps(
+                {"answerable": True, "stable": True, "lang": "ru", "answer": "Lite 12 000 тенге."})}}]}
+
+        self.f = w.faqmod.Faq(q=w.q, x=w.x, llm=llm, cw=lambda m, p, b=None: (self.posts.append(b), (200, {}))[1],
+                              catalog_path=w.CATALOG_PATH, catalog_roots=["голосов"], log=w.log)
+
+    def row(self, i, text, conv=50):
+        return {"id": i, "conv_id": conv, "text": text, "created_at": time.time()}
+
+    def test_candidates(self):
+        c = lambda t: w.faqmod.is_candidate(t, ["голосов"])  # noqa: E731
+        self.assertTrue(c("Сколько стоит онлайн-голосование?"))
+        self.assertTrue(c("e-KNOT қосымшасы тегін бе"))
+        self.assertFalse(c("Кто оставил машину у подъезда?"), "a question, not about e-KNOT")
+        self.assertFalse(c("Голосование в субботу"), "about the topic, not a question")
+
+    def test_cache_by_meaning(self):
+        self.assertTrue(self.f.handle(self.row(1, "Сколько стоит онлайн-голосование?")))
+        self.assertIn("/chat/completions", self.calls)
+        self.calls.clear()
+        self.assertTrue(self.f.handle(self.row(2, "А голосование онлайн почём?", conv=51)))
+        self.assertEqual(self.calls, ["/embeddings"], "same meaning: from the cache, no model call")
+        self.assertEqual(self.posts[-1]["content_attributes"], {"in_reply_to": 2})
+        self.assertEqual(w.q("SELECT hits FROM faq")[0]["hits"], 1)
+
+    def test_no_repeat_in_same_chat(self):
+        self.assertTrue(self.f.handle(self.row(1, "Сколько стоит онлайн-голосование?")))
+        self.assertFalse(self.f.handle(self.row(2, "Сколько стоит голосование в e-KNOT?")))
+        self.assertEqual(w.q("SELECT source FROM group_answers WHERE message_id=2")[0]["source"], "none:repeat")
+
+    def test_stale_material_misses(self):
+        self.f.handle(self.row(1, "Сколько стоит онлайн-голосование?"))
+        w.x("UPDATE faq SET kb_version='old'")
+        self.calls.clear()
+        self.f.handle(self.row(2, "А голосование онлайн почём?", conv=51))
+        self.assertIn("/chat/completions", self.calls, "a changed site retires the cached answer")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

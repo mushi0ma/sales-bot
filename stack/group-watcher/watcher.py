@@ -11,6 +11,9 @@ Chatwoot account webhook (message_created, HMAC-signed) -> this service:
      offer per contact per OFFER_COOLDOWN_DAYS, quiet hours, daily cap, SEND_MODE) and path A: a private WhatsApp
      message to the author through Chatwoot, handed back to the agent with the «Вернуть боту» macro so the agent
      answers the reply.
+  A question to the chat about e-KNOT (price, tariff, how a service works, Аудитор ЖКХ) is answered in the group
+  itself, under the question, at once (faq.py: cached answers by meaning, else the knowledge material); no private
+  offer is sent for a message answered there.
   «стоп» / «тоқта» from a member, in the group or in private, opts them out and deletes their stored messages.
   SEND_MODE: auto (send), approve (the card asks for a private note `/offer N` or `/skip N`), dry (cards only).
 
@@ -19,6 +22,8 @@ CLI: watcher.py serve | stats | eval SAMPLES.json (classifier precision/recall o
      | forget CONTACT_ID (tests: drop the contact's opt-out, offers and cooldown, untick the Chatwoot attribute)
      | report [DAYS] (metrics for the daily report over the last DAYS days, default 1: funnel from group message to
        lead, delivery and read status, replies within 24 h, opt-outs; reads offer conversations from Chatwoot)
+     | faq (cached group answers) | faq-ask "QUESTION" (what the group would get; caches, posts nothing)
+     | faq-off ID (retire a cached answer)
 """
 import hashlib, hmac, json, logging, os, re, sqlite3, statistics, sys, threading, time, urllib.error, urllib.request
 from datetime import datetime, timedelta, timezone
@@ -36,7 +41,7 @@ DB_PATH = E("DB_PATH", "/data/watcher.db")
 CATALOG_PATH = E("CATALOG_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "services.json"))
 WATCH_LABEL = E("WATCH_LABEL", "salesbot-watch")
 SEND_MODE = E("SEND_MODE", "approve")
-BATCH_SECONDS = int(E("BATCH_SECONDS", "60"))
+BATCH_SECONDS = int(E("BATCH_SECONDS", "20"))
 BATCH_MAX = int(E("BATCH_MAX", "20"))
 CONTEXT_MESSAGES = int(E("CONTEXT_MESSAGES", "6"))
 MIN_CONFIDENCE = float(E("MIN_CONFIDENCE", "0.7"))
@@ -47,6 +52,10 @@ UTC_OFFSET = int(E("UTC_OFFSET", "5"))  # Kazakhstan
 HOLD_MAX_HOURS = int(E("HOLD_MAX_HOURS", "14"))  # a need held for quiet hours expires after this
 HANDBACK_MACRO = E("HANDBACK_MACRO", "🤖 Вернуть боту")
 OPTOUT_ATTR = "salesbot_optout"
+# The agents service does not take our offer into the seller's memory (it was posted before the bot owned the
+# conversation), and its memory is per contact, so an older chat can leak in. The offer travels as a conversation
+# attribute the seller's prompt shows (bootstrap.py: attributeContext), which pins the topic of this conversation.
+OFFER_ATTR = "salesbot_offer"
 # Path A: WhatsApp Web session of the group's number (whatsmeow inbox). Path B: official WhatsApp Cloud API inbox,
 # first message as an approved Meta template. SPLIT sends B to odd contact ids and A to even ones (stable per
 # person) for the A/B comparison the mentor asked for. Without CLOUD_INBOX_ID everything goes by A.
@@ -80,6 +89,8 @@ def load_catalog(path=CATALOG_PATH):
 
 
 CATALOG = load_catalog()
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # -I leaves the script's folder off sys.path
+import faq as faqmod  # noqa: E402
 
 
 # ---------------------------------------------------------------- storage
@@ -118,7 +129,7 @@ def db():
     if _db is None:
         _db = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
         _db.row_factory = sqlite3.Row
-        _db.executescript(SCHEMA)
+        _db.executescript(SCHEMA + faqmod.SCHEMA)
     return _db
 
 
@@ -207,6 +218,13 @@ def build_prompt(context_rows, new_rows, catalog=CATALOG):
         "чужую жалобу — это потребность автора ответа).\n"
         "- Не отмечай: шутки, приветствия, благодарности, вопросы не по теме, случаи, когда услугой уже пользуются, "
         "советы другим без своей проблемы.\n"
+        "- Не отмечай аварии, где сейчас опасность для людей (газ, пожар, человек застрял, искрит проводка): там "
+        "нужна экстренная служба, а не предложение услуги. Обычная поломка или протечка без угрозы — отмечай.\n"
+        "- Вывоз мусора и уборка двора — работа акимата и подрядчика, а не услуг e-KNOT: не отмечай.\n"
+        "- Потребность бывает и в рабочем вопросе совета или председателя: лист присутствия и запись собрания — "
+        "online_meetings, квитанция после оплаты и оплата картой — payments, ручное разнесение платежей в 1С или "
+        "бухгалтерии — accounting, статус поданной заявки — dispatcher, жиналысты өзіміз бастау (созвать самим) — "
+        "convening_assembly.\n"
         "- Одно сообщение — не больше одной услуги, самой подходящей.\n"
         "- confidence от 0 до 1: 0.9+ — явная проблема из признаков, 0.7 — вероятная, ниже 0.5 — не выдавай вовсе.\n"
         "- quote — дословный отрывок сообщения до 120 символов.\n"
@@ -359,6 +377,12 @@ def handback(conv_id):
     log.info("handback conversation=%s macro HTTP %s", conv_id, st)
 
 
+def offer_context(need, catalog=CATALOG):
+    s = catalog[need["service"]]
+    return (f"Первое сообщение этого диалога написали мы: предложение услуги «{s['name']}» ({s['url']}). "
+            f"Повод: человек написал в группе дома «{(need.get('quote') or '')[:160]}».")[:400]
+
+
 def send_offer(need_id):
     n = q("SELECT * FROM needs WHERE id=?", (need_id,))[0]
     path = choose_path(n["contact_id"])
@@ -383,6 +407,10 @@ def send_offer(need_id):
     x("UPDATE needs SET status='sent', path=?, offer_conv_id=?, sent_at=? WHERE id=?",
       (path, c["id"], time.time(), need_id))
     log.info("need=%s sent: conversation=%s service=%s path=%s", need_id, c["id"], n["service"], path)
+    st, _ = cw("POST", f"/conversations/{c['id']}/custom_attributes",
+               {"custom_attributes": {OFFER_ATTR: offer_context(dict(n))}})
+    if st >= 300:
+        log.warning("need=%s: offer attribute HTTP %s", need_id, st)
     threading.Thread(target=handback, args=(c["id"],), daemon=True).start()
     return True
 
@@ -469,6 +497,30 @@ def _spawn(fn, *args):
     threading.Thread(target=fn, args=args, daemon=True).start()
 
 
+def llm(path, body):
+    return _http("POST", f"{LLM_URL}{path}", body, {"Authorization": f"Bearer {LLM_KEY}"}, timeout=60)
+
+
+FAQ = faqmod.Faq(q=lambda *a: q(*a), x=lambda *a: x(*a), llm=lambda *a: llm(*a), cw=lambda *a: cw(*a),
+                 catalog_path=CATALOG_PATH, catalog_roots=[r for s in CATALOG.values() for r in s["roots"]], log=log)
+_faq_busy = set()
+
+
+def answer_in_group(row):
+    _faq_busy.add(row["id"])
+    try:
+        FAQ.handle(row)
+    except Exception as e:  # an unanswered question is fine; the need path still sees the message
+        log.warning("faq message=%s: %s", row["id"], str(e)[:200])
+    finally:
+        _faq_busy.discard(row["id"])
+
+
+def answered_in_group(message_id):
+    return message_id in _faq_busy or bool(q(
+        "SELECT 1 FROM group_answers WHERE message_id=? AND source IN ('cache','model')", (message_id,)))
+
+
 def mark_tester(contact_id):
     st, _ = cw("PATCH", f"/contacts/{contact_id}", {"custom_attributes": {TESTER_ATTR: True}})
     if st >= 300:
@@ -507,6 +559,9 @@ def intake(p):
     x("INSERT OR IGNORE INTO messages (id, conv_id, inbox_id, group_name, contact_id, author, text, created_at) "
       "VALUES (?,?,?,?,?,?,?,?)", (p["id"], conv["id"], conv.get("inbox_id") or (p.get("inbox") or {}).get("id"),
                                    group_name, sender["id"], sender.get("name"), text[:2000], _ts(p.get("created_at"))))
+    if faqmod.FAQ_MODE == "auto" and faqmod.is_candidate(text, FAQ.roots):
+        _spawn(answer_in_group, {"id": p["id"], "conv_id": conv["id"], "text": text[:2000],
+                                 "created_at": _ts(p.get("created_at"))})
     if (AUTO_TESTERS and sender["id"] not in _marked
             and not (sender.get("custom_attributes") or {}).get(TESTER_ATTR)):
         _marked.add(sender["id"])
@@ -567,6 +622,9 @@ def process_group(conv_id):
     by_id = {r["id"]: r for r in new}
     for n in needs:
         r = by_id[n["message_id"]]
+        if answered_in_group(r["id"]):  # the group already has the answer; a private offer on top is pushy
+            log.info("need on message=%s skipped: answered in the group", r["id"])
+            continue
         handle_need({**n, "conv_id": conv_id, "inbox_id": r["inbox_id"], "contact_id": r["contact_id"],
                      "author": r["author"], "group_name": r["group_name"], "message_at": r["created_at"]})
     with _db_lock:
@@ -686,6 +744,14 @@ def report(days=1.0):
         f"Ответили за 24 ч: {pct(count('replied'))}. Отказ «стоп»: {pct(count('optout'))}. "
         f"Лид (метка lead): {pct(count('lead'))}. Передано менеджеру: {pct(count('handoff'))}.",
     ]
+    ga = q("SELECT source, latency FROM group_answers WHERE at >= ?", (since,))
+    posted = [r for r in ga if r["source"] in ("cache", "model")]
+    if ga:
+        gl = sorted(r["latency"] for r in posted if r["latency"] is not None)
+        lines.append(f"Вопросы в группе: {len(ga)}, ответили в группе {len(posted)} "
+                     f"(из кеша {sum(r['source'] == 'cache' for r in posted)}), "
+                     f"медиана до ответа {round(statistics.median(gl))} с." if gl else
+                     f"Вопросы в группе: {len(ga)}, ответов в группе нет.")
     paths = sorted({n["path"] or "A" for n in sent})
     if len(paths) > 1:  # A/B comparison: same funnel per send path
         for path in paths:
@@ -719,6 +785,19 @@ def main():
         report(float(sys.argv[2]) if len(sys.argv) == 3 else 1.0)
     elif cmd == "forget" and len(sys.argv) == 3 and sys.argv[2].isdigit():
         forget(int(sys.argv[2]))
+    elif cmd == "faq":
+        for r in q("SELECT id, hits, kb_version, disabled, datetime(created_at,'unixepoch') AS at, question, answer "
+                   "FROM faq ORDER BY hits DESC, id DESC"):
+            print(f"#{r['id']} hits={r['hits']} kb={r['kb_version']}{' OFF' if r['disabled'] else ''} {r['at']}\n"
+                  f"  ? {r['question'][:150]}\n  > {r['answer'][:300]}")
+    elif cmd == "faq-ask" and len(sys.argv) == 3:
+        t = time.time()
+        answer, faq_id, source = FAQ.lookup_or_generate(sys.argv[2])
+        print(f"{source} faq={faq_id} {time.time() - t:.1f}s candidate={faqmod.is_candidate(sys.argv[2], FAQ.roots)}"
+              f"\n{answer}")
+    elif cmd == "faq-off" and len(sys.argv) == 3 and sys.argv[2].isdigit():
+        x("UPDATE faq SET disabled=1 WHERE id=?", (int(sys.argv[2]),))
+        print("disabled", sys.argv[2])
     elif cmd == "serve":
         if not (CW_TOKEN and WEBHOOK_SECRET and LLM_KEY):
             log.warning("CW_API_TOKEN / WEBHOOK_SECRET / LLM_KEY missing: run bootstrap.py group-watcher; "

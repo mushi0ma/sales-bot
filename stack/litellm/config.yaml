@@ -9,7 +9,8 @@ x-vertex: &vertex
 
 model_list:
   - model_name: gemini-3.8-flash          # replies of the agents, vision
-    litellm_params: { <<: *vertex, model: vertex_ai/gemini-3.8-flash, rpm: 40, rpd: 1000 }
+    # reasoning_effort low: default thinking spent ~850 tokens and 5-7 s per call (3 calls per reply); low is 2.5-3 s
+    litellm_params: { <<: *vertex, model: vertex_ai/gemini-3.8-flash, reasoning_effort: low, rpm: 40, rpd: 1000 }
   - model_name: gemini-3.5-flash-lite     # need detection, fact checking, bulk scenario runs
     litellm_params: { <<: *vertex, model: vertex_ai/gemini-3.5-flash-lite, rpm: 50, rpd: 3000 }
   - model_name: gemini-4-argon            # Pro class, expensive: offline only (dataset gold labels, calibrating the Flash judge, failure analysis); never in a live reply
