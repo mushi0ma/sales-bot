@@ -274,6 +274,14 @@ ru-RU). Тот же промпт по смыслу, что у продавца, 
   `stack/patches/chatwoot-whatsapp-voice-agent.patch` при заданном `WHATSAPP_VOICE_AGENT_URL` подключает сессию с
   `calls.answer` и отдаёт каждый звонок агенту. Голос к серверам WhatsApp идёт по UDP 40000 (исходящий). A-запись
   для этого не нужна. Выключить: `VOICE_AGENT_URL=` в `stack/.env`, пересоздать `cw-sidekiq`.
+- **Исходящий звонок от имени председателя ОСИ** (обзвон: сбор голосов, напоминание о взносах). Коннектор звонит
+  с тестового номера и отдаёт голос агенту, как при входящем. В коннекторе v0.9.0 исходящий звонок умел только
+  браузерный WebRTC: патч `stack/patches/whatsapp-connector-outbound-stream.patch` добавляет `call.start` со
+  `stream` (тесты в патче), образ коннектора собирается у нас (`docker compose --profile build build wa-connector`,
+  затем `build cw-rails`). Поводы и факты для разговора: `stack/voice/campaigns.json` (`votes`, `fees`, тестовые
+  данные), промпт `stack/voice/prompt-outbound.md`, итог (`voted`, `will_pay`, `callback`, `refused`…) в таблице
+  `outcomes`. Звонить только тем, кто согласился на тест; с 09:00 до 21:00 по Астане:
+  `deploy/ssh.sh 'cd /srv/salesbot/stack && voice/dial.sh +77011234567 votes Имя'`.
 - **Браузер** (отладка): на ноутбуке `deploy/ssh.sh -- -N -L 8090:127.0.0.1:8090`, затем http://localhost:8090.
   localhost считается защищённым адресом, поэтому микрофон работает без HTTPS. Нужны наушники.
 
@@ -336,7 +344,8 @@ group-watcher уже умеет оба пути, нужен только inbox.
 
 - [x] A-запись `sales-bot.eknot.kz` (зона eknot.kz у ps.kz) → сертификат, публичная ссылка.
 - [ ] Путь B (WhatsApp Cloud API): приложение Meta, тестовый номер, шаблоны ru/kk, inbox `whatsapp_cloud`.
-- [ ] Голос: заявки из `voice.db` в Chatwoot (диалог контакта, метка `lead`); исходящий звонок после «я председатель».
+- [ ] Голос: заявки и итоги обзвона из `voice.db` в Chatwoot (диалог контакта, метка); список обзвона из файла,
+  повторный звонок по `callback`; два звонка одновременно на одном аккаунте WhatsApp не проверены.
 - [ ] Проверить восстановление из бэкапа на пустой копии.
 - [ ] Окно приёма показаний 20–25 инструмент не проверяет.
 - [ ] Upstream: маска токена Telegram в логах (fazer-ai/chatwoot), `dimensions` эмбеддингов (fazer-ai/agents).

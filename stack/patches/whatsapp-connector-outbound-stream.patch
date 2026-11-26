@@ -1,0 +1,253 @@
+diff --git a/contract/PROTOCOL.md b/contract/PROTOCOL.md
+index 926e165..2fe6525 100644
+--- a/contract/PROTOCOL.md
++++ b/contract/PROTOCOL.md
+@@ -361,7 +361,7 @@ theirs, and the connector is always upgraded first.
+ - `session.connect` may carry `calls: {answer: true}`, which asks the connector to carry the voice of 1:1 calls between WhatsApp and the client's browser, the way a WhatsApp Cloud API provider does: the connector stands where Meta stands and the browser is a WebRTC peer. It is optional, and a connect without it changes nothing: `call.offer` keeps the shape it has always had and calls are left ringing or refused as before. Like `groups`, `history_sync` and `auto_reject`, each connect states it again. Every SDP travels as a `string`, the SDP text itself, and the connector does not rewrite what the browser sent. The flow, in both directions:
+   - **A call this account receives.** With `calls.answer` on, a `call.offer` for a 1:1 voice call carries `sdp`, the connector's WebRTC offer. A video call, a group call and a session without `calls.answer` get a `call.offer` without it. `calls.auto_reject` wins over `calls.answer`: with both on, the call is refused as it is today and the `call.offer` carries no `sdp`. The client answers with `call.accept {call_id, sdp}`, where `sdp` is the browser's WebRTC answer, and the connector answers on WhatsApp once it has applied it. `call.reject` refuses the call as before.
+   - **A call answered by a media server.** `call.accept {call_id, stream: {url}}` answers a received call with a media server in the browser's place, such as a voice agent, and carries no `sdp`. The connector dials the WebSocket at `url` and answers on WhatsApp only once it is open; a stream it cannot reach within 5 seconds fails the command with `invalid_payload` and leaves the call ringing, so it can still be accepted another way. A call offered without `sdp` can be accepted this way. Frames are JSON text, keyed by `event`, and a side ignores fields and events it does not know. The connector sends `start` once dialled, with `call_id`, `direction` (`inbound`), `peer` (the caller's number, or their LID when the number is not known) and `format` (`{encoding: "pcm_s16le", sample_rate: 16000, channels: 1}`); `answered` with `call_id` once the voice is wired, before which nothing the server sends is played; a `media` frame every 60 ms with `payload`, the caller's audio as base64 little-endian PCM in that format, silence included, so a server that hears the end of a turn in silence hears it; and `stop` when the call ends, after which it closes the socket. The server sends `media` frames of any length in the same format, queued to be played in order; `clear` to drop what it sent and was not played yet, when the caller talks over it; and `hangup`, with optional `by` and `reason`, to end the call. A `hangup`, or the socket closing or breaking without one, hangs the call up on WhatsApp, and the `call.terminate` event for it carries `reason` `stream_hangup` or `stream_lost`.
+-  - **A call the client places.** `call.start {to, sdp}` carries the browser's WebRTC offer and is an RPC whose result is `{call_id}`, the id `call.answered` and `call.terminate` are matched by. It rings somebody's phone, which is not a side effect that repeats harmlessly, so it **requires an `idempotency_key`**: a `call.start` redelivered with the same key answers the same `call_id` and does not ring again. When the callee answers, `call.answered {call_id, sdp}` brings the connector's WebRTC answer for the browser.
++  - **A call the client places.** `call.start {to, sdp}` carries the browser's WebRTC offer and is an RPC whose result is `{call_id}`, the id `call.answered` and `call.terminate` are matched by. It rings somebody's phone, which is not a side effect that repeats harmlessly, so it **requires an `idempotency_key`**: a `call.start` redelivered with the same key answers the same `call_id` and does not ring again. When the callee answers, `call.answered {call_id, sdp}` brings the connector's WebRTC answer for the browser. `call.start {to, stream: {url}}` places the call with a media server in the browser's place instead, as `call.accept` does for a received call: the connector dials the stream once the call has an id, its `start` frame says `direction` `outbound` and `peer` the number rung, `answered` follows when the callee picks up, and the `call.answered` event carries an empty `sdp`. A stream it cannot reach hangs the call up and fails the command.
+   - **The end of a call.** `call.terminate {call_id}` hangs up a call the client answered or placed. The `call.terminate` event, which already reported a call that ended before anybody answered it, also reports the end of a call that was answered or placed, whichever side ended it.
+   - **Repeats and late commands.** `call.accept` and `call.terminate` are idempotent by `call_id` and are fire and forget: accepting a call that was already accepted or has ended, or ending one that already ended, does nothing new, and a failure arrives as `command.failed`.
+   - **Where this connector stands.** The three commands are answered `unsupported` on a session without `calls.answer`, on one with `calls.auto_reject` (which wins over it), on a session connected with a `proxy`, and on every session of a deployment that did not open a port for call media: there `calls.answer` is accepted and has no effect, so no `call.offer` carries `sdp`. A proxied session is left out because a call's voice travels to WhatsApp over UDP, which the proxy does not carry, and it would leave from the connector's own address. The connector offers the browser G.722 and PCMU, in that order, and answers a browser's offer in whichever of the two it prefers. A call is carried by the instance that owns the session and cannot follow it: when the session moves to another instance or closes, the call is hung up, and the `call.terminate` that reports it may not reach the client. The browser's peer connection closing is then what says the call is over. `call.start` dials a `phone` address only, and is answered `recipient_not_on_whatsapp` for a number WhatsApp does not know. A `call.accept` whose `sdp` answers a call that was offered without one, or is not one the connector can use, fails with `invalid_payload` and the call goes on ringing.
+diff --git a/contract/schema/protocol.schema.json b/contract/schema/protocol.schema.json
+index 5d417de..4a14b25 100644
+--- a/contract/schema/protocol.schema.json
++++ b/contract/schema/protocol.schema.json
+@@ -735,7 +735,7 @@
+       "type": "object",
+       "properties": {
+         "call_id": { "type": "string" },
+-        "sdp": { "type": "string", "description": "The connector's WebRTC answer to the browser's call.start offer." }
++        "sdp": { "type": "string", "description": "The connector's WebRTC answer to the browser's call.start offer; empty for a call placed with a media stream." }
+       },
+       "required": ["call_id", "sdp"],
+       "additionalProperties": true
+@@ -1114,9 +1114,11 @@
+       "type": "object",
+       "properties": {
+         "to": { "$ref": "#/definitions/address" },
+-        "sdp": { "type": "string", "description": "The browser's WebRTC offer for the call." }
++        "sdp": { "type": "string", "description": "The browser's WebRTC offer for the call." },
++        "stream": { "$ref": "#/definitions/call_media_stream" }
+       },
+-      "required": ["to", "sdp"],
++      "required": ["to"],
++      "anyOf": [{ "required": ["sdp"] }, { "required": ["stream"] }],
+       "additionalProperties": true
+     },
+     "command_call_terminate": {
+diff --git a/internal/engine/whatsmeow/bridge.go b/internal/engine/whatsmeow/bridge.go
+index 0dbac3e..ea7a219 100644
+--- a/internal/engine/whatsmeow/bridge.go
++++ b/internal/engine/whatsmeow/bridge.go
+@@ -132,8 +132,9 @@ const (
+ )
+ 
+ type startRequest struct {
+-	To  *protocol.Address `json:"to"`
+-	SDP string            `json:"sdp"`
++	To     *protocol.Address   `json:"to"`
++	SDP    string              `json:"sdp"`
++	Stream *calls.StreamTarget `json:"stream"`
+ }
+ 
+ type terminateRequest struct {
+@@ -577,9 +578,10 @@ func (s *Session) startCall(ctx context.Context, command *protocol.Command) (jso
+ 		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "a call.start has to carry an idempotency_key")
+ 	}
+ 	var req startRequest
+-	if err := json.Unmarshal(command.Payload, &req); err != nil || req.To == nil || req.SDP == "" {
++	if err := json.Unmarshal(command.Payload, &req); err != nil || req.To == nil ||
++		(req.SDP == "") == (req.Stream == nil || req.Stream.URL == "") {
+ 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+-			"a call.start has to name who to call and carry the browser's offer")
++			"a call.start has to name who to call and carry either the browser's offer or a media stream")
+ 	}
+ 	if req.To.Kind != protocol.AddressPhone {
+ 		// meowcaller dials a number, and resolving the number from another namespace is
+@@ -608,19 +610,26 @@ func (s *Session) startCall(ctx context.Context, command *protocol.Command) (jso
+ 	}
+ 
+ 	log := s.log.With().Str("cmd_id", command.ID).Logger()
+-	leg, err := s.callMedia.Answer(req.SDP, log)
+-	if err != nil {
+-		if errors.Is(err, calls.ErrBadSDP) {
+-			return nil, protocol.NewError(protocol.ErrorInvalidPayload, "the browser's offer is not an SDP this connector can use")
++	// A call placed with a media stream has no browser leg: the stream, dialled once the
++	// call has an id, carries the voice from the callee's answer on.
++	var leg *calls.Leg
++	if req.Stream == nil {
++		leg, err = s.callMedia.Answer(req.SDP, log)
++		if err != nil {
++			if errors.Is(err, calls.ErrBadSDP) {
++				return nil, protocol.NewError(protocol.ErrorInvalidPayload, "the browser's offer is not an SDP this connector can use")
++			}
++			return nil, protocol.NewError(protocol.ErrorInternal, "the connector could not prepare the call")
+ 		}
+-		return nil, protocol.NewError(protocol.ErrorInternal, "the connector could not prepare the call")
+ 	}
+ 	// The client the call is placed on, taken before the dial: a rebuild during it retires
+ 	// that client, and the call is not registered on the one that replaced it.
+ 	retired := s.currentRetirement()
+ 	call, err := s.dialCall(ctx, target)
+ 	if err != nil {
+-		_ = leg.Close()
++		if leg != nil {
++			_ = leg.Close()
++		}
+ 		log.Warn().Err(err).Msg("meowcaller could not place the call")
+ 		failure := protocol.NewError(protocol.ErrorWaError, "WhatsApp did not take the call")
+ 		if ctx.Err() == nil && offerMayHaveRung(err) {
+@@ -640,15 +649,35 @@ func (s *Session) startCall(ctx context.Context, command *protocol.Command) (jso
+ 	}
+ 	id := call.ID()
+ 	live := &liveCall{call: call, leg: leg, outbound: true}
++	if req.Stream != nil {
++		// Dialled while the callee's phone rings: a media server that cannot be reached
++		// hangs the call up before anybody answers into silence.
++		stream, err := dialStream(ctx, *req.Stream, calls.StreamStart{CallID: id, Direction: "outbound", Peer: target},
++			func(end calls.StreamEnd) { s.streamEnded(id, end) }, log)
++		if err != nil {
++			log.Warn().Err(err).Str("call_id", id).Msg("could not reach the media stream of a placed call; hanging up")
++			go func() { _ = call.Hangup() }()
++			return nil, engine.MayHaveLanded(protocol.NewError(protocol.ErrorInvalidPayload,
++				"the connector could not reach that media stream"))
++		}
++		live.stream, live.peer = stream, target
++	}
+ 	if !s.register(id, live, retired) {
+ 		// The session closed, or stopped carrying calls, while the callee was being
+ 		// rung, after its calls were ended: this one is ended here, or it would ring
+ 		// with nobody behind it.
+-		_ = leg.Close()
++		if leg != nil {
++			_ = leg.Close()
++		}
++		if live.stream != nil {
++			_ = live.stream.Close()
++		}
+ 		go func() { _ = call.Hangup() }()
+ 		return nil, engine.MayHaveLanded(protocol.NewError(protocol.ErrorWaError, "the session closed as the call was placed"))
+ 	}
+-	leg.OnLost(func() { s.browserLost(id) })
++	if leg != nil {
++		leg.OnLost(func() { s.browserLost(id) })
++	}
+ 	call.OnEnd(func(reason string) { s.callFinished(id, reason) })
+ 	if call.State() == meowcaller.CallPhaseEnded {
+ 		// Refused or ended between the offer going out and OnEnd above, which meowcaller
+@@ -667,7 +696,11 @@ func (s *Session) startCall(ctx context.Context, command *protocol.Command) (jso
+ //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
+ func (s *Session) calleeAnswered(live *liveCall, log zerolog.Logger) {
+ 	id := live.call.ID()
+-	answer, err := live.leg.Answer(s.ctx)
++	var answer string
++	var err error
++	if live.stream == nil {
++		answer, err = live.leg.Answer(s.ctx)
++	}
+ 	if err != nil {
+ 		log.Warn().Err(err).Str("call_id", id).Msg("could not answer the browser once the callee picked up; hanging up")
+ 		// Off the dispatch, like every other write this handler causes: the hang-up writes a
+diff --git a/internal/engine/whatsmeow/outbound_stream_test.go b/internal/engine/whatsmeow/outbound_stream_test.go
+new file mode 100644
+index 0000000..208ebe0
+--- /dev/null
++++ b/internal/engine/whatsmeow/outbound_stream_test.go
+@@ -0,0 +1,94 @@
++package whatsmeow
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++
++	wm "go.mau.fi/whatsmeow"
++	waTypes "go.mau.fi/whatsmeow/types"
++
++	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
++)
++
++func onWhatsAppAsGiven(_ context.Context, _ *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
++	return []waTypes.IsOnWhatsAppResponse{{Query: phones[0], IsIn: true,
++		JID: waTypes.NewJID("77070000000", waTypes.DefaultUserServer)}}, nil
++}
++
++// A call placed with a media stream: the stream is dialled while the callee is rung and
++// told it is an outbound call to that number, hears `answered` only when the callee picks
++// up, and the voice is wired to it; call.answered carries no SDP, there being no browser.
++func TestACallPlacedWithAStreamIsCarriedByTheStream(t *testing.T) {
++	t.Parallel()
++	server := newMediaServer(t, nil)
++	session := newCallSession(t)
++	session.onWhatsApp = onWhatsAppAsGiven
++	call := &fakeCall{id: "CALLOUT1"}
++	session.dialCall = func(context.Context, string) (bridgedCall, error) { return call, nil }
++
++	result, err := session.Execute(t.Context(), &protocol.Command{
++		ID: "c1", Type: protocol.CommandCallStart, IdempotencyKey: "k1",
++		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"77070000000"},"stream":{"url":"` + server.url + `"}}`),
++	})
++	if err != nil {
++		t.Fatalf("call.start with a stream: %v", err)
++	}
++	if got := decode(t, result)["call_id"]; got != "CALLOUT1" {
++		t.Fatalf("call_id is %v", got)
++	}
++	start := server.next(t)
++	if start["event"] != "start" || start["direction"] != "outbound" || start["peer"] != "77070000000" ||
++		start["call_id"] != "CALLOUT1" {
++		t.Fatalf("the stream was told %v", start)
++	}
++	if _, _, _, wired := call.counts(); wired {
++		t.Fatal("the voice was wired while the callee was still being rung")
++	}
++
++	call.peerAccepts()
++	if frame := server.next(t); frame["event"] != "answered" {
++		t.Fatalf("after the callee picked up the stream heard %v, want answered", frame)
++	}
++	answered := published(t, session, protocol.EventCallAnswered, "event_call_answered")
++	if answered["call_id"] != "CALLOUT1" || answered["sdp"] != "" {
++		t.Fatalf("call.answered is %v, want the call with an empty sdp", answered)
++	}
++	if _, _, _, wired := call.counts(); !wired {
++		t.Fatal("the voice was not wired to the stream")
++	}
++}
++
++// A stream the connector cannot reach hangs the placed call up and fails the command.
++func TestACallPlacedWithAnUnreachableStreamIsHungUp(t *testing.T) {
++	t.Parallel()
++	session := newCallSession(t)
++	session.onWhatsApp = onWhatsAppAsGiven
++	call := &fakeCall{id: "CALLOUT2"}
++	session.dialCall = func(context.Context, string) (bridgedCall, error) { return call, nil }
++
++	_, err := session.Execute(t.Context(), &protocol.Command{
++		ID: "c2", Type: protocol.CommandCallStart, IdempotencyKey: "k2",
++		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"77070000000"},"stream":{"url":"ws://127.0.0.1:1/none"}}`),
++	})
++	if err == nil {
++		t.Fatal("a call.start whose stream cannot be reached succeeded")
++	}
++	waitFor(t, func() bool { _, _, hungUp, _ := call.counts(); return hungUp == 1 }, "the placed call was not hung up")
++}
++
++// Neither an offer nor a stream, or both, is not a call.start.
++func TestACallStartCarriesAnOfferOrAStream(t *testing.T) {
++	t.Parallel()
++	session := newCallSession(t)
++	for _, payload := range []string{
++		`{"to":{"kind":"phone","id":"77070000000"}}`,
++		`{"to":{"kind":"phone","id":"77070000000"},"stream":{"url":""}}`,
++		`{"to":{"kind":"phone","id":"77070000000"},"sdp":"v=0","stream":{"url":"ws://x"}}`,
++	} {
++		_, err := session.Execute(t.Context(), &protocol.Command{
++			ID: "c3", Type: protocol.CommandCallStart, IdempotencyKey: "k3", Payload: json.RawMessage(payload),
++		})
++		assertCode(t, err, protocol.ErrorInvalidPayload)
++	}
++}

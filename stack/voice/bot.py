@@ -1,9 +1,13 @@
 """Voice agent of e-KNOT: Gemini Live on Vertex AI through Pipecat.
 
-Two doors into the same conversation:
+Doors:
   /wa       a WhatsApp call to the test number. The connector inside Chatwoot answers the call and dials this
             WebSocket (JSON frames: start, answered, media every 60 ms, stop; we send media, clear, hangup), 16 kHz
             PCM both ways. Chatwoot hands the call over when WHATSAPP_VOICE_AGENT_URL is set (stack/patches).
+  /wa?campaign=votes&name=...  an outbound call the agent makes for the ОСИ chairman (stack/voice/dial.sh): the
+            connector rings the number and dials this WebSocket; `answered` comes when the person picks up. The
+            campaign (campaigns.json: what to say, what to find out) picks prompt-outbound.md; the result goes to
+            the outcomes table.
   /browser  the same agent from a browser page (/), raw PCM over a WebSocket: 16 kHz up, 24 kHz down. For
             testing through an SSH tunnel to localhost (a secure context, so the microphone works).
 
@@ -45,6 +49,9 @@ HERE = Path(__file__).resolve().parent
 CATALOG = json.loads(Path(E("CATALOG_PATH", "/app/services.json")).read_text(encoding="utf-8"))
 SERVICES = {s["id"]: s for s in CATALOG["services"]}
 KB_DIR = Path(E("KB_DIR", "/app/kb"))
+_cp = Path(E("CAMPAIGNS_PATH", "/app/campaigns.json"))
+CAMPAIGNS = {k: v for k, v in (json.loads(_cp.read_text(encoding="utf-8")) if _cp.exists() else {}).items()
+             if not k.startswith("_")}
 
 # Pipecat logs the system prompt, tool arguments and transcripts at DEBUG; the transcript lives in voice.db only.
 logger.remove()
@@ -57,7 +64,11 @@ CREATE TABLE IF NOT EXISTS calls (id INTEGER PRIMARY KEY AUTOINCREMENT, door TEX
   started_at REAL NOT NULL, ended_at REAL, transcript TEXT NOT NULL DEFAULT '[]');
 CREATE TABLE IF NOT EXISTS leads (id INTEGER PRIMARY KEY AUTOINCREMENT, call_id INTEGER NOT NULL, peer TEXT,
   at REAL NOT NULL, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS outcomes (id INTEGER PRIMARY KEY AUTOINCREMENT, call_id INTEGER NOT NULL, peer TEXT,
+  campaign TEXT NOT NULL, result TEXT NOT NULL, note TEXT, callback TEXT, at REAL NOT NULL);
 """)
+if "campaign" not in {r[1] for r in db.execute("PRAGMA table_info(calls)")}:
+    db.execute("ALTER TABLE calls ADD COLUMN campaign TEXT")
 active = 0
 
 
@@ -66,6 +77,13 @@ def prompt():
     prices = json.dumps(CATALOG.get("company", {}).get("prices", {}), ensure_ascii=False)
     return (HERE / "prompt.md").read_text(encoding="utf-8").replace(
         "{catalog}", "\n".join(lines) + f"\nЦены с сайта: {prices}")
+
+
+def prompt_outbound(campaign, name):
+    c = CAMPAIGNS[campaign]
+    return (HERE / "prompt-outbound.md").read_text(encoding="utf-8").format(
+        house=c["house"], chairman=c["chairman"], title=c["title"], goal=c["goal"], ask=c["ask"],
+        facts="\n".join(f"- {f}" for f in c["facts"]), name=name or "неизвестно")
 
 
 def calls_today():
@@ -131,7 +149,7 @@ class BrowserSerializer(FrameSerializer):
 
 # ---------------------------------------------------------------- one call
 
-async def run_call(ws: WebSocket, door: str, serializer, out_rate: int):
+async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign=None, name=None):
     global active
     if active >= MAX_CALLS or calls_today() >= DAILY_CALLS:
         log.warning("call refused: active=%s today=%s", active, calls_today())
@@ -140,7 +158,8 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int):
         await ws.close()
         return
     active += 1
-    call_id = db.execute("INSERT INTO calls (door, started_at) VALUES (?, ?)", (door, time.time())).lastrowid
+    call_id = db.execute("INSERT INTO calls (door, started_at, campaign) VALUES (?, ?, ?)",
+                         (door, time.time(), campaign)).lastrowid
     transcript = []
     task = None
 
@@ -160,27 +179,49 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int):
         log.info("call=%s lead saved: %s", call_id, sorted(params.arguments))
         await params.result_callback({"saved": True})
 
+    async def save_outcome(params: FunctionCallParams):
+        a = params.arguments
+        db.execute("INSERT INTO outcomes (call_id, peer, campaign, result, note, callback, at) VALUES (?,?,?,?,?,?,?)",
+                   (call_id, serializer.peer, campaign, a.get("result", ""), a.get("note"), a.get("callback"),
+                    time.time()))
+        log.info("call=%s outcome %s", call_id, a.get("result"))
+        await params.result_callback({"saved": True})
+
     async def end_call(params: FunctionCallParams):
         await params.result_callback({"ok": True})
         await asyncio.sleep(4)  # let the goodbye play out
         await task.queue_frame(EndFrame())
 
-    tools = ToolsSchema(standard_tools=[
-        FunctionSchema("service_info", "Подробности об услуге e-KNOT со страницы сайта: что входит, тарифы, FAQ.",
-                       {"service_id": {"type": "string", "enum": list(SERVICES)}}, ["service_id"], service_info),
-        FunctionSchema("save_lead", "Записать заявку для менеджера e-KNOT, когда председатель или УК заинтересованы.",
-                       {"service": {"type": "string"}, "role": {"type": "string", "description": "председатель, УК, "
-                                                                "член совета, жилец"},
-                        "house": {"type": "string", "description": "город и дом или ЖК"},
-                        "apartments": {"type": "string"}, "wants": {"type": "string"},
-                        "name": {"type": "string", "description": "как представился, если представился"}},
-                       ["service", "role", "wants"], save_lead),
-        FunctionSchema("end_call", "Положить трубку после прощания.", {}, [], end_call),
-    ])
+    service_tool = FunctionSchema(
+        "service_info", "Подробности об услуге e-KNOT со страницы сайта: что входит, тарифы, FAQ.",
+        {"service_id": {"type": "string", "enum": list(SERVICES)}}, ["service_id"], service_info)
+    end_tool = FunctionSchema("end_call", "Положить трубку после прощания.", {}, [], end_call)
+    if campaign:
+        tools = ToolsSchema(standard_tools=[
+            FunctionSchema("save_outcome", "Записать итог звонка для председателя.",
+                           {"result": {"type": "string", "enum": CAMPAIGNS[campaign]["outcomes"]},
+                            "note": {"type": "string", "description": "вопросы и жалобы для председателя, кратко"},
+                            "callback": {"type": "string", "description": "когда перезвонить или когда оплатит/"
+                                                                          "проголосует, словами человека"}},
+                           ["result"], save_outcome),
+            service_tool, end_tool])
+    else:
+        tools = ToolsSchema(standard_tools=[
+            service_tool,
+            FunctionSchema("save_lead", "Записать заявку для менеджера e-KNOT, когда председатель или УК заинтересованы.",
+                           {"service": {"type": "string"}, "role": {"type": "string", "description": "председатель, УК, "
+                                                                    "член совета, жилец"},
+                            "house": {"type": "string", "description": "город и дом или ЖК"},
+                            "apartments": {"type": "string"}, "wants": {"type": "string"},
+                            "name": {"type": "string", "description": "как представился, если представился"}},
+                           ["service", "role", "wants"], save_lead),
+            end_tool])
     llm = GeminiLiveVertexLLMService(
-        project_id=PROJECT, location=LOCATION, system_instruction=prompt(), tools=tools,
+        project_id=PROJECT, location=LOCATION,
+        system_instruction=prompt_outbound(campaign, name) if campaign else prompt(), tools=tools,
         settings=GeminiLiveVertexLLMService.Settings(model=MODEL, voice=VOICE, language="ru-RU"))
-    context = LLMContext([{"role": "user", "content": "(звонок принят)"}], tools)
+    context = LLMContext([{"role": "user", "content": "(человек взял трубку)" if campaign else "(звонок принят)"}],
+                         tools)
     agg = LLMContextAggregatorPair(context)
     transport = FastAPIWebsocketTransport(ws, FastAPIWebsocketParams(
         audio_in_enabled=True, audio_out_enabled=True, add_wav_header=False, serializer=serializer,
@@ -208,7 +249,8 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int):
     @transport.event_handler("on_client_connected")
     async def _connected(_, __):
         try:
-            await asyncio.wait_for(serializer.answered.wait(), 30)
+            # An outbound call rings until the person picks up (or WhatsApp gives up, ~60 s).
+            await asyncio.wait_for(serializer.answered.wait(), 90 if campaign else 30)
         except asyncio.TimeoutError:
             await task.cancel()
             return
@@ -222,7 +264,7 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int):
     async def _timeout(_, __):
         await task.queue_frame(EndFrame())
 
-    log.info("call=%s door=%s started (active=%s)", call_id, door, active)
+    log.info("call=%s door=%s campaign=%s started (active=%s)", call_id, door, campaign, active)
     try:
         await PipelineRunner(handle_sigint=False).run(task)
     finally:
@@ -247,8 +289,13 @@ async def health():
 
 @app.websocket("/wa")
 async def wa(ws: WebSocket):
+    campaign = ws.query_params.get("campaign") or None
+    if campaign and campaign not in CAMPAIGNS:
+        await ws.close(code=4404)
+        return
     await ws.accept()
-    await run_call(ws, "wa", ConnectorSerializer(), 16000)
+    await run_call(ws, "wa-out" if campaign else "wa", ConnectorSerializer(), 16000, campaign,
+                   (ws.query_params.get("name") or "")[:60] or None)
 
 
 @app.websocket("/browser")

@@ -3,7 +3,7 @@ FROM python:3.13-slim@sha256:7249d5587b78209a006dc4a3b5340678f84ea729239193aa559
 RUN pip install --no-cache-dir "pipecat-ai[google,websocket]==1.15.0" "uvicorn==0.54.0" \
  && useradd --system --uid 10001 agent && mkdir /data && chown agent /data
 WORKDIR /app
-COPY bot.py prompt.md ./
+COPY bot.py prompt.md prompt-outbound.md ./
 COPY static ./static
 USER agent
 EXPOSE 8090

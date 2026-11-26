@@ -223,6 +223,16 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Build only (docker compose --profile build build wa-connector, before building cw-rails): the WhatsApp connector
+  # v0.9.0 from vendor/ with stack/patches/whatsapp-connector-outbound-stream.patch (call.start with a media stream,
+  # for the voice agent's outbound calls). The Chatwoot Dockerfile copies its binary from this image.
+  wa-connector:
+    build:
+      context: ../vendor/whatsapp-connector
+      args: {VERSION: 0.9.0-stream}
+    image: salesbot/whatsapp-connector:0.9.0-stream
+    profiles: [build]
+
   # Voice agent (Pipecat + Gemini Live): WhatsApp calls handed over by the connector (/wa) and a browser test page.
   # Only on the VM's loopback until PUBLIC_DOMAIN has its A record: ssh -L 8090:localhost:8090 to try it.
   voice:
@@ -240,6 +250,7 @@ services:
     volumes:
       - ./group-watcher/services.json:/app/services.json:ro
       - ./kb/pages:/app/kb:ro
+      - ./voice/campaigns.json:/app/campaigns.json:ro
       - voice_data:/data
     read_only: true
     tmpfs: [/tmp]

@@ -1,4 +1,6 @@
 # Upstream sources built on the VM, pinned to full commits. Bump only together with a scenario run.
 # name   url                                       commit
+# whatsapp-connector: v0.9.0, the version the Chatwoot image pins, built here only to carry the outbound-stream patch.
 agents   https://github.com/fazer-ai/agents.git    e1c71dfaf7b5560a60a58f41d3bf0823a2708122
 chatwoot https://github.com/fazer-ai/chatwoot.git  0f1d591a76916ff69af16bd1d0831ce07a664aba
+whatsapp-connector https://github.com/fazer-ai/whatsapp-connector.git edb8d3ddcef819e579f63bc5cdeda1f59ea1a8b5

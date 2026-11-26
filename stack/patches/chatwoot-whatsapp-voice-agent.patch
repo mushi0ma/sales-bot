@@ -1,11 +1,16 @@
 diff --git a/app/services/whatsapp/session/backends/connector/backend.rb b/app/services/whatsapp/session/backends/connector/backend.rb
-index 92e980c..499c2d5 100644
+index 92e980c..14a7b9e 100644
 --- a/app/services/whatsapp/session/backends/connector/backend.rb
 +++ b/app/services/whatsapp/session/backends/connector/backend.rb
-@@ -268,6 +268,11 @@ class Whatsapp::Session::Backends::Connector::Backend < Whatsapp::Session::Backe
+@@ -268,6 +268,16 @@ class Whatsapp::Session::Backends::Connector::Backend < Whatsapp::Session::Backe
      client.publish(command, timeout: DEFERRABLE_TIMEOUT)
    end
  
++  # Rings somebody's phone, so a redelivery must not ring it again: the key names this one placement.
++  def start_call(command, key)
++    client.call(command, idempotency_key: "call:#{key}")
++  end
++
 +  def accept_call(command)
 +    client.call(command)
 +    nil
@@ -15,7 +20,7 @@ index 92e980c..499c2d5 100644
      client.publish(command, timeout: DEFERRABLE_TIMEOUT)
    end
 diff --git a/app/services/whatsapp/session/facade.rb b/app/services/whatsapp/session/facade.rb
-index 76346ff..dd7bca9 100644
+index 76346ff..c778ab8 100644
 --- a/app/services/whatsapp/session/facade.rb
 +++ b/app/services/whatsapp/session/facade.rb
 @@ -82,7 +82,8 @@ class Whatsapp::Session::Facade
@@ -28,7 +33,7 @@ index 76346ff..dd7bca9 100644
        )
      )
    end
-@@ -215,8 +216,20 @@ class Whatsapp::Session::Facade
+@@ -215,8 +216,27 @@ class Whatsapp::Session::Facade
      { 'jid' => model::Address.phone(check.phone.presence || digits).to_jid, 'exists' => check.exists }
    end
  
@@ -36,6 +41,13 @@ index 76346ff..dd7bca9 100644
 +  # the URL and answers on WhatsApp once it is open.
 +  def accept_call_with_stream(call_id, url)
 +    backend.accept_call(model::Commands::CallAccept.new(call_id: call_id, sdp: nil, stream: { 'url' => url }))
++  end
++
++  # An outbound call the voice agent makes: the connector rings `phone` (digits only) and hands the voice
++  # to the media stream at `url`. Returns the connector's result ({'call_id' => ...}).
++  def start_call_with_stream(phone, url, key)
++    backend.start_call(model::Commands::CallStart.new(to: model::Address.new(kind: 'phone', id: phone),
++                                                      stream: { 'url' => url }), key)
 +  end
 +
    private
@@ -49,7 +61,7 @@ index 76346ff..dd7bca9 100644
    def capability?(capability)
      channel.session_capabilities.include?(capability)
    end
-@@ -276,7 +289,8 @@ class Whatsapp::Session::Facade
+@@ -276,7 +296,8 @@ class Whatsapp::Session::Facade
      backend.connect(
        model::Commands::SessionConnect.new(
          pairing: mode, phone: channel.phone_number.to_s.delete('+'),
@@ -91,3 +103,39 @@ index 96443e0..f3925aa 100644
    # Prefixed, and not the raw call id: this shares a column with WhatsApp's message ids,
    # and the prefix is what keeps a call from ever being the target of an edit, a revoke
    # or a reaction that names the same string.
+diff --git a/app/services/whatsapp/session/model/commands.rb b/app/services/whatsapp/session/model/commands.rb
+index c4d420a..f432523 100644
+--- a/app/services/whatsapp/session/model/commands.rb
++++ b/app/services/whatsapp/session/model/commands.rb
+@@ -285,12 +285,14 @@ module Whatsapp::Session::Model::Commands
+     wire_type 'call.accept'
+   end
+ 
+-  # Rings `to` with the browser's WebRTC offer. An RPC: the result is the call id that
++  # Rings `to` with the browser's WebRTC offer, or with the media `stream` ({'url' => 'ws://...'}) of a
++  # voice agent that carries the call from the callee's answer on. An RPC: the result is the call id that
+   # `call.answered` and `call.terminate` carry for it.
+-  class CallStart < Data.define(:to, :sdp)
++  class CallStart < Data.define(:to, :sdp, :stream)
+     include Serializable
+     wire_type 'call.start'
+     coerce to: Address
++    defaults sdp: nil, stream: nil
+   end
+ 
+   class CallTerminate < Data.define(:call_id)
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index 4974908..93f92eb 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -2,7 +2,9 @@
+ FROM node:24-alpine as node
+ # The WhatsApp connector Sidekiq runs unless WHATSAPP_CONNECTOR_ENABLED=false (see
+ # docker/entrypoints/helpers/whatsapp_connector.rb). Pinned, and moved by Dependabot.
+-FROM ghcr.io/fazer-ai/whatsapp-connector:0.9.0 AS whatsapp-connector
++# salesbot: v0.9.0 built from vendor/whatsapp-connector with stack/patches/whatsapp-connector-outbound-stream.patch
++# (docker compose --profile build build wa-connector).
++FROM salesbot/whatsapp-connector:0.9.0-stream AS whatsapp-connector
+ # The official enterprise/ for VERSION_CW, and the hash of its tree. The image never ships
+ # that tree: the hash is what docker/entrypoints/helpers/enterprise.sh checks the copy it
+ # downloads at boot against, and the tree itself only feeds the asset build below.
