@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""group-watcher: finds e-KNOT sales needs in WhatsApp groups and offers the matching service in a private message.
+"""group-watcher: finds e-KNOT sales needs in WhatsApp and Telegram groups and offers the matching service in a private
+message. Telegram groups reach Chatwoot through tg-userbot as group conversations of its API inbox (TG_INBOX_ID),
+so everything below holds for them too; the private offer goes through that inbox, as a Telegram message.
 
 Chatwoot account webhook (message_created, HMAC-signed) -> this service:
   1. keeps the incoming messages of group conversations that carry the label WATCH_LABEL. Other groups are ignored:
@@ -71,6 +73,9 @@ OFFER_ATTR = "salesbot_offer"
 # person) for the A/B comparison the mentor asked for. Without CLOUD_INBOX_ID everything goes by A.
 SEND_PATH = E("SEND_PATH", "A").upper()
 CLOUD_INBOX_ID = int(E("CLOUD_INBOX_ID", "0") or 0)
+# Telegram groups come through tg-userbot's API inbox (group conversations like WhatsApp's). The offer goes to the
+# author's private chat in that same inbox: paths A/B are WhatsApp's. Events say channel "telegram" for the cards.
+TG_INBOX_ID = int(E("TG_INBOX_ID", "0") or 0)
 TEMPLATES = {"ru": E("TEMPLATE_RU", "eknot_offer_ru"), "kk": E("TEMPLATE_KK", "eknot_offer_kk")}
 # What the approved templates say, {{1}} name, {{2}} service, {{3}} link (texts submitted to Meta: docs/SETUP.md).
 TEMPLATE_TEXT = {
@@ -309,10 +314,15 @@ def parse_needs(content, new_rows, catalog=CATALOG):
     return out
 
 
-def choose_path(contact_id, mode=None, cloud_inbox=None):
+def channel_of(inbox_id):
+    """Event data naming the channel when it is not WhatsApp (funnel.channel_for)."""
+    return {"channel": "telegram"} if TG_INBOX_ID and inbox_id == TG_INBOX_ID else {}
+
+
+def choose_path(contact_id, mode=None, cloud_inbox=None, inbox_id=None):
     mode = SEND_PATH if mode is None else mode
     cloud_inbox = CLOUD_INBOX_ID if cloud_inbox is None else cloud_inbox
-    if not cloud_inbox or mode not in ("B", "SPLIT"):
+    if not cloud_inbox or mode not in ("B", "SPLIT") or channel_of(inbox_id):
         return "A"
     return "B" if mode == "B" or contact_id % 2 else "A"
 
@@ -421,7 +431,7 @@ def offer_context(need, catalog=CATALOG):
 
 def send_offer(need_id):
     n = q("SELECT * FROM needs WHERE id=?", (need_id,))[0]
-    path = choose_path(n["contact_id"])
+    path = choose_path(n["contact_id"], inbox_id=n["inbox_id"])
     inbox = CLOUD_INBOX_ID if path == "B" else n["inbox_id"]
     st, b = cw("GET", f"/contacts/{n['contact_id']}/contactable_inboxes")
     entries = (b or {}).get("payload", []) if isinstance(b, dict) else []
@@ -445,7 +455,8 @@ def send_offer(need_id):
     log.info("need=%s sent: conversation=%s service=%s path=%s", need_id, c["id"], n["service"], path)
     emit("offer.sent", n["contact_id"], {"service": n["service"], "service_name": service_name(n["service"]),
                                          "need_id": need_id, "path": path, "cw_conversation_id": c["id"],
-                                         "text": message.get("content") if isinstance(message, dict) else None},
+                                         "text": message.get("content") if isinstance(message, dict) else None,
+                                         **channel_of(n["inbox_id"])},
          name=n["author"], house=n["group_name"], once=f"offer:{need_id}")
     st, _ = cw("POST", f"/conversations/{c['id']}/custom_attributes",
                {"custom_attributes": {OFFER_ATTR: offer_context(dict(n))}})
@@ -480,7 +491,7 @@ def handle_need(need, mode=None):
         emit("need.detected", need["contact_id"], {
             "service": need["service"], "service_name": service_name(need["service"]), "quote": need["quote"],
             "group": need.get("group_name"), "need_id": need_id, "confidence": need["confidence"],
-            "decision": stored_full, "cw_conversation_id": need["conv_id"]},
+            "decision": stored_full, "cw_conversation_id": need["conv_id"], **channel_of(need["inbox_id"])},
             name=need.get("author"), house=need.get("group_name"), once=f"need:{need_id}", at=need.get("message_at"))
     log.info("need=%s message=%s service=%s conf=%.2f -> %s%s", need_id, need["message_id"], need["service"],
              need["confidence"], status, f" ({why})" if why else "")
@@ -744,7 +755,7 @@ def intake(p):
         emit("lead.handoff", contact.get("id") or (conv.get("contact_inbox") or {}).get("contact_id"), {
             "note": text[:800], "cw_conversation_id": conv["id"], "inbox_id": conv.get("inbox_id"),
             "service": offer[0]["service"] if offer else None,
-            "service_name": service_name(offer[0]["service"]) if offer else None},
+            "service_name": service_name(offer[0]["service"]) if offer else None, **channel_of(conv.get("inbox_id"))},
             name=contact.get("name"), phone=contact.get("phone_number"), once=f"handoff:{p.get('id')}")
         return "lead"
     if p.get("message_type") != "incoming" or not sender.get("id") or sender.get("type") not in (None, "contact"):
@@ -758,7 +769,8 @@ def intake(p):
         if offer:  # the first answer to our offer moves the card to REPLIED (once per conversation)
             emit("dm.replied", sender["id"], {"service": offer[0]["service"],
                                               "service_name": service_name(offer[0]["service"]),
-                                              "text": text[:500], "cw_conversation_id": conv.get("id")},
+                                              "text": text[:500], "cw_conversation_id": conv.get("id"),
+                                              **channel_of(conv.get("inbox_id"))},
                  name=sender.get("name"), phone=sender.get("phone_number"), once=f"reply:{conv.get('id')}")
             return "ignored:individual:replied"
         return "ignored:individual"
@@ -948,7 +960,7 @@ def backfill_events():
         sys.exit("ORCH_TOKEN is empty")
     queued = []
     for n in map(dict, q("SELECT * FROM needs WHERE confidence >= ? ORDER BY message_at", (MIN_CONFIDENCE,))):
-        svc = {"service": n["service"], "service_name": service_name(n["service"])}
+        svc = {"service": n["service"], "service_name": service_name(n["service"]), **channel_of(n["inbox_id"])}
         queued.append((n["message_at"], "need.detected", n["contact_id"], dict(svc, quote=n["quote"],
                        group=n["group_name"], need_id=n["id"], confidence=n["confidence"], decision=n["status"],
                        cw_conversation_id=n["conv_id"]), n, f"need:{n['id']}"))

@@ -9,20 +9,28 @@ A real Telegram account (MTProto, Telethon), not a bot: residents see a person w
                     while that grows with the length, then the text and attachments.
                     What the owner types from their phone in an allowed private chat is mirrored into the conversation
                     as an operator message (CW_OPERATOR_TOKEN), so Chatwoot and the agent see the whole dialog.
-  groups         -> rows in /data/userbot.db `group_messages`: the queue the profiler will read (plan §4).
+  groups         -> Chatwoot, as the fork keeps WhatsApp groups: one group conversation in the API inbox, each message
+                    incoming from its author's own contact (the salesbot patch chatwoot-api-group-messages adds the
+                    endpoint), so group-watcher reads Telegram groups the way it reads WhatsApp ones. The group
+                    conversation carries WATCH_LABEL from its first message. Chatwoot's outgoing messages there (group-watcher's answers)
+                    go to the group, as a reply when they reply to a message. Also kept in /data/userbot.db
+                    `group_messages`: who wrote in an allowed group may be written to first and is served in private.
   first contact  -> Chatwoot can write first to a member of an allowed group who never wrote to the account
                     (bootstrap.py tg-outreach): the bridge sends it and from then on handles that private chat.
 
-DEFAULT DENY. The account is a person's account and has personal chats: nothing is read, stored or forwarded
+DEFAULT DENY. The account may be a person's account with personal chats: nothing is read, stored or forwarded
 unless the chat was allowed by the account owner. To allow a chat, write `/salesbot allow` in it FROM THIS
 ACCOUNT (in a group, or in a private chat with a tester); `/salesbot deny` revokes, `/salesbot status` reports to
-Saved Messages. The command message is deleted right away. Logs carry ids and lengths, never message text.
+Saved Messages. The command message is deleted right away. A private chat with someone who wrote in an allowed
+group counts as allowed (as on WhatsApp, where a member of the watched group reaches the seller in private). In a
+group only what is written after it was allowed reaches Chatwoot. Logs carry ids and lengths, never message text.
 
     python3 -I userbot.py login     # once, interactive: phone, code, 2FA password -> /data/userbot.session
     python3 -I userbot.py run       # the service (default)
 
 Env: TG_API_ID, TG_API_HASH (my.telegram.org), CW_URL, CW_ACCOUNT_ID, CW_INBOX_IDENTIFIER (API inbox),
-     CW_WEBHOOK_SECRET, CW_OPERATOR_TOKEN (optional: mirror the owner's phone messages),
+     CW_WEBHOOK_SECRET, CW_OPERATOR_TOKEN (an agent of this inbox only: groups, and the owner's phone messages),
+     CW_INBOX_ID (the inbox's numeric id, for groups), WATCH_LABEL (default salesbot-watch),
      SEND_MIN_INTERVAL (s between sends to one chat, default 3), SEND_MAX_PER_HOUR (all chats, default 30),
      MEDIA_MAX_MB (default 20).
 """
@@ -39,6 +47,8 @@ CW_ACCOUNT = os.environ.get("CW_ACCOUNT_ID", "")
 INBOX = os.environ.get("CW_INBOX_IDENTIFIER", "")
 WEBHOOK_SECRET = os.environ.get("CW_WEBHOOK_SECRET", "")
 OPERATOR_TOKEN = os.environ.get("CW_OPERATOR_TOKEN", "")
+INBOX_ID = os.environ.get("CW_INBOX_ID", "")
+WATCH_LABEL = os.environ.get("WATCH_LABEL", "salesbot-watch")
 SEND_MIN_INTERVAL = float(os.environ.get("SEND_MIN_INTERVAL", "3"))
 SEND_MAX_PER_HOUR = int(os.environ.get("SEND_MAX_PER_HOUR", "30"))
 MEDIA_MAX = int(float(os.environ.get("MEDIA_MAX_MB", "20")) * 1024 * 1024)
@@ -73,6 +83,12 @@ def init_db():
             text TEXT, reply_to INTEGER, has_media INTEGER NOT NULL DEFAULT 0, consumed_at TEXT,
             PRIMARY KEY (chat_id, msg_id));
         CREATE TABLE IF NOT EXISTS deliveries (delivery_id TEXT PRIMARY KEY, seen_at TEXT NOT NULL);
+        -- Telegram message <-> Chatwoot message in a group conversation: replies both ways.
+        CREATE TABLE IF NOT EXISTS msg_map (chat_id INTEGER NOT NULL, tg_msg_id INTEGER NOT NULL,
+            cw_msg_id INTEGER NOT NULL, PRIMARY KEY (chat_id, tg_msg_id));
+        CREATE INDEX IF NOT EXISTS msg_map_cw ON msg_map (cw_msg_id);
+        -- Since when an allowed group's messages go to Chatwoot.
+        CREATE TABLE IF NOT EXISTS group_bridge (chat_id INTEGER PRIMARY KEY, since TEXT NOT NULL);
         """)
 
 
@@ -84,6 +100,43 @@ def allowed(chat_id):
 def allow(chat_id, kind, title):
     with db() as c:
         c.execute("INSERT OR REPLACE INTO allowed_chats VALUES (?,?,?,?)", (chat_id, kind, title, now_iso()))
+        if kind == "group":
+            c.execute("INSERT OR REPLACE INTO group_bridge (chat_id, since) VALUES (?,?)", (chat_id, now_iso()))
+
+
+def bridge_since(chat_id):
+    """Messages of an allowed group from this moment go to Chatwoot; a group allowed before the bridge existed
+    starts now, so its history never reaches group-watcher as new messages."""
+    with db() as c:
+        c.execute("INSERT OR IGNORE INTO group_bridge (chat_id, since) VALUES (?,?)", (chat_id, now_iso()))
+        return c.execute("SELECT since FROM group_bridge WHERE chat_id=?", (chat_id,)).fetchone()[0]
+
+
+def map_msg(chat_id, tg_msg_id, cw_msg_id):
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO msg_map VALUES (?,?,?)", (chat_id, tg_msg_id, cw_msg_id))
+
+
+def cw_msg_of(chat_id, tg_msg_id):
+    with db() as c:
+        r = c.execute("SELECT cw_msg_id FROM msg_map WHERE chat_id=? AND tg_msg_id=?", (chat_id, tg_msg_id)).fetchone()
+    return r[0] if r else None
+
+
+def tg_msg_of(chat_id, cw_msg_id):
+    with db() as c:
+        r = c.execute("SELECT tg_msg_id FROM msg_map WHERE chat_id=? AND cw_msg_id=?", (chat_id, cw_msg_id)).fetchone()
+    return r[0] if r else None
+
+
+def private_allowed(user_id):
+    return allowed(user_id) or seen_in_allowed_group(user_id)
+
+
+def tg_identifier(ident):
+    """'tg:123' -> 123 (a user), 'tg:-100123' -> -100123 (a group); None for anything else."""
+    v = ident[3:] if ident.startswith("tg:") else ""
+    return int(v) if v.lstrip("-").isdigit() else None
 
 
 def seen_in_allowed_group(user_id):
@@ -173,6 +226,21 @@ class Chatwoot:
                          headers={"api_access_token": OPERATOR_TOKEN})
         return conv
 
+    async def group_message(self, chat_id, title, msg, sender, text):
+        """A message of an allowed group into its group conversation, from the author's contact, the conversation
+        labelled for group-watcher (the owner's `/salesbot allow` was the decision). Returns
+        (Chatwoot message id, conversation display id)."""
+        reply_to = cw_msg_of(chat_id, msg.reply_to_msg_id) if msg.reply_to_msg_id else None
+        body = {"group": {"identifier": f"tg:{chat_id}", "name": title or f"tg {chat_id}"},
+                "sender": {"identifier": f"tg:{sender.id}", "name": display_name(sender) or f"tg {sender.id}"},
+                "content": text, "source_id": f"tg:{chat_id}:{msg.id}", "in_reply_to": reply_to,
+                "labels": [WATCH_LABEL]}
+        m = await self._post(f"{CW_URL}/api/v1/accounts/{CW_ACCOUNT}/inboxes/{INBOX_ID}/group_messages",
+                             {k: v for k, v in body.items() if v is not None},
+                             headers={"api_access_token": OPERATOR_TOKEN})
+        map_msg(chat_id, msg.id, m["id"])
+        return m["id"], m["conversation_id"]
+
     async def download(self, data_url):
         """Attachment of an outgoing message. Its URL carries FRONTEND_URL's host; fetch it inside the network."""
         u = urlsplit(data_url)
@@ -215,6 +283,7 @@ def typing_seconds(text):
 async def run():
     from aiohttp import ClientSession, ClientTimeout, web
     from telethon import TelegramClient, events, errors
+    from telethon.tl.types import User
 
     if not (API_ID and API_HASH and INBOX and WEBHOOK_SECRET and CW_ACCOUNT):
         sys.exit("TG_API_ID, TG_API_HASH, CW_ACCOUNT_ID, CW_INBOX_IDENTIFIER and CW_WEBHOOK_SECRET are required "
@@ -225,13 +294,15 @@ async def run():
     if not await client.is_user_authorized():
         sys.exit("not logged in: run `userbot.py login` once (see SETUP.md)")
     me = await client.get_me()
-    log.info("account id=%s username=%s; phone mirror %s", me.id, "@" + me.username if me.username else "-",
-             "on" if OPERATOR_TOKEN else "off (no CW_OPERATOR_TOKEN)")
+    log.info("account id=%s username=%s; phone mirror %s; groups to Chatwoot %s", me.id,
+             "@" + me.username if me.username else "-", "on" if OPERATOR_TOKEN else "off (no CW_OPERATOR_TOKEN)",
+             "on" if OPERATOR_TOKEN and INBOX_ID else "off (no CW_OPERATOR_TOKEN or CW_INBOX_ID)")
     http = ClientSession(timeout=ClientTimeout(total=60))
     cw = Chatwoot(http)
     pacer = Pacer()
     bridge_sent = set()  # Telegram ids of messages this process sent: not the owner typing on the phone
-    outbox = {}  # user id -> queue of Chatwoot messages to send, in order
+    outbox = {}  # chat id (a user, or a group: negative) -> queue of Chatwoot messages to send, in order
+    group_lock = asyncio.Lock()  # one group message at a time into Chatwoot (a new group opens one conversation)
 
     async def media_of(msg):
         if msg.media is None or msg.file is None:
@@ -278,7 +349,7 @@ async def run():
     async def message(ev):
         if ev.out and (ev.raw_text or "").startswith(CMD):
             return
-        if not allowed(ev.chat_id):
+        if not (private_allowed(ev.chat_id) if ev.is_private else allowed(ev.chat_id)):
             return
         text = ev.raw_text or ""
         if ev.is_private:
@@ -299,9 +370,28 @@ async def run():
                 log.error("private in: user=%s failed: %s", sender.id, e)
             return
         sender = await ev.get_sender()
-        store_group(ev.chat_id, display_name(await ev.get_chat()), ev.message, sender)
+        title = display_name(await ev.get_chat())
+        stored = store_group(ev.chat_id, title, ev.message, sender)
         log.info("group %s: chat=%s sender=%s len=%d", "out" if ev.out else "in", ev.chat_id,
                  getattr(sender, "id", None), len(text))
+        if stored and not ev.out:
+            await to_chatwoot(ev.chat_id, title, ev.message, sender)
+
+    async def to_chatwoot(chat_id, title, msg, sender):
+        """Our own messages are already in Chatwoot (they came from it) or are the owner's from the phone; media
+        without a caption, bots and channels posting as the group carry nothing group-watcher reads."""
+        text = msg.raw_text or ""
+        if not (OPERATOR_TOKEN and INBOX_ID) or not text or not isinstance(sender, User) or sender.bot:
+            return
+        if msg.date.strftime("%Y-%m-%dT%H:%M:%SZ") < bridge_since(chat_id):
+            return
+        async with group_lock:
+            try:
+                mid, conv = await cw.group_message(chat_id, title, msg, sender, text)
+            except Exception as e:
+                log.error("group to chatwoot: chat=%s msg=%s failed: %s", chat_id, msg.id, e)
+                return
+        log.info("group to chatwoot: chat=%s msg=%s -> conversation %s message %s", chat_id, msg.id, conv, mid)
 
     def store_group(chat_id, title, msg, sender):
         with db() as c:
@@ -320,18 +410,23 @@ async def run():
                 groups = c.execute("SELECT chat_id, title, allowed_at FROM allowed_chats WHERE kind='group'").fetchall()
             for g in groups:
                 since = time.mktime(time.strptime(g["allowed_at"], "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
-                added = 0
+                missing = []
                 try:
                     async for msg in client.iter_messages(g["chat_id"], limit=500):
                         if msg.date.timestamp() < since:
                             break
                         if msg.action is not None or (msg.out and (msg.raw_text or "").startswith(CMD)):
                             continue
-                        added += store_group(g["chat_id"], g["title"], msg, await msg.get_sender())
+                        sender = await msg.get_sender()
+                        if store_group(g["chat_id"], g["title"], msg, sender):
+                            missing.append((msg, sender))
+                    for msg, sender in reversed(missing):  # oldest first: a reply finds what it answers
+                        if not msg.out:
+                            await to_chatwoot(g["chat_id"], g["title"], msg, sender)
                 except Exception as e:
                     log.error("backfill chat=%s failed: %s", g["chat_id"], type(e).__name__)
-                if added:
-                    log.warning("backfill chat=%s: %d messages were missing, stored", g["chat_id"], added)
+                if missing:
+                    log.warning("backfill chat=%s: %d messages were missing, stored", g["chat_id"], len(missing))
             await asyncio.sleep(BACKFILL_EVERY)
 
     async def mirror(ev, text):
@@ -385,33 +480,65 @@ async def run():
             if c.execute("INSERT OR IGNORE INTO deliveries VALUES (?,?)", (delivery, now_iso())).rowcount == 0:
                 return web.Response(status=200)
         ident = ((p.get("conversation") or {}).get("meta") or {}).get("sender", {}).get("identifier") or ""
-        if not ident.startswith("tg:") or not ident[3:].isdigit():
+        target = tg_identifier(ident)
+        if target is None:
             log.warning("webhook: message %s has no tg contact", p.get("id"))
             return web.Response(status=200)
-        user_id = int(ident[3:])
-        first_contact = not allowed(user_id)
+        content = (p.get("content") or "").strip()
+        if target < 0:  # a group conversation: group-watcher answers in the group
+            if not allowed(target):
+                log.warning("webhook: group %s is not allowed; message %s not sent", target, p.get("id"))
+            elif content:
+                queue_for(target).put_nowait((p, content, [], False))
+            return web.Response(status=200)
+        user_id = target
+        first_contact = not private_allowed(user_id)
         if first_contact and not seen_in_allowed_group(user_id):
             log.warning("webhook: user %s is neither an allowed chat nor a member of an allowed group; not sent",
                         user_id)
             return web.Response(status=200)
-        content = (p.get("content") or "").strip()
         attachments = [a for a in (p.get("attachments") or []) if a.get("data_url")]
         if not (content or attachments):
             return web.Response(status=200)
-        # Typing takes seconds: answer Chatwoot now, send in order per resident in the background.
-        if user_id not in outbox:
-            outbox[user_id] = asyncio.Queue()
-            asyncio.create_task(sender_loop(user_id, outbox[user_id]))
-        outbox[user_id].put_nowait((p, content, attachments, first_contact))
+        queue_for(user_id).put_nowait((p, content, attachments, first_contact))
         return web.Response(status=200)
 
-    async def sender_loop(user_id, q):
+    def queue_for(chat_id):
+        """Typing takes seconds: Chatwoot is answered at once, and each chat's messages go out in order."""
+        if chat_id not in outbox:
+            outbox[chat_id] = asyncio.Queue()
+            asyncio.create_task(sender_loop(chat_id, outbox[chat_id]))
+        return outbox[chat_id]
+
+    async def sender_loop(chat_id, q):
         while True:
             item = await q.get()
             try:
-                await send_one(user_id, *item)
-            except Exception as e:  # never let one message stop the resident's queue
-                log.error("private out: user=%s failed: %s", user_id, type(e).__name__)
+                await (send_group(chat_id, item[0], item[1]) if chat_id < 0 else send_one(chat_id, *item))
+            except Exception as e:  # never let one message stop the chat's queue
+                log.error("%s out: chat=%s failed: %s", "group" if chat_id < 0 else "private", chat_id,
+                          type(e).__name__)
+
+    async def send_group(chat_id, p, content):
+        attrs = p.get("content_attributes") or {}
+        if isinstance(attrs, str):
+            try:
+                attrs = json.loads(attrs)
+            except ValueError:
+                attrs = {}
+        quoted = str(attrs.get("in_reply_to") or "")
+        reply_to = tg_msg_of(chat_id, int(quoted)) if quoted.isdigit() else None
+        try:
+            await pacer.wait(chat_id)
+            async with client.action(chat_id, "typing"):
+                await asyncio.sleep(typing_seconds(content))
+            m = await client.send_message(chat_id, content, reply_to=reply_to)
+        except errors.FloodWaitError as e:
+            log.error("group out: FLOOD_WAIT %ss (chat %s), message %s not sent", e.seconds, chat_id, p.get("id"))
+            return
+        bridge_sent.add(m.id)
+        map_msg(chat_id, m.id, p["id"])  # a reply to our answer continues the thread in Chatwoot
+        log.info("group out: chat=%s len=%d reply_to=%s -> msg %s", chat_id, len(content), reply_to or "-", m.id)
 
     async def send_one(user_id, p, content, attachments, first_contact):
         try:

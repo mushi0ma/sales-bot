@@ -31,6 +31,7 @@ WhatsApp ─ whatsmeow (в Chatwoot) ─┬─ группа ─ вебхук ─
                                    │                                    └─ ответ в группе на повторный вопрос
                                    ├─ личка ─ fazer.ai agents (продавец: база знаний, проверка фактов)
                                    └─ звонок ─ WebSocket ─ voice (Pipecat + Gemini Live) ─ заметка в Chatwoot
+Telegram ─ tg-userbot (тестовый аккаунт) ─ API-inbox Chatwoot ─ группа и личка, дальше как у WhatsApp
 
 group-watcher, voice ─ события (очередь в каждом) ─ orchestrator ─ Hatchet ─ роль card ─ Twenty (карточки)
 LiteLLM ─ Gemini (Vertex AI); трассы LiteLLM и звонков ─ Langfuse
@@ -46,7 +47,7 @@ LiteLLM ─ Gemini (Vertex AI); трассы LiteLLM и звонков ─ Langf
 | `stack/voice/` | голосовой агент: входящие звонки, обзвон (`dial.sh`, по списку с повторами `obzvon.py`, поводы в `campaigns.json`), итоги в `voice.db` и в Chatwoot |
 | `stack/agent/` | промпты продавца и бота поддержки, ответы на возражения, справочник УК |
 | `stack/kb/` | снимки страниц услуг eknot.me; `refresh.py` раз в неделю показывает, что изменилось на сайте |
-| `stack/tg-userbot/` | Telegram через обычный аккаунт (userbot), как в WhatsApp; ждёт входа тестовым аккаунтом |
+| `stack/tg-userbot/` | Telegram через обычный тестовый аккаунт (userbot): личка к продавцу, группы в Chatwoot групповыми диалогами (патч `chatwoot-api-group-messages`), их читает тот же group-watcher |
 | `stack/patches/` | наши патчи к vendor: звонки WhatsApp голосовому агенту, звонок агента из диалога (`/call`), исходящий звонок со `stream`, эмбеддинги |
 | `stack/orchestrator/`, `stack/events/` | шина событий: очередь в сервисе-источнике, приём, роли `card` (карточка в Twenty, воронка в `funnel.py`) и `review` (ИИ-аналитик, `review.py`) |
 | `stack/platform.yml`, `stack/platform/` | Twenty, Hatchet, Langfuse и их хранилища; `setup.py`: токены, поля и стадии карточек |

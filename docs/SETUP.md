@@ -147,7 +147,8 @@ group-watcher.
 - `/reset` в диалоге сбрасывает память бота.
 
 Привязка inbox: один inbox = один агент. WhatsApp-номер (Chatwoot inbox 2) привязан к продавцу:
-`python3 -I bootstrap.py bind-cw 2 seller`. Бот поддержки остаётся для Telegram. Автоназначение в inbox должно
+`python3 -I bootstrap.py bind-cw 2 seller`, inbox «Telegram (userbot)» тоже (`bootstrap.py tg-userbot` делает это
+сам). Автоназначение в inbox должно
 быть выключено (`bind-cw` делает это сам), иначе Chatwoot назначает диалог оператору и бот молчит (`taken_over`).
 
 ## Оператор и бот
@@ -183,6 +184,8 @@ group-watcher.
 ```
 
 - Читает только группы с меткой `salesbot-watch` (ставит оператор в Chatwoot). Сообщения до метки не учитываются.
+  Группы Telegram приходят так же, через tg-userbot (раздел Telegram), и метку ставит сам userbot: решение о
+  группе принимает владелец аккаунта командой `/salesbot allow`. Предложение автору уходит в его личку Telegram.
 - Правила отправки (по порядку): отказ «стоп» → уверенность ≥ 0,7 → одно предложение человеку в 7 дней → лимит в
   день (`GW_DAILY_SEND_CAP`, 20) → режим. Тихие часы 21–09 (Астана): предложение ждёт утра до 14 ч.
 - Тестировщикам (атрибут контакта `salesbot_tester`; при `GW_AUTO_TESTERS=true` его получает каждый, кто пишет в
@@ -264,8 +267,27 @@ group-watcher.
   (вебхук снят, входящие удалены; 27.11 убраны и остатки: секрет `telegram-bot-token`, шаг `bootstrap.py telegram`,
   проверка вебхука в Caddy, два патча Chatwoot. Секрет `webhook-secret` ментора остался в Secret Manager, стек его
   не читает).
-- **Userbot** (`stack/tg-userbot/`, профиль compose `tg-userbot`): спайк S2 на Telethon, заморожен до 06.12.
-  Telethon архивирован, замена на Kurigram в бэклоге.
+- **Userbot** (`stack/tg-userbot/`, профиль compose `tg-userbot`, Telethon) на тестовом аккаунте (тестовая SIM):
+
+  ```
+  личка Telegram ─ userbot ─ inbox «Telegram (userbot)» (API) ─ продавец, как в WhatsApp
+  группа Telegram ─ userbot ─ групповой диалог в том же inbox ─ group-watcher ─ ответ в группе / предложение в личку
+  ```
+
+  - **Ничего не читает без разрешения.** `/salesbot allow` с этого аккаунта в группе или личке разрешает чат
+    (`deny` запрещает, `status` пишет в «Избранное»). Личка того, кто писал в разрешённой группе, разрешена сама,
+    как в WhatsApp: участник тестовой группы сразу попадает к продавцу.
+  - **Группы в Chatwoot как группы WhatsApp**: групповой диалог, у каждого сообщения свой автор-контакт, ответы
+    реплаем. Это даёт патч `chatwoot-api-group-messages` (эндпоинт
+    `POST /api/v1/accounts/:id/inboxes/:inbox_id/group_messages` для API-inbox, на общем механизме групп форка).
+    В Chatwoot уходит только то, что написано после `/salesbot allow`, история группы не попадает.
+  - Ответ group-watcher в групповом диалоге userbot отправляет в группу (реплаем, если это ответ на сообщение);
+    предложение в личку, ответы продавца и оператора отправляет в личку с паузой «печатает…».
+  - Запуск: `python3 -I bootstrap.py tg-userbot` (inbox, продавец, группы для group-watcher), затем
+    `docker compose up -d group-watcher` и `docker compose --profile tg-userbot up -d --build tg-userbot`.
+    Проверка без сети: `python3 -I stack/tg-userbot/test_userbot.py`.
+  - Telethon архивирован в феврале 2026: обновлений под новые версии Telegram не будет. Замена на Kurigram в
+    бэклоге (сессию придётся войти заново).
 
 ## Проверки
 
@@ -457,7 +479,8 @@ agents и Twenty (карточки) прямо в бакет,
 - [x] Голос: обзвон по списку с повторами (`voice/obzvon.py`).
 - [ ] Голос: два звонка одновременно на одном аккаунте WhatsApp не проверены; перезвон точно ко времени, которое
   назвал человек.
-- [ ] Telegram-userbot: вход выполнен (тестовая SIM), осталось `bootstrap.py tg-userbot` и запуск профиля.
+- [ ] Telegram: личка к продавцу и группы через group-watcher сделаны, нужна живая проверка в тестовой группе;
+  Telethon → Kurigram.
 - [x] Карточки жильцов в Twenty из событий group-watcher и голоса; трассы LLM и звонков в Langfuse.
 - [ ] Продавец и бот поддержки пока не шлют свои события (`lead.qualified`), стадия `QUALIFIED` не используется.
 - [x] ИИ-аналитик: разбор каждого диалога и звонка (слой 1 самообучения).

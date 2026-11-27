@@ -1,0 +1,118 @@
+diff --git a/app/controllers/api/v1/accounts/inboxes/group_messages_controller.rb b/app/controllers/api/v1/accounts/inboxes/group_messages_controller.rb
+new file mode 100644
+index 0000000..13a0b9a
+--- /dev/null
++++ b/app/controllers/api/v1/accounts/inboxes/group_messages_controller.rb
+@@ -0,0 +1,100 @@
++# salesbot: a message from a group of an API inbox's channel (Telegram groups read by stack/tg-userbot), stored the
++# way the fork stores WhatsApp groups: a group contact and its conversation (group_type: group), every author a
++# contact of their own and a member of the group, the message incoming FROM its author. The API channel itself has
++# no groups: any incoming message there is the conversation contact's. Outgoing messages in the group conversation
++# reach the channel through the inbox webhook as usual.
++#
++# POST /api/v1/accounts/:account_id/inboxes/:inbox_id/group_messages
++#   group[identifier], group[name], sender[identifier], sender[name], content, source_id (required, idempotency),
++#   in_reply_to (optional: the id of a message of this conversation this one replies to),
++#   labels[] (optional: added to the group conversation BEFORE the message, so its message_created already carries
++#   them: group-watcher reads only labelled groups, and the first message of a new group would be lost otherwise)
++# -> {id, conversation_id (display id), contact_id}; 200 for a source_id already stored, 201 for a new message.
++class Api::V1::Accounts::Inboxes::GroupMessagesController < Api::V1::Accounts::BaseController
++  include GroupConversationHandler
++
++  before_action :fetch_inbox
++
++  def create
++    source_id = params.require(:source_id).to_s
++    return render(json: { error: 'group and sender identifiers required' }, status: :unprocessable_entity) if
++      extract_group_identifier.blank? || extract_sender_source_id.blank?
++
++    existing = @inbox.messages.find_by(source_id: source_id)
++    return render(json: payload(existing)) if existing
++
++    render json: payload(create_message(source_id)), status: :created
++  end
++
++  private
++
++  attr_reader :inbox
++
++  def fetch_inbox
++    @inbox = Current.account.inboxes.find(params[:inbox_id])
++    authorize @inbox, :show?
++    render(json: { error: 'not an API inbox' }, status: :unprocessable_entity) unless @inbox.channel_type == 'Channel::Api'
++  end
++
++  # The bridge posts one message at a time, so two first messages of a new group never race for its conversation.
++  def create_message(source_id)
++    group_contact_inbox, group_contact = find_or_create_group_contact
++    sender = find_or_create_sender_contact
++    conversation = find_or_create_group_conversation(group_contact_inbox)
++    conversation.add_labels(Array(params[:labels]).map(&:to_s) - conversation.label_list)
++    add_group_member(group_contact, sender)
++    create_group_message(conversation: conversation, sender_contact: sender, content: params[:content].to_s,
++                         source_id: source_id, content_attributes: reply_attributes(conversation))
++  end
++
++  def reply_attributes(conversation)
++    replied = params[:in_reply_to].present? && conversation.messages.find_by(id: params[:in_reply_to])
++    return {} unless replied
++
++    { in_reply_to: replied.id, in_reply_to_external_id: replied.source_id }.compact
++  end
++
++  def payload(message)
++    { id: message.id, conversation_id: message.conversation.display_id, contact_id: message.sender_id }
++  end
++
++  def group_params
++    params.fetch(:group, {})
++  end
++
++  def sender_params
++    params.fetch(:sender, {})
++  end
++
++  def extract_group_identifier
++    group_params[:identifier].to_s.presence
++  end
++
++  def extract_group_source_id
++    extract_group_identifier
++  end
++
++  def extract_group_name
++    group_params[:name].to_s.presence
++  end
++
++  def extract_sender_identifier
++    sender_params[:identifier].to_s.presence
++  end
++
++  def extract_sender_source_id
++    extract_sender_identifier
++  end
++
++  def extract_sender_name
++    sender_params[:name].to_s.presence
++  end
++
++  def extract_sender_phone
++    nil
++  end
++
++  def build_sender_contact_attributes
++    { name: extract_sender_name || extract_sender_identifier, identifier: extract_sender_identifier }
++  end
++end
+diff --git a/config/initializers/salesbot_group_messages_route.rb b/config/initializers/salesbot_group_messages_route.rb
+new file mode 100644
+index 0000000..81d277c
+--- /dev/null
++++ b/config/initializers/salesbot_group_messages_route.rb
+@@ -0,0 +1,6 @@
++# salesbot: group messages of an API inbox (stack/tg-userbot), see Api::V1::Accounts::Inboxes::GroupMessagesController.
++# A route of its own here rather than a line in config/routes.rb, which the other salesbot patches also touch.
++Rails.application.routes.prepend do
++  post '/api/v1/accounts/:account_id/inboxes/:inbox_id/group_messages',
++       to: 'api/v1/accounts/inboxes/group_messages#create', defaults: { format: 'json' }
++end

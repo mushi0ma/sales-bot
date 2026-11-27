@@ -208,6 +208,7 @@ services:
       CLOUD_INBOX_ID: ${GW_CLOUD_INBOX_ID:-0}
       TESTER_QUIET_HOURS: ${GW_TESTER_QUIET_HOURS:-23-8}  # 0-0: testers any time
       AUTO_TESTERS: ${GW_AUTO_TESTERS:-true}  # test env: group members become testers (see watcher.py)
+      TG_INBOX_ID: ${CW_TGU_INBOX_ID:-0}  # tg-userbot's inbox: Telegram groups, offers in Telegram private chats
       DB_PATH: /data/watcher.db
       ORCH_TOKEN: ${ORCH_TOKEN:-}  # events to the orchestrator (events/outbox.py, queue in /data/outbox.db)
     volumes:
@@ -374,8 +375,9 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # Telegram userbot (a real account, MTProto) <-> Chatwoot API inbox; groups -> /data queue (plan v2, spike S2).
-  # Default deny: only chats allowed with `/salesbot allow` from the account itself. Session = secret (volume).
+  # Telegram userbot (a real account, MTProto) <-> Chatwoot API inbox: private chats to the seller, allowed groups as
+  # group conversations for group-watcher (patch chatwoot-api-group-messages). Default deny: only chats allowed with
+  # `/salesbot allow` from the account itself, and private chats of their members. Session = secret (volume).
   tg-userbot:
     build: ./tg-userbot
     image: salesbot/tg-userbot:local
@@ -389,6 +391,7 @@ services:
       CW_INBOX_IDENTIFIER: ${CW_TGU_INBOX_IDENTIFIER:-}
       CW_WEBHOOK_SECRET: ${CW_TGU_WEBHOOK_SECRET:-}
       CW_OPERATOR_TOKEN: ${CW_TGU_OPERATOR_TOKEN:-}
+      CW_INBOX_ID: ${CW_TGU_INBOX_ID:-}
     volumes:
       - tgu_data:/data
     read_only: true

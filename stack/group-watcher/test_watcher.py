@@ -102,6 +102,15 @@ class Logic(unittest.TestCase):
         self.assertEqual(w.choose_path(7, "A", 5), "A")
         self.assertEqual(w.choose_path(8, "B", 5), "B")
         self.assertEqual([w.choose_path(i, "SPLIT", 5) for i in (7, 8, 7)], ["B", "A", "B"], "stable per contact")
+        old, w.TG_INBOX_ID = w.TG_INBOX_ID, 9
+        try:
+            self.assertEqual(w.choose_path(7, "B", 5, inbox_id=9), "A", "a Telegram group: private in Telegram")
+            self.assertEqual(w.choose_path(7, "B", 5, inbox_id=4), "B")
+            self.assertEqual(w.channel_of(9), {"channel": "telegram"})
+            self.assertEqual(w.channel_of(4), {})
+        finally:
+            w.TG_INBOX_ID = old
+        self.assertEqual(w.channel_of(0), {}, "no Telegram inbox configured")
 
     def test_offer_template(self):
         n = {"service": "dispatcher", "author": "Айгерим Б.", "lang": "kk", "quote": "лифт"}
