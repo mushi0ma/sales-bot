@@ -24,7 +24,8 @@ while read -r name var src; do
   fi
 done < <(grep -vE '^\s*(#|$)' "$root/deploy/secrets.map")
 unset v
-# Keep what bootstrap.py wrote (CW_TGU_*, GW_*: ids and tokens minted inside Chatwoot), unless a secret now sets it.
+# Keep what bootstrap.py and platform/setup.py wrote (CW_TGU_*, GW_*, HATCHET_*, TWENTY_API_KEY: ids and tokens
+# minted inside Chatwoot, Hatchet, Twenty), unless a secret now sets it.
 if [[ -f "$stack/.env" ]]; then
   while IFS= read -r line; do
     [[ "$line" =~ ^([A-Z0-9_]+)= ]] || continue

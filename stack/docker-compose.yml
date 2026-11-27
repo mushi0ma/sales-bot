@@ -5,6 +5,10 @@
 # of the VM or stays inside docker networks (the agents console: deploy/ssh.sh -- -N -L 3100:127.0.0.1:3100).
 name: salesbot
 
+# Twenty (cards, funnel), Hatchet (events), Langfuse (traces): see platform.yml.
+include:
+  - platform.yml
+
 x-cw-env: &cw-env
   RAILS_ENV: production
   NODE_ENV: production
@@ -168,6 +172,9 @@ services:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?}
       LITELLM_LOG: WARNING
       LITELLM_TELEMETRY: "False"
+      LANGFUSE_HOST: http://langfuse-web:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:?}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:?}
       DISABLE_SCHEMA_UPDATE: "true"
     volumes:
       - ./litellm/config.yaml:/app/config.yaml:ro
@@ -201,8 +208,10 @@ services:
       CLOUD_INBOX_ID: ${GW_CLOUD_INBOX_ID:-0}
       AUTO_TESTERS: ${GW_AUTO_TESTERS:-true}  # test env: group members become testers (see watcher.py)
       DB_PATH: /data/watcher.db
+      ORCH_TOKEN: ${ORCH_TOKEN:-}  # events to the orchestrator (events/outbox.py, queue in /data/outbox.db)
     volumes:
       - ./group-watcher/watcher.py:/app/watcher.py:ro
+      - ./events/outbox.py:/app/outbox.py:ro
       - ./group-watcher/services.json:/app/services.json:ro
       - ./group-watcher/samples.json:/app/samples.json:ro
       - ./group-watcher/faq.py:/app/faq.py:ro
@@ -211,9 +220,42 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    mem_limit: 128m
+    mem_limit: 192m
     depends_on:
       litellm: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # The event bus between the roles (orchestrator/main.py): producers POST events to :8080/events (ORCH_TOKEN), the
+  # worker runs the roles on Hatchet. Role «card»: the resident's card and the funnel stage in Twenty.
+  orchestrator:
+    build:
+      context: ./orchestrator
+    image: salesbot/orchestrator:local
+    networks: [default]
+    environment:
+      ORCH_TOKEN: ${ORCH_TOKEN:?}
+      HATCHET_CLIENT_TOKEN: ${HATCHET_CLIENT_TOKEN:-}
+      HATCHET_CLIENT_HOST_PORT: hatchet:7077
+      HATCHET_CLIENT_SERVER_URL: http://hatchet:8888
+      HATCHET_CLIENT_TLS_STRATEGY: none
+      TWENTY_URL: http://twenty:3000
+      TWENTY_API_KEY: ${TWENTY_API_KEY:-}
+      CW_PUBLIC_URL: https://${PUBLIC_DOMAIN:?}
+      CW_ACCOUNT_ID: ${GW_CW_ACCOUNT_ID:-1}
+      DB_PATH: /data/processed.db
+    volumes:
+      - orchestrator_data:/data
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    depends_on:
+      hatchet: { condition: service_started }
+      twenty: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
       interval: 15s
@@ -249,10 +291,16 @@ services:
       CW_ACCOUNT_ID: ${GW_CW_ACCOUNT_ID:-1}
       CW_API_TOKEN: ${GW_CW_TOKEN:-}
       CW_INBOX_ID: ${VOICE_CW_INBOX_ID:-2}
+      ORCH_TOKEN: ${ORCH_TOKEN:-}  # call.ended to the orchestrator (events/outbox.py, queue in /data/outbox.db)
+      # Each call as a trace in the self-hosted Langfuse (Pipecat OpenTelemetry; never the cloud).
+      LANGFUSE_HOST: http://langfuse-web:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
     volumes:
       - ./group-watcher/services.json:/app/services.json:ro
       - ./kb/pages:/app/kb:ro
       - ./voice/campaigns.json:/app/campaigns.json:ro
+      - ./events/outbox.py:/app/outbox.py:ro
       - voice_data:/data
     read_only: true
     tmpfs: [/tmp]
@@ -398,4 +446,5 @@ volumes:
   caddy_data:
   caddy_config:
   gw_data:
+  orchestrator_data:
   voice_data:

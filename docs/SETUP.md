@@ -2,7 +2,8 @@
 
 Стек работает на ВМ Google Cloud компании e-KNOT (проект, зона, имя ВМ, домен и бакет в `deploy/gcp.env`).
 Внутри Docker Compose: Chatwoot-форк fazer.ai со встроенным WhatsApp-коннектором, fazer.ai agents, LiteLLM
-(шлюз к Gemini на Vertex AI), group-watcher, тестовая диспетчерская, локальный STT, Caddy.
+(шлюз к Gemini на Vertex AI), group-watcher, голосовой агент, тестовая диспетчерская, локальный STT, Caddy; платформа
+(`stack/platform.yml`): карточки жильцов в Twenty, шина событий Hatchet и orchestrator, трассировка в Langfuse.
 **Только тестовые данные. Секреты только в Secret Manager, в репозитории их нет.**
 
 ## Состав репозитория
@@ -17,7 +18,10 @@
 | `deploy/vm/provision.sh` | разовая подготовка ВМ: Docker из apt, ротация логов, swap, каталог стека, таймер бэкапа |
 | `deploy/vm/fetch-vendor.sh` | клонирует `vendor/` по `vendor.lock` и накладывает `stack/patches` |
 | `deploy/vm/backup.sh` | ночной `pg_dump` обеих баз прямо в `gs://<бакет>/backups/` (хранение 30 дней) |
-| `stack/docker-compose.yml` | стек |
+| `stack/docker-compose.yml` | стек; подключает `stack/platform.yml` (Twenty, Hatchet, Langfuse, их Postgres, Redis, ClickHouse, MinIO) |
+| `stack/platform/setup.py` | первая настройка платформы: токен Hatchet, рабочее пространство и ключ Twenty, поля и стадии карточек |
+| `stack/orchestrator/` | события → Hatchet → роли; первая роль `card`: карточка жильца в Twenty (`cards.py`), воронка (`funnel.py`) |
+| `stack/events/outbox.py` | очередь событий в сервисе-источнике (SQLite): ничего не теряется, пока orchestrator недоступен |
 | `stack/render-env.sh` | на ВМ собирает `stack/.env` (600) из Secret Manager через сервисный аккаунт ВМ, печатает только имена |
 | `stack/bootstrap.py` | настройка Chatwoot и agents по шагам (`python3 -I bootstrap.py` без аргументов печатает список) |
 | `stack/litellm/config.yaml` | модели Gemini и жёсткие лимиты rpm/rpd на каждую |
@@ -47,6 +51,7 @@ deploy/ssh.sh 'cd /srv/salesbot/stack && ./render-env.sh && docker compose build
 deploy/ssh.sh 'cd /srv/salesbot/stack && python3 -I bootstrap.py all'    # Chatwoot, agents, vault, бот поддержки, база, макрос
 deploy/ssh.sh 'cd /srv/salesbot/stack && python3 -I bootstrap.py group-watcher && python3 -I bootstrap.py seller'
 deploy/ssh.sh 'cd /srv/salesbot/stack && docker compose up -d --force-recreate group-watcher'  # прочитать GW_*
+deploy/ssh.sh 'cd /srv/salesbot/stack && python3 -I platform/setup.py all && docker compose up -d'  # Hatchet, Twenty
 ```
 
 Секреты с пометкой `manual` в `deploy/secrets.map` (токены Meta) вносятся руками через stdin:
@@ -54,8 +59,9 @@ deploy/ssh.sh 'cd /srv/salesbot/stack && docker compose up -d --force-recreate g
 передаются аргументом и не печатаются. `deploy/secrets.sh` не меняет уже заданные значения: новый
 `agents-encryption-key` сделал бы нечитаемым vault agents, новый пароль БД закрыл бы доступ к существующему тому.
 
-`bootstrap.py` пишет учётные данные только на ВМ: `~/secrets/chatwoot-admin.env`, `~/secrets/agents-admin.env`
-(600). Посмотреть пароль: в своём терминале, не в чате с ИИ.
+Учётные данные остаются только на ВМ (файлы 600): `bootstrap.py` пишет `~/secrets/chatwoot-admin.env` и
+`~/secrets/agents-admin.env`, `platform/setup.py` пишет `~/secrets/platform-admin.env` (адреса и логины; пароли
+`*_ADMIN_PASSWORD` в `stack/.env`). Посмотреть пароль: в своём терминале, не в чате с ИИ.
 
 ## Обновление
 
@@ -64,14 +70,16 @@ deploy/sync.sh
 deploy/ssh.sh 'cd /srv/salesbot/stack && docker compose up -d'           # пересоздаёт изменившиеся сервисы
 ```
 
-- Файлы, смонтированные в контейнер (`watcher.py`, `services.json`, `tickets/server.py`, `litellm/config.yaml`),
-  подхватываются только после `docker compose up -d --force-recreate <сервис>`.
+- Файлы, смонтированные в контейнер (`watcher.py`, `services.json`, `events/outbox.py`, `tickets/server.py`,
+  `litellm/config.yaml`), подхватываются только после `docker compose up -d --force-recreate <сервис>`: `sync.sh`
+  заменяет файл новым, а контейнер до пересоздания видит старый.
 - Промпты, база знаний и настройки агентов живут в agents: после правки `stack/agent/*` или `services.json`
   запустить нужный шаг (`agent`, `knowledge`, `seller`). Повторный запуск перезапишет ручные правки в консоли agents.
 - Новая версия vendor: поменять коммит в `deploy/vendor.lock`, `fetch-vendor.sh`, `docker compose build <сервис>`,
   затем оба набора сценариев (ниже).
 - Новый секрет: `deploy/secrets.sh`, затем на ВМ `./render-env.sh` и `docker compose up -d`. `render-env.sh`
-  сохраняет ключи, которые записал `bootstrap.py` (`CW_TGU_*`, `GW_*`).
+  сохраняет ключи, которые записали `bootstrap.py` и `platform/setup.py` (`CW_TGU_*`, `GW_*`, `HATCHET_*`,
+  `TWENTY_API_KEY`).
 
 ### База знаний продавца
 
@@ -88,7 +96,8 @@ deploy/ssh.sh 'cd /srv/salesbot/stack && docker compose up -d'           # пе�
 | Chatwoot (оператор) | `https://sales-bot.eknot.kz` (`PUBLIC_DOMAIN`); без него туннель `deploy/ssh.sh -- -N -L 3000:127.0.0.1:3000` и http://localhost:3000 | `curl -s localhost:3000/api` → 200 |
 | agents (консоль, playground) | только туннель: `deploy/ssh.sh -- -N -L 3100:127.0.0.1:3100`, http://localhost:3100 | `curl -s localhost:3100/api/health` |
 | LiteLLM | только туннель: `deploy/ssh.sh -- -N -L 4000:127.0.0.1:4000`, ключ `LITELLM_MASTER_KEY` | `/health/liveliness` |
-| Postgres ×2, Redis, tickets, stt, group-watcher | только внутри docker-сети ВМ | `docker compose ps` → healthy |
+| Twenty (карточки), Langfuse (трассы), Hatchet (события, запуски ролей) | только туннель: `deploy/ssh.sh -- -N -L 3300:127.0.0.1:3300 -L 3200:127.0.0.1:3200 -L 8888:127.0.0.1:8888`, затем http://localhost:3300, :3200, :8888; логины в `~/secrets/platform-admin.env` | `docker compose ps` → healthy |
+| Postgres ×3, Redis ×2, ClickHouse, MinIO, tickets, stt, group-watcher, orchestrator | только внутри docker-сети ВМ | `docker compose ps` → healthy |
 
 Наружу открыты только 80 и 443 (Caddy). Сертификат Caddy получит, когда `PUBLIC_DOMAIN` начнёт указывать на
 внешний IP ВМ. Логи: `deploy/ssh.sh 'cd /srv/salesbot/stack && docker compose logs -f agents'`. Стек
@@ -252,6 +261,7 @@ group-watcher.
 
 ```sh
 python3 -I stack/group-watcher/test_watcher.py                       # ноутбук, логика без сети
+python3 -I stack/events/test_outbox.py && (cd stack/orchestrator && python3 -I test_funnel.py)   # очередь, воронка
 deploy/ssh.sh 'cd /srv/salesbot/stack && python3 -I tests/scenarios.py'            # бот поддержки, 14 сценариев
 deploy/ssh.sh 'cd /srv/salesbot/stack && python3 -I tests/scenarios.py --seller'   # продавец, 15 сценариев
 deploy/ssh.sh 'cd /srv/salesbot/stack && docker compose exec -T group-watcher python3 -I /app/watcher.py eval /app/samples.json'
@@ -309,6 +319,49 @@ import sqlite3; c=sqlite3.connect(\"/data/voice.db\")
 print(c.execute(\"SELECT id, door, round(ended_at-started_at), transcript FROM calls ORDER BY id DESC LIMIT 3\").fetchall())"'
 ```
 
+## Карточки жильцов, события, трассировка
+
+Каждое касание с жильцом оставляет след в его карточке в Twenty (CRM, открытый код):
+
+| Twenty | У нас |
+|---|---|
+| Company | дом или ЖК (название группы WhatsApp, дом из заявки со звонка) |
+| Person | жилец; ключ: id контакта Chatwoot, ссылка на контакт, роль (председатель, совет, УК, собственник), отказ от сообщений, последний канал, итог последнего звонка |
+| Opportunity | интерес к одной услуге e-KNOT: стадия, источник, цитата из группы, ссылка на диалог, причина отказа |
+| Note | касание на ленте: потребность с цитатой, отправленное предложение, первый ответ, заметка для менеджера, итог звонка со стенограммой |
+| Task | перезвонить, если человек попросил («перезвоните вечером») |
+
+Стадии (`orchestrator/funnel.py`): `NEW` (нашли потребность) → `OFFERED` (написали в личку) → `REPLIED` (ответил) →
+`QUALIFIED` → `LEAD` (заявка: передан менеджеру или оставил заявку в звонке) → `CUSTOMER`; `LOST` («стоп») из любой.
+Стадия двигается только вперёд, повторная потребность не откатывает карточку. Закрытая `LOST` открывается снова
+только заявкой.
+
+**Как событие доходит до карточки.** Сервис пишет событие в свою очередь (`events/outbox.py`, SQLite рядом с его
+базой) и дальше о нём не думает. Поток очереди отправляет его в orchestrator (`POST /events`, токен `ORCH_TOKEN`),
+тот кладёт его в Hatchet и отвечает 202; только тогда событие удаляется из очереди. Hatchet запускает роль `card`:
+3 повтора с паузой, события одного жильца по одному и по порядку, повтор того же события не дублирует запись.
+Если orchestrator, Hatchet или Twenty лежат, события ждут и доходят потом.
+
+| Событие | Кто | Когда |
+|---|---|---|
+| `need.detected` | group-watcher | потребность в группе (уверенность от 0.7) |
+| `offer.sent` | group-watcher | предложение ушло в личку |
+| `dm.replied` | group-watcher | первый ответ жильца на наше предложение |
+| `lead.handoff` | group-watcher | продавец оставил менеджеру заметку перед передачей (`seller-prompt.md`) |
+| `optout` | group-watcher | «стоп» в группе или в личке |
+| `call.ended` | voice | любой звонок с номера WhatsApp: направление, повод, итог, заявка, когда перезвонить, стенограмма |
+
+Новая роль (подсказки оператору, мониторинг, аналитик) подписывается на те же события в `orchestrator/main.py`,
+источники при этом не меняются. История, накопленная до карточек: `docker compose exec group-watcher python3 -I
+/app/watcher.py events-backfill` (повторный запуск ничего не дублирует).
+
+**Langfuse** (свой, на ВМ, в облако Langfuse ничего не уходит): каждый вызов модели через LiteLLM (group-watcher,
+продавец, бот поддержки, эмбеддинги) с промптом, ответом, токенами и задержкой; каждый звонок одной трассой
+(`call-<id>` в сессии): разговор → реплики → Gemini Live, вызовы инструментов и их результаты.
+
+Платформа занимает около 12 ГБ лимитов памяти (ClickHouse 3 ГБ, Twenty 2.5 ГБ). Ночной бэкап включает базу Twenty;
+трассы и запуски Hatchet не выгружаются.
+
 ## Путь B: официальный WhatsApp Cloud API
 
 Путь A пишет в личку с того же номера WhatsApp, что читает группу. Путь B пишет с номера Cloud API: первое
@@ -341,13 +394,15 @@ group-watcher уже умеет оба пути, нужен только inbox.
 
 ## Бэкап
 
-Ночью (03:15 UTC, таймер `salesbot-backup`) `deploy/vm/backup.sh` выгружает базы Chatwoot (`chatwoot_production`) и agents прямо в бакет,
+Ночью (03:15 UTC, таймер `salesbot-backup`) `deploy/vm/backup.sh` выгружает базы Chatwoot (`chatwoot_production`),
+agents и Twenty (карточки) прямо в бакет,
 без записи на диск. БД WhatsApp-коннектора не выгружается (это секрет, см. выше). Восстановление из бэкапа ещё не
 проверялось.
 
 ## Внешние обращения стека
 
-- agents: `FAZER_AI_HUB_URL=""`, к app.fazer.ai не ходит. Chatwoot: `DISABLE_TELEMETRY=true`.
+- agents: `FAZER_AI_HUB_URL=""`, к app.fazer.ai не ходит. Chatwoot: `DISABLE_TELEMETRY=true`. Langfuse, Twenty,
+  Hatchet: телеметрия выключена, иконки Twenty не загружаются, LiteLLM и голос шлют трассы только в свой Langfuse.
 - Наружу ходят: LiteLLM в Vertex AI, коннектор в WhatsApp (и UDP 40000 для голоса), tg-userbot в Telegram (MTProto,
   когда профиль запущен), Caddy в Let's Encrypt.
 - Установщик fazer.ai (`install.sh`) не используется: он требует OAuth-входа на app.fazer.ai.
@@ -360,7 +415,9 @@ group-watcher уже умеет оба пути, нужен только inbox.
 - [x] Голос: обзвон по списку с повторами (`voice/obzvon.py`).
 - [ ] Голос: два звонка одновременно на одном аккаунте WhatsApp не проверены; перезвон точно ко времени, которое
   назвал человек.
-- [ ] Telegram-userbot: вход отдельным тестовым аккаунтом, затем `bootstrap.py tg-userbot`.
+- [ ] Telegram-userbot: вход выполнен (тестовая SIM), осталось `bootstrap.py tg-userbot` и запуск профиля.
+- [x] Карточки жильцов в Twenty из событий group-watcher и голоса; трассы LLM и звонков в Langfuse.
+- [ ] Продавец и бот поддержки пока не шлют свои события (`lead.qualified`), стадия `QUALIFIED` не используется.
 - [ ] Проверить восстановление из бэкапа на пустой копии.
 - [ ] Окно приёма показаний 20–25 инструмент не проверяет.
 - [ ] Upstream: `dimensions` эмбеддингов (fazer-ai/agents), `call.start` со `stream` (fazer-ai/whatsapp-connector).

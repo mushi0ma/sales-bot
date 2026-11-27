@@ -25,7 +25,12 @@ router_settings:
 
 litellm_settings:
   drop_params: true                 # OpenAI-only knobs (e.g. reasoning effort) are dropped, not rejected
-  turn_off_message_logging: true    # no prompt or reply text in LiteLLM logs
+  # Every call, its text, tokens and latency -> our Langfuse (stack/platform.yml, on this VM). The switch below
+  # also applies to callbacks, so it stays off; LiteLLM's own log is WARNING and prints no text.
+  turn_off_message_logging: false
+  # Langfuse v4 takes OpenTelemetry only (events_only mode); the endpoint is LANGFUSE_HOST + /api/public/otel.
+  # Without LANGFUSE_HOST the integration would send to Langfuse Cloud: compose sets it to our container.
+  callbacks: ["langfuse_otel"]
   telemetry: false
 
 general_settings:

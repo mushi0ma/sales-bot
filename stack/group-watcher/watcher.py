@@ -26,6 +26,7 @@ CLI: watcher.py serve | stats | eval SAMPLES.json (classifier precision/recall o
        lead, delivery and read status, replies within 24 h, opt-outs; reads offer conversations from Chatwoot)
      | faq (cached group answers) | faq-ask "QUESTION" (what the group would get; caches, posts nothing)
      | faq-off ID (retire a cached answer)
+     | events-backfill (replay needs, offers, replies, handoffs, opt-outs into the cards in Twenty; idempotent)
 """
 import hashlib, hmac, json, logging, os, re, sqlite3, statistics, sys, threading, time, urllib.error, urllib.request
 from datetime import datetime, timedelta, timezone
@@ -93,6 +94,22 @@ def load_catalog(path=CATALOG_PATH):
 CATALOG = load_catalog()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # -I leaves the script's folder off sys.path
 import faq as faqmod  # noqa: E402
+
+# Events to the orchestrator (the resident's card and funnel in Twenty): need.detected, offer.sent, dm.replied,
+# lead.handoff, optout. Set in `serve` (events/outbox.py, mounted next to this file); None in tests and CLI.
+EVENTS = None
+
+
+def emit(type, contact_id, data=None, **kw):
+    if EVENTS is not None:
+        try:
+            EVENTS.emit(type, contact_id, data, **kw)
+        except Exception as e:  # the card is a side channel: never break the group flow for it
+            log.warning("event %s: %s", type, str(e)[:160])
+
+
+def service_name(service, catalog=None):
+    return ((catalog or CATALOG).get(service) or {}).get("name") or service
 
 
 # ---------------------------------------------------------------- storage
@@ -410,6 +427,10 @@ def send_offer(need_id):
     x("UPDATE needs SET status='sent', path=?, offer_conv_id=?, sent_at=? WHERE id=?",
       (path, c["id"], time.time(), need_id))
     log.info("need=%s sent: conversation=%s service=%s path=%s", need_id, c["id"], n["service"], path)
+    emit("offer.sent", n["contact_id"], {"service": n["service"], "service_name": service_name(n["service"]),
+                                         "need_id": need_id, "path": path, "cw_conversation_id": c["id"],
+                                         "text": message.get("content") if isinstance(message, dict) else None},
+         name=n["author"], house=n["group_name"], once=f"offer:{need_id}")
     st, _ = cw("POST", f"/conversations/{c['id']}/custom_attributes",
                {"custom_attributes": {OFFER_ATTR: offer_context(dict(n))}})
     if st >= 300:
@@ -439,6 +460,11 @@ def handle_need(need, mode=None):
         return
     if need["confidence"] >= MIN_CONFIDENCE:
         note(need["conv_id"], card_text(need_id, need, stored, why))
+        emit("need.detected", need["contact_id"], {
+            "service": need["service"], "service_name": service_name(need["service"]), "quote": need["quote"],
+            "group": need.get("group_name"), "need_id": need_id, "confidence": need["confidence"],
+            "decision": stored_full, "cw_conversation_id": need["conv_id"]},
+            name=need.get("author"), house=need.get("group_name"), once=f"need:{need_id}", at=need.get("message_at"))
     log.info("need=%s message=%s service=%s conf=%.2f -> %s%s", need_id, need["message_id"], need["service"],
              need["confidence"], status, f" ({why})" if why else "")
     if status == "send":
@@ -459,6 +485,7 @@ def opt_out(contact_id, conv_id=None, individual=False):
         if st not in (200, 201):
             log.warning("optout reply conversation=%s HTTP %s", conv_id, st)
     log.info("optout contact=%s", contact_id)
+    emit("optout", contact_id, {"cw_conversation_id": conv_id, "where": "dm" if individual else "group"})
 
 
 def operator_command(text):
@@ -564,6 +591,17 @@ def intake(p):
             threading.Thread(target=operator_command, args=(text,), daemon=True).start()
             return "command"
         return "ignored:note"
+    if (p.get("private") and sender.get("type") == "agent_bot" and conv.get("group_type") != "group"
+            and conv.get("id")):
+        # The seller leaves a private note for the manager right before handoff_to_human (seller-prompt.md).
+        contact = ((conv.get("meta") or {}).get("sender") or {})
+        offer = q("SELECT service FROM needs WHERE offer_conv_id=? ORDER BY id DESC LIMIT 1", (conv["id"],))
+        emit("lead.handoff", contact.get("id") or (conv.get("contact_inbox") or {}).get("contact_id"), {
+            "note": text[:800], "cw_conversation_id": conv["id"], "inbox_id": conv.get("inbox_id"),
+            "service": offer[0]["service"] if offer else None,
+            "service_name": service_name(offer[0]["service"]) if offer else None},
+            name=contact.get("name"), phone=contact.get("phone_number"), once=f"handoff:{p.get('id')}")
+        return "lead"
     if p.get("message_type") != "incoming" or not sender.get("id") or sender.get("type") not in (None, "contact"):
         return "ignored:not_incoming"
     group = conv.get("group_type") == "group"
@@ -571,6 +609,13 @@ def intake(p):
         threading.Thread(target=opt_out, args=(sender["id"], conv.get("id"), not group), daemon=True).start()
         return "optout"
     if not group:
+        offer = q("SELECT service FROM needs WHERE offer_conv_id=? ORDER BY id DESC LIMIT 1", (conv.get("id"),))
+        if offer:  # the first answer to our offer moves the card to REPLIED (once per conversation)
+            emit("dm.replied", sender["id"], {"service": offer[0]["service"],
+                                              "service_name": service_name(offer[0]["service"]),
+                                              "text": text[:500], "cw_conversation_id": conv.get("id")},
+                 name=sender.get("name"), phone=sender.get("phone_number"), once=f"reply:{conv.get('id')}")
+            return "ignored:individual:replied"
         return "ignored:individual"
     if WATCH_LABEL not in (conv.get("labels") or []):
         return "ignored:group_not_allowed"
@@ -743,6 +788,45 @@ def offer_outcome(n, optout_at):
             "handoff": (conv or {}).get("status") == "open"}
 
 
+def backfill_events():
+    """Replay the history into the orchestrator (cards in Twenty): every need, offer, first reply, handoff and
+    opt-out we have, in time order. Safe to rerun: each event has its `once` key, the same the live hooks use."""
+    global EVENTS
+    sys.path.insert(1, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "events"))
+    from outbox import Outbox
+    EVENTS = Outbox(os.path.join(os.path.dirname(DB_PATH), "outbox.db"), "group-watcher")  # serve's thread sends
+    if not EVENTS.enabled:
+        sys.exit("ORCH_TOKEN is empty")
+    queued = []
+    for n in map(dict, q("SELECT * FROM needs WHERE confidence >= ? ORDER BY message_at", (MIN_CONFIDENCE,))):
+        svc = {"service": n["service"], "service_name": service_name(n["service"])}
+        queued.append((n["message_at"], "need.detected", n["contact_id"], dict(svc, quote=n["quote"],
+                       group=n["group_name"], need_id=n["id"], confidence=n["confidence"], decision=n["status"],
+                       cw_conversation_id=n["conv_id"]), n, f"need:{n['id']}"))
+        if n["status"] != "sent" or not n["offer_conv_id"]:
+            continue
+        queued.append((n["sent_at"], "offer.sent", n["contact_id"], dict(svc, need_id=n["id"], path=n["path"],
+                       cw_conversation_id=n["offer_conv_id"]), n, f"offer:{n['id']}"))
+        st, msgs = cw("GET", f"/conversations/{n['offer_conv_id']}/messages")
+        msgs = sorted((msgs or {}).get("payload") or [] if st == 200 else [], key=lambda m: m.get("created_at", 0))
+        reply = next((m for m in msgs if not m.get("private") and m.get("message_type") == 0), None)
+        if reply:
+            queued.append((reply["created_at"], "dm.replied", n["contact_id"], dict(svc, text=(reply.get("content") or "")[:500],
+                           cw_conversation_id=n["offer_conv_id"]), n, f"reply:{n['offer_conv_id']}"))
+        hand = next((m for m in msgs if m.get("private") and (m.get("sender") or {}).get("type") == "agent_bot"), None)
+        if hand:
+            queued.append((hand["created_at"], "lead.handoff", n["contact_id"], dict(svc, note=(hand.get("content") or "")[:800],
+                           cw_conversation_id=n["offer_conv_id"]), n, f"handoff:{hand['id']}"))
+    for o in q("SELECT contact_id, at FROM optout"):
+        queued.append((o["at"], "optout", o["contact_id"], {"where": "history"}, {}, f"optout:{o['contact_id']}"))
+    sent = 0
+    for at, type, contact, data, n, once in sorted(queued, key=lambda t: t[0] or 0):
+        if EVENTS.emit(type, contact, data, name=n.get("author") if n else None,
+                       house=n.get("group_name") if n else None, once=once, at=at):
+            sent += 1
+    print(f"queued {sent} of {len(queued)} events (the rest were sent before); the service delivers them")
+
+
 def report(days=1.0):
     since = time.time() - days * 86400
     msgs = q("SELECT COUNT(*) AS n FROM messages WHERE created_at >= ?", (since,))[0]["n"]
@@ -814,6 +898,9 @@ def main():
         report(float(sys.argv[2]) if len(sys.argv) == 3 else 1.0)
     elif cmd == "forget" and len(sys.argv) == 3 and sys.argv[2].isdigit():
         forget(int(sys.argv[2]))
+    elif cmd == "events-backfill":
+        db()
+        backfill_events()
     elif cmd == "faq":
         for r in q("SELECT id, hits, kb_version, disabled, datetime(created_at,'unixepoch') AS at, question, answer, "
                    "conv_id, author FROM faq ORDER BY hits DESC, id DESC"):
@@ -835,6 +922,11 @@ def main():
         if SEND_MODE not in ("auto", "approve", "dry"):
             sys.exit(f"SEND_MODE must be auto, approve or dry, not {SEND_MODE!r}")
         db()
+        global EVENTS
+        sys.path.insert(1, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "events"))
+        from outbox import Outbox
+        EVENTS = Outbox(os.path.join(os.path.dirname(DB_PATH), "outbox.db"), "group-watcher").start()
+        log.info("events: %s", "on" if EVENTS.enabled else "off (no ORCH_TOKEN)")
         threading.Thread(target=loop, daemon=True).start()
         log.info("serving :8080 mode=%s label=%s model=%s", SEND_MODE, WATCH_LABEL, LLM_MODEL)
         ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()

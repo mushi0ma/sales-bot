@@ -17,6 +17,9 @@
 - **Обзвон:** помощник сам звонит жильцу от имени председателя (сбор голосов, напоминание о взносах) и записывает
   итог. Звонит только тестировщикам, с 09:00 до 21:00 по Астане.
 - Итоги звонков, заявки и стенограммы видны оператору в Chatwoot (приватная заметка в диалоге, метки `call`, `lead`).
+- **Карточка жильца** в Twenty собирает всё о человеке: дом, роль, интерес к каждой услуге со стадией воронки
+  (нашли потребность → написали → ответил → заявка, или «стоп»), ленту касаний со ссылками на диалоги и стенограммами
+  звонков, задачу перезвонить. Каждый вызов модели и каждый звонок виден трассой в Langfuse.
 
 ## Как устроено
 
@@ -25,8 +28,13 @@ WhatsApp ─ whatsmeow (в Chatwoot) ─┬─ группа ─ вебхук ─
                                    │                                    └─ ответ в группе на повторный вопрос
                                    ├─ личка ─ fazer.ai agents (продавец: база знаний, проверка фактов)
                                    └─ звонок ─ WebSocket ─ voice (Pipecat + Gemini Live) ─ заметка в Chatwoot
-                                         все модели через LiteLLM ─ Gemini (Vertex AI)
+
+group-watcher, voice ─ события (очередь в каждом) ─ orchestrator ─ Hatchet ─ роль card ─ Twenty (карточки)
+LiteLLM ─ Gemini (Vertex AI); трассы LiteLLM и звонков ─ Langfuse
 ```
+
+События (`need.detected`, `offer.sent`, `dm.replied`, `lead.handoff`, `optout`, `call.ended`) отделяют источники от
+того, что с ними делают: новая роль подписывается на них в orchestrator, group-watcher и голос не меняются.
 
 | Путь | Что |
 |---|---|
@@ -37,12 +45,15 @@ WhatsApp ─ whatsmeow (в Chatwoot) ─┬─ группа ─ вебхук ─
 | `stack/kb/` | снимки страниц услуг eknot.me; `refresh.py` раз в неделю показывает, что изменилось на сайте |
 | `stack/tg-userbot/` | Telegram через обычный аккаунт (userbot), как в WhatsApp; ждёт входа тестовым аккаунтом |
 | `stack/patches/` | наши патчи к vendor: звонки WhatsApp голосовому агенту, исходящий звонок со `stream`, эмбеддинги |
+| `stack/orchestrator/`, `stack/events/` | шина событий: очередь в сервисе-источнике, приём, роль `card` (карточка в Twenty, воронка в `funnel.py`) |
+| `stack/platform.yml`, `stack/platform/` | Twenty, Hatchet, Langfuse и их хранилища; `setup.py`: токены, поля и стадии карточек |
 | `stack/litellm/config.yaml` | единый вход к Gemini, жёсткие лимиты запросов в минуту и в день на каждую модель |
 | `stack/bootstrap.py` | настройка Chatwoot и agents: агенты, инструменты, база знаний, вебхуки |
 | `stack/tests/` | сценарии через настоящий конвейер agents: 14 для бота поддержки, 15 для продавца |
 | `deploy/` | деплой на ВМ Google Cloud через IAP, секреты из Secret Manager, ночной бэкап в Cloud Storage |
 
-Проверки: `python3 -I stack/group-watcher/test_watcher.py` (логика без сети); на ВМ
+Проверки: `python3 -I stack/group-watcher/test_watcher.py`, `stack/events/test_outbox.py`,
+`stack/orchestrator/test_funnel.py` (логика без сети); на ВМ
 `docker compose exec group-watcher python3 -I /app/watcher.py eval /app/samples.json` (точность и полнота
 распознавания), `python3 -I tests/scenarios.py` и `--seller`. Цифры для ежедневного отчёта:
 `docker compose exec group-watcher python3 -I /app/watcher.py report [дней]` (воронка от сообщения в группе до лида).

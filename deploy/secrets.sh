@@ -22,6 +22,7 @@ gen() {
     gen:hex:*) openssl rand -hex "${1#gen:hex:}" | tr -d '\n' ;;
     gen:sk)    printf 'sk-%s' "$(openssl rand -hex 32)" ;;
     gen:pass)  printf '%sAa1!' "$(openssl rand -hex 16)" ;;
+    gen:pfx:*) p="${1#gen:pfx:}"; printf '%s%s' "${p%:*}" "$(openssl rand -hex "${p##*:}")" ;;
   esac
 }
 case "${1:-status}" in

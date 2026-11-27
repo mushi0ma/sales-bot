@@ -52,6 +52,12 @@ CW_URL = E("CW_URL", "http://cw-rails:3000").rstrip("/")
 CW_ACCOUNT_ID = E("CW_ACCOUNT_ID", "1")
 CW_TOKEN = E("CW_API_TOKEN", "")
 CW_INBOX_ID = int(E("CW_INBOX_ID", "2"))  # the WhatsApp inbox the test number lives in
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # outbox.py is mounted next to bot.py
+try:
+    from outbox import Outbox  # stack/events/outbox.py: call.ended to the orchestrator (the card in Twenty)
+    EVENTS = Outbox(str(Path(E("DB_PATH", "/data/voice.db")).with_name("outbox.db")), "voice").start()
+except ImportError:
+    EVENTS = None
 CATALOG = json.loads(Path(E("CATALOG_PATH", "/app/services.json")).read_text(encoding="utf-8"))
 SERVICES = {s["id"]: s for s in CATALOG["services"]}
 KB_DIR = Path(E("KB_DIR", "/app/kb"))
@@ -62,6 +68,25 @@ CAMPAIGNS = {k: v for k, v in (json.loads(_cp.read_text(encoding="utf-8")) if _c
 # Pipecat logs the system prompt, tool arguments and transcripts at DEBUG; the transcript lives in voice.db only.
 logger.remove()
 logger.add(sys.stderr, level=E("PIPECAT_LOG_LEVEL", "INFO"))
+
+
+def setup_tracing():
+    """Every call as one trace in the self-hosted Langfuse (OTLP/HTTP): Pipecat's conversation > turn > Gemini Live
+    spans with setup, tool calls and results. Off without the Langfuse keys or the OpenTelemetry packages."""
+    pk, sk, host = E("LANGFUSE_PUBLIC_KEY", ""), E("LANGFUSE_SECRET_KEY", ""), E("LANGFUSE_HOST", "").rstrip("/")
+    if not (pk and sk and host):
+        return False
+    try:
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from pipecat.utils.tracing.setup import setup_tracing as pipecat_tracing
+    except ImportError:
+        return False
+    auth = base64.b64encode(f"{pk}:{sk}".encode()).decode()
+    return pipecat_tracing("voice", exporter=OTLPSpanExporter(endpoint=f"{host}/api/public/otel/v1/traces",
+                                                              headers={"Authorization": f"Basic {auth}"}))
+
+
+TRACING = setup_tracing()
 log = logging.getLogger("voice")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 db = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
@@ -175,7 +200,8 @@ def cw(method, path, body=None):
 
 
 def conversation_for(phone):
-    """The person's WhatsApp conversation id: their latest one in CW_INBOX_ID, else a new one; a new contact too."""
+    """(conversation id, contact) of the person in CW_INBOX_ID: their latest conversation, else a new one; a new
+    contact too."""
     st, b = cw("GET", f"/contacts/search?q={phone}")
     contact = next((c for c in (b or {}).get("payload", []) if re.sub(r"\D", "", c.get("phone_number") or "") == phone),
                    None)
@@ -187,14 +213,14 @@ def conversation_for(phone):
     st, b = cw("GET", f"/contacts/{contact['id']}/conversations")
     convs = [c for c in (b or {}).get("payload", []) if c.get("inbox_id") == CW_INBOX_ID]
     if convs:
-        return max(convs, key=lambda c: c.get("last_activity_at") or 0)["id"]
+        return max(convs, key=lambda c: c.get("last_activity_at") or 0)["id"], contact
     st, b = cw("GET", f"/contacts/{contact['id']}/contactable_inboxes")
     src = next((e.get("source_id") for e in (b or {}).get("payload", []) if (e.get("inbox") or {}).get("id") == CW_INBOX_ID),
                None)
     st, c = cw("POST", "/conversations", {"inbox_id": CW_INBOX_ID, "contact_id": contact["id"], "source_id": src})
     if st >= 300 or not (c or {}).get("id"):
         raise RuntimeError(f"create conversation HTTP {st}")
-    return c["id"]
+    return c["id"], contact
 
 
 def call_note(call_id):
@@ -224,15 +250,52 @@ def to_chatwoot(call_id, peer):
     if not CW_TOKEN or not (10 <= len(phone) <= 15):
         return
     try:
-        conv = conversation_for(phone)
+        conv, contact = conversation_for(phone)
         note, lead = call_note(call_id)
         st, _ = cw("POST", f"/conversations/{conv}/messages", {"content": note, "private": True})
         _, b = cw("GET", f"/conversations/{conv}/labels")
         labels = sorted(set((b or {}).get("payload", [])) | {"call"} | ({"lead"} if lead else set()))
         st2, _ = cw("POST", f"/conversations/{conv}/labels", {"labels": labels})
         log.info("call=%s note in conversation=%s HTTP %s, labels HTTP %s", call_id, conv, st, st2)
+        call_event(call_id, conv, contact, phone)
     except Exception as e:  # the call is in voice.db either way
         log.warning("call=%s chatwoot note failed: %s", call_id, str(e)[:160])
+
+
+LEAD_SERVICE = [("online_voting", ("голосован", "опрос")), ("online_meetings", ("собрани", "zoom")),
+                ("convening_assembly", ("созыв",)), ("debt_collection", ("долг", "должник")),
+                ("dispatcher", ("диспетчер", "заявк")), ("accounting", ("бухгалтер",)),
+                ("payments", ("платеж", "платёж", "оплат")), ("legal_auditor", ("аудитор", "юрист", "закон"))]
+
+
+def call_event(call_id, conv, contact, phone):
+    """call.ended to the orchestrator: the resident's card in Twenty (outcome, lead, transcript on the timeline)."""
+    if EVENTS is None:
+        return
+    door, campaign, started, ended, transcript = db.execute(
+        "SELECT door, campaign, started_at, ended_at, transcript FROM calls WHERE id=?", (call_id,)).fetchone()
+    turns = json.loads(transcript)
+    o = db.execute("SELECT result, note, callback FROM outcomes WHERE call_id=? ORDER BY id DESC LIMIT 1",
+                   (call_id,)).fetchone()
+    lead = db.execute("SELECT data FROM leads WHERE call_id=? ORDER BY id DESC LIMIT 1", (call_id,)).fetchone()
+    lead = json.loads(lead[0]) if lead else None
+    c = CAMPAIGNS.get(campaign) or {}
+    data = {"direction": "out" if door == "wa-out" else "in", "campaign": campaign, "campaign_title": c.get("title"),
+            "secs": int((ended or started) - started), "answered": bool(turns), "cw_conversation_id": conv,
+            "call_id": call_id, "outcome": o[0] if o else ("no_answer" if not turns else None),
+            "outcome_label": RESULTS.get(o[0], o[0]) if o else ("не дозвонились" if not turns else None),
+            "note": o[1] if o else None, "callback": o[2] if o else None, "lead": lead,
+            "transcript": "\n".join(("Помощник: " if t["who"] == "bot" else "Собеседник: ") + t["text"]
+                                     for t in turns)[:6000] or None}
+    if lead:  # which e-KNOT service the lead is about, so the card of that service moves (funnel: same service)
+        want = " ".join(str(lead.get(k) or "") for k in ("wants", "service")).lower()
+        data["service"] = next((sid for sid, words in LEAD_SERVICE if any(w in want for w in words)), None)
+    if lead and lead.get("role"):
+        role = lead["role"].lower()
+        data["role"] = ("CHAIRMAN" if "председ" in role else "UK" if "управля" in role or role == "ук"
+                        else "COUNCIL" if "совет" in role else "OWNER" if "собствен" in role else None)
+    EVENTS.emit("call.ended", contact.get("id"), data, name=contact.get("name"), phone=phone,
+                house=(lead or {}).get("house") or c.get("house"), once=f"call:{call_id}", at=started)
 
 
 # ---------------------------------------------------------------- one call
@@ -321,7 +384,11 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
         session_timeout=MAX_CALL_SECS))
     task = PipelineTask(Pipeline([transport.input(), agg.user(), llm, transport.output(), agg.assistant()]),
                         params=PipelineParams(audio_in_sample_rate=16000, audio_out_sample_rate=out_rate),
-                        idle_timeout_secs=120)
+                        idle_timeout_secs=120, enable_tracing=TRACING, conversation_id=f"call-{call_id}",
+                        additional_span_attributes={"langfuse.session.id": f"call-{call_id}",
+                                                    "langfuse.trace.name": f"call {door}"
+                                                                           + (f" {campaign}" if campaign else ""),
+                                                    "langfuse.trace.tags": ["voice", door]})
 
     async def said(who, text):
         text = re.sub(r"<no speech>|\{pause\}", "", text or "").strip()  # Gemini Live's markers, not speech
@@ -373,7 +440,7 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
             asyncio.get_running_loop().run_in_executor(None, to_chatwoot, call_id, serializer.peer)
 
 
-app = FastAPI()
+app = FastAPI(telemetry={"tracing": False})  # FastAPI 0.165 traces every request (healthz too): only calls go to Langfuse
 
 
 @app.get("/")

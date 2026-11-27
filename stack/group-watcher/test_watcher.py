@@ -139,6 +139,41 @@ class Intake(unittest.TestCase):
         self.assertEqual(calls, [("PATCH", "/contacts/8", {"custom_attributes": {w.TESTER_ATTR: True}})])
 
 
+    def test_card_events(self):
+        """The hooks for the orchestrator: a reply to our offer (once), the seller's handoff note, an opt-out."""
+        got = []
+
+        class Fake:
+            def emit(self, type, contact_id, data=None, **kw):
+                got.append((type, contact_id, (data or {}).get("service"), kw.get("once")))
+
+        old = (w.EVENTS, w._spawn, w.cw)
+        w.EVENTS, w._spawn = Fake(), (lambda fn, *a: None)
+        w.cw = lambda method, path, body=None: (200, {})
+        try:
+            w.x("INSERT INTO needs (message_id, conv_id, inbox_id, contact_id, service, confidence, message_at, "
+                "found_at, status, offer_conv_id) VALUES (900, 50, 2, 7, 'online_voting', 0.9, 0, 0, 'sent', 77)")
+            dm = dict(group_type="individual")
+            p = self.payload(id=120, **dm)
+            p["conversation"]["id"] = 77
+            self.assertEqual(w.intake(p), "ignored:individual:replied")
+            p = self.payload(id=121, **dm)
+            p["conversation"]["id"] = 78  # no offer of ours there
+            self.assertEqual(w.intake(p), "ignored:individual")
+            p = self.payload(id=122, private=True, message_type="outgoing", content="Председатель, Астана, 100 кв.",
+                             sender={"id": 1, "type": "agent_bot"}, **dm)
+            p["conversation"]["id"] = 77
+            p["conversation"]["meta"] = {"sender": {"id": 7, "name": "A"}}
+            self.assertEqual(w.intake(p), "lead")
+            w.opt_out(7, 77, True)
+        finally:
+            w.EVENTS, w._spawn, w.cw = old
+            w.x("DELETE FROM optout WHERE contact_id=7")
+            w.x("DELETE FROM needs WHERE message_id=900")
+        self.assertEqual(got, [("dm.replied", 7, "online_voting", "reply:77"),
+                               ("lead.handoff", 7, "online_voting", "handoff:122"),
+                               ("optout", 7, None, None)])
+
 class GroupAnswers(unittest.TestCase):
     def setUp(self):
         w.x("DELETE FROM faq"); w.x("DELETE FROM group_answers"); w.x("DELETE FROM messages")
