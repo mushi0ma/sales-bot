@@ -248,9 +248,20 @@ services:
       TWENTY_API_KEY: ${TWENTY_API_KEY:-}
       CW_PUBLIC_URL: https://${PUBLIC_DOMAIN:?}
       CW_ACCOUNT_ID: ${GW_CW_ACCOUNT_ID:-1}
+      # the analyst (review.py): Chatwoot as group-watcher's automation user, the judge through LiteLLM, Langfuse
+      CW_URL: http://cw-rails:3000
+      CW_API_TOKEN: ${GW_CW_TOKEN:-}
+      LLM_URL: http://litellm:4000/v1
+      LLM_KEY: ${LITELLM_MASTER_KEY:?}
+      LANGFUSE_HOST: http://langfuse-web:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      REVIEW_IDLE_MINUTES: ${REVIEW_IDLE_MINUTES:-45}
       DB_PATH: /data/processed.db
     volumes:
       - orchestrator_data:/data
+      - ./group-watcher/services.json:/app/services.json:ro  # the judge's facts about e-KNOT
+      - ./voice/campaigns.json:/app/campaigns.json:ro
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     mem_limit: 512m

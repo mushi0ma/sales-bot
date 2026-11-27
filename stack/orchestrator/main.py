@@ -1,8 +1,10 @@
 """orchestrator: the event bus between the roles (Hatchet) and the roles that run on it.
 
     producers (group-watcher, voice, ...) --HTTP POST /events--> ingress --Hatchet event--> tasks, each a role:
-      card   Twenty: the resident's card, the opportunity's stage by the funnel (funnel.py), the timeline
-    (next roles subscribe to the same events: advisor hints for the operator, monitoring, analyst tools)
+      card     Twenty: the resident's card, the opportunity's stage by the funnel (funnel.py), the timeline
+      review   the analyst (review.py): an LLM judge rates every finished call (call.ended) and, every 10 min,
+               every WhatsApp DM that went quiet; scores to Langfuse, the card and a note in Chatwoot
+    (next roles subscribe to the same events: advisor hints for the operator, monitoring)
 
 Ingress answers 202 only once Hatchet has the event, so a producer's outbox (events/outbox.py) keeps an event until
 then. Hatchet retries a failed task (3 times, backoff) and shows every run in its dashboard. A task is idempotent by
@@ -12,10 +14,11 @@ import hmac, json, logging, os, sqlite3, threading, time
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from hatchet_sdk import ConcurrencyExpression, ConcurrencyLimitStrategy, Context, Hatchet
+from hatchet_sdk import ConcurrencyExpression, ConcurrencyLimitStrategy, Context, EmptyModel, Hatchet
 from pydantic import BaseModel, Field
 
 import cards
+import review
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("orchestrator")
@@ -70,6 +73,25 @@ def card(ev: Event, ctx: Context) -> dict:
     return out
 
 
+@hatchet.task(name="review-call", on_events=["call.ended"], input_validator=Event, retries=2, backoff_factor=4,
+              backoff_max_seconds=300, execution_timeout=timedelta(seconds=240),
+              concurrency=ConcurrencyExpression(expression="input.key", max_runs=1,
+                                                limit_strategy=ConcurrencyLimitStrategy.GROUP_ROUND_ROBIN))
+def review_call(ev: Event, ctx: Context) -> dict:
+    if done(ev.id, "review"):
+        return {"skipped": "already reviewed"}
+    r = review.review_call(ev.model_dump())
+    mark(ev.id, "review")
+    return {"reviewed": r is not None, "score": r and r["score"]}
+
+
+@hatchet.task(name="review-sweep", on_crons=["*/10 * * * *"], retries=0, execution_timeout=timedelta(minutes=9),
+              concurrency=ConcurrencyExpression(expression="'sweep'", max_runs=1,
+                                                limit_strategy=ConcurrencyLimitStrategy.CANCEL_NEWEST))
+def review_sweep(_: EmptyModel, ctx: Context) -> dict:
+    return {"reviewed": review.sweep()}
+
+
 class Ingress(BaseHTTPRequestHandler):
     def log_message(self, *a):  # no access log: the path is fixed, bodies carry personal data
         pass
@@ -111,8 +133,8 @@ def main():
         raise SystemExit("ORCH_TOKEN and TWENTY_API_KEY are required")
     srv = ThreadingHTTPServer(("0.0.0.0", 8080), Ingress)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    log.info("ingress on :8080, roles: card")
-    hatchet.worker("orchestrator", slots=4, workflows=[card]).start()
+    log.info("ingress on :8080, roles: card, review")
+    hatchet.worker("orchestrator", slots=4, workflows=[card, review_call, review_sweep]).start()
 
 
 if __name__ == "__main__":

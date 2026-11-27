@@ -75,7 +75,7 @@ def company_id(name):
 
 def opportunities(person_id):
     d = gql("""query($p: UUID) { opportunities(filter: {pointOfContactId: {eq: $p}}, first: 50) {
-               edges { node { id stage service createdAt } } } }""", {"p": person_id})
+               edges { node { id stage service createdAt chatwootConversationId } } } }""", {"p": person_id})
     return [e["node"] for e in d["opportunities"]["edges"]]
 
 

@@ -75,7 +75,9 @@ def gql(path, query, variables=None, token=None):
     # client needs no cookie (the workspace origin goes as the `origin` argument where a mutation asks for it).
     st, b = http("POST", TWENTY + path, {"query": query, "variables": variables or {}}, token)
     if st >= 300 or b.get("errors"):
-        msgs = [e.get("message", "")[:200] for e in (b.get("errors") or [])] or [str(b)[:200]]
+        msgs = [e.get("message", "")[:200] + (f" {json.dumps(e.get('extensions'), ensure_ascii=False)[:600]}"
+                                               if e.get("extensions") else "")
+                for e in (b.get("errors") or [])] or [str(b)[:200]]
         raise RuntimeError(f"HTTP {st}: {'; '.join(msgs)}")
     return b["data"]
 
@@ -186,6 +188,13 @@ ROLES = [("CHAIRMAN", "Председатель ОСИ", "purple"), ("COUNCIL", 
          ("TENANT", "Арендатор", "yellow"), ("UNKNOWN", "Не известно", "gray")]
 
 
+REVIEW_OUTCOMES = [("LEAD", "Заявка", "green"), ("INTERESTED", "Интерес не закрыт", "sky"),
+                   ("TASK_DONE", "Задача звонка выполнена", "turquoise"), ("NO_INTEREST", "Не интересно", "gray"),
+                   ("OPTED_OUT", "Отказ от сообщений", "red"), ("WRONG_TARGET", "Не тот адресат", "yellow"),
+                   ("UNRESOLVED", "Вопрос не решён", "orange"), ("OTHER", "Другое", "purple")]
+SENTIMENTS = [("POSITIVE", "Позитивное", "green"), ("NEUTRAL", "Нейтральное", "gray"), ("NEGATIVE", "Негативное", "red")]
+
+
 def options(items):
     return [{"value": v, "label": l, "color": c, "position": i} for i, (v, l, c) in enumerate(items)]
 
@@ -212,6 +221,14 @@ def model_fields():
         ("opportunity", "needQuote", "Повод", "TEXT", None),
         ("opportunity", "chatwootConversationId", "Диалог Chatwoot", "NUMBER", None),
         ("opportunity", "lostReason", "Причина отказа", "TEXT", None),
+        # The analyst's review (orchestrator/review.py): the last one of this opportunity's dialog or call.
+        ("opportunity", "reviewScore", "Оценка агента (1–5)", "NUMBER", None),
+        ("opportunity", "reviewCsat", "Удовлетворённость (прогноз 1–5)", "NUMBER", None),
+        ("opportunity", "reviewOutcome", "Итог по разбору", "SELECT", options(REVIEW_OUTCOMES)),
+        ("opportunity", "reviewNextStep", "Следующий шаг (разбор)", "TEXT", None),
+        ("opportunity", "reviewedAt", "Разобрано", "DATE_TIME", None),
+        ("person", "lastCsat", "Удовлетворённость (прогноз 1–5)", "NUMBER", None),
+        ("person", "lastSentiment", "Настроение в конце разговора", "SELECT", options(SENTIMENTS)),
     ]
 
 
