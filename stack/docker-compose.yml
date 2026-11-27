@@ -206,6 +206,7 @@ services:
       DAILY_SEND_CAP: ${GW_DAILY_SEND_CAP:-20}
       SEND_PATH: ${GW_SEND_PATH:-A}  # A | B | SPLIT (B needs GW_CLOUD_INBOX_ID and approved templates)
       CLOUD_INBOX_ID: ${GW_CLOUD_INBOX_ID:-0}
+      TESTER_QUIET_HOURS: ${GW_TESTER_QUIET_HOURS:-23-8}  # 0-0: testers any time
       AUTO_TESTERS: ${GW_AUTO_TESTERS:-true}  # test env: group members become testers (see watcher.py)
       DB_PATH: /data/watcher.db
       ORCH_TOKEN: ${ORCH_TOKEN:-}  # events to the orchestrator (events/outbox.py, queue in /data/outbox.db)

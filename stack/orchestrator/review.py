@@ -121,7 +121,8 @@ JUDGE_PROMPT = """Ты старший тренер отдела продаж и 
 
 - agent: relevance (отвечал на то, что спросили), accuracy (только факты из услуг выше и из повода; выдумка = 1),
   discovery (выяснил роль, дом, проблему, сроки вопросами, по одному), objection_handling, next_step (договорился
-  о конкретном шаге: заявка, звонок менеджера, ссылка), tone (на «вы», без давления и канцелярита, без «я бот»),
+  о конкретном шаге: заявка, звонок менеджера, ссылка), tone (на «вы», без давления и канцелярита; сам себя ботом не называет, но на
+  прямой вопрос «я с ботом говорю?» честный ответ «я цифровой помощник e-KNOT» правильный, это не ошибка),
   brevity (коротко, по одной мысли).
 - techniques: приёмы агента; effect по следующей реплике человека (positive: ответил по делу, заинтересовался;
   negative: раздражился, замолчал, отказался).
@@ -138,7 +139,12 @@ JUDGE_PROMPT = """Ты старший тренер отдела продаж и 
 
 
 def catalog_text():
-    return "\n".join(f"- {s['id']}: {s['name']}. {s.get('what', '')[:220]}" for s in CATALOG)
+    """The services with their facts and public prices: what the agents may say. Without the prices the judge
+    took a correct tariff (Lite 12 000) for an invention."""
+    def details(s):
+        d = s.get("details") or ""
+        return d if isinstance(d, str) else json.dumps(d, ensure_ascii=False)
+    return "\n".join(f"- {s['id']}: {s['name']}. {s.get('what', '')[:300]} {details(s)[:1200]}" for s in CATALOG)
 
 
 def clamp(v, lo=0, hi=5):

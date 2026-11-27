@@ -43,6 +43,8 @@ PROJECT = E("GCP_PROJECT", "")
 LOCATION = E("VOICE_LOCATION", "eu")
 MODEL = E("VOICE_MODEL", "google/gemini-3.8-live")
 VOICE = E("VOICE_NAME", "Kore")
+# Below the default 1.0: at full temperature the native-audio model drifts mid-call (another timbre, an Indonesian word).
+TEMPERATURE = float(E("VOICE_TEMPERATURE", "0.6"))
 MAX_CALLS = int(E("MAX_CALLS", "2"))
 MAX_CALL_SECS = int(E("MAX_CALL_SECS", "600"))
 DAILY_CALLS = int(E("DAILY_CALLS", "40"))
@@ -202,6 +204,16 @@ def is_closing(text):
     """A reply after the goodbye that ends the call: a farewell anywhere, or only acknowledgements."""
     words = re.findall(r"[\w']+", (text or "").lower().replace("’", "'"))
     return bool(BYE_WORDS.search(text or "")) or (bool(words) and all(w in ACK for w in words))
+
+
+# Gemini Live now and then writes the tool call as text instead of calling it: "<metadata>{command: "end_call"}</metadata>".
+TEXT_CALL = re.compile(r"<metadata>.*?</metadata>|\{\s*command\s*:[^}]*\}", re.S | re.I)
+
+
+def spoken(text):
+    """(what was said, whether the text carried an end_call)."""
+    text = text or ""
+    return TEXT_CALL.sub("", text).strip(), bool(re.search(r"end_call", text))
 
 
 def wants_hangup(text):
@@ -366,11 +378,16 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
 
     ending = {"goodbye_at": None, "done": False}
 
-    async def hang_up(why):
+    async def hang_up(why, now=False):
+        """now: the line closes at once, cutting whatever the model is still saying (CancelFrame also sends the
+        hangup). Otherwise what is already said plays out first (EndFrame goes behind the audio)."""
         if not ending["done"]:
             ending["done"] = True
-            log.info("call=%s hang up: %s", call_id, why)
-            await task.queue_frame(EndFrame())
+            log.info("call=%s hang up%s: %s", call_id, " now" if now else "", why)
+            if now:
+                await task.cancel(reason=why)
+            else:
+                await task.queue_frame(EndFrame())
 
     async def after_goodbye(at):
         """The goodbye plays out, then the line closes, unless the person came back with a real turn."""
@@ -408,18 +425,20 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
     else:
         tools = ToolsSchema(standard_tools=[
             service_tool,
-            FunctionSchema("save_lead", "Записать заявку для менеджера e-KNOT, когда председатель или УК заинтересованы.",
+            FunctionSchema("save_lead", "Записать заявку для менеджера e-KNOT, когда председатель или УК заинтересованы. "
+                                        "Человек исправил данные: вызвать ещё раз, менеджер увидит последнюю.",
                            {"service": {"type": "string"}, "role": {"type": "string", "description": "председатель, УК, "
                                                                     "член совета, жилец"},
-                            "house": {"type": "string", "description": "город и дом или ЖК"},
+                            "house": {"type": "string", "description": "город, улица и дом или ЖК"},
                             "apartments": {"type": "string"}, "wants": {"type": "string"},
-                            "name": {"type": "string", "description": "как представился, если представился"}},
+                            "name": {"type": "string", "description": "имя собеседника"}},
                            ["service", "role", "wants"], save_lead),
             end_tool])
     llm = GeminiLiveVertexLLMService(
         project_id=PROJECT, location=LOCATION,
         system_instruction=prompt_outbound(campaign, name) if campaign else prompt(), tools=tools,
-        settings=GeminiLiveVertexLLMService.Settings(model=MODEL, voice=VOICE, language="ru-RU"))
+        settings=GeminiLiveVertexLLMService.Settings(model=MODEL, voice=VOICE, language="ru-RU",
+                                                     temperature=TEMPERATURE))
     context = LLMContext([{"role": "user", "content": "(человек взял трубку)" if campaign else "(звонок принят)"}],
                          tools)
     agg = LLMContextAggregatorPair(context)
@@ -435,7 +454,7 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
                                                     "langfuse.trace.tags": ["voice", door]})
 
     async def said(who, text):
-        text = re.sub(r"<no speech>|\{pause\}", "", text or "").strip()  # Gemini Live's markers, not speech
+        text = re.sub(r"<no speech>|\{pause\}", "", spoken(text)[0]).strip()  # Gemini Live's markers, not speech
         if not re.search(r"\w", text):  # "...", "-": a pause, not speech
             return
         transcript.append({"who": who, "text": text, "t": round(time.time(), 1)})
@@ -453,14 +472,20 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
                 db.execute("INSERT INTO outcomes (call_id, peer, campaign, result, note, callback, at) "
                            "VALUES (?,?,?,?,?,?,?)", (call_id, serializer.peer, campaign, "refused",
                                                       "попросил закончить звонок", None, time.time()))
-            await hang_up("the person asked to end the call")
+            await hang_up("the person asked to end the call", now=True)
         elif ending["goodbye_at"] and is_closing(text):
-            await hang_up("the person answered the goodbye")
+            await hang_up("the person answered the goodbye", now=True)  # no second goodbye
 
     @agg.assistant().event_handler("on_assistant_turn_stopped")
     async def _bot(_, message):
-        await said("bot", message.content)
-        if FAREWELL.search((message.content or "").strip()[-80:]):
+        text, called = spoken(message.content)
+        await said("bot", text)
+        if not (FAREWELL.search(text[-80:]) or called):
+            return
+        last = next((x for x in reversed(transcript) if x["who"] == "user"), None)
+        if last and BYE_WORDS.search(last["text"]) and "?" not in last["text"]:
+            await hang_up("the person said goodbye first")  # the farewell plays out, then the line closes
+        else:
             goodbye()  # also when the model said goodbye and forgot end_call
 
     @transport.event_handler("on_client_connected")
