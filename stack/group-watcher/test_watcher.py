@@ -255,6 +255,50 @@ class GroupAnswers(unittest.TestCase):
                 (r["id"], conv, 1, r["contact_id"], author, text, r["created_at"]))
         return r
 
+    def test_thread_follow_up(self):
+        """A reply to our answer continues the thread in the group; «спасибо» gets no answer; a cap per hour."""
+        seen = []
+
+        def llm(path, body):
+            seen.append(body["messages"][1]["content"])
+            last = body["messages"][1]["content"].rsplit("Жилец: ", 1)[-1]
+            reply = not last.lower().startswith("спасибо")
+            return 200, {"choices": [{"message": {"content": json.dumps(
+                {"reply": reply, "lang": "ru", "answer": "Председатель подаёт заявку, дальше всё в приложении."})}}]}
+
+        self.f.llm = llm
+        chain = [("Жилец", "Хотим переизбрать председателя, как собрать собрание?"),
+                 ("Помощник e-KNOT", "По закону нужно 10% собственников."), ("Жилец", "Как это работает?")]
+        self.assertTrue(self.f.thread(self.row(119, "Как это работает?"), chain))
+        self.assertEqual(self.posts[-1]["content_attributes"], {"in_reply_to": 119})
+        self.assertIn("Помощник e-KNOT: По закону", seen[-1], "the model sees the whole thread")
+        self.assertTrue(w.answered_in_group(119), "the need path skips a message answered in the thread")
+        self.assertFalse(self.f.thread(self.row(121, "Спасибо!"), chain[:2] + [("Жилец", "Спасибо!")]))
+        old = w.faqmod.THREAD_PER_HOUR
+        w.faqmod.THREAD_PER_HOUR = 1
+        try:
+            self.assertFalse(self.f.thread(self.row(122, "А сколько стоит?"), chain), "the hourly cap")
+        finally:
+            w.faqmod.THREAD_PER_HOUR = old
+
+    def test_reply_chain(self):
+        me = w.my_user_id
+        msgs = {"payload": [
+            {"id": 116, "message_type": 0, "sender": {"type": "contact", "id": 7}, "content": "Как собрать собрание?"},
+            {"id": 117, "message_type": 1, "sender": {"type": "user", "id": 2}, "content": "Нужно 10%.",
+             "content_attributes": {"in_reply_to": 116}},
+            {"id": 118, "message_type": 1, "private": True, "sender": {"type": "user", "id": 2}, "content": "💡 карточка"},
+            {"id": 120, "message_type": 0, "sender": {"type": "contact", "id": 8}, "content": "У нас так же",
+             "content_attributes": {"in_reply_to": 116}}]}
+        old = w.cw
+        w.cw, w.my_user_id = (lambda m, p, b=None: (200, msgs)), (lambda: 2)
+        try:
+            chain = w.reply_chain(50, 117)
+            self.assertEqual([(m["id"], m["ours"]) for m in chain], [(116, False), (117, True)])
+            self.assertFalse(w.reply_chain(50, 120)[-1]["ours"], "a reply to a neighbour is not our thread")
+        finally:
+            w.cw, w.my_user_id = old, me
+
     def test_candidates(self):
         c = lambda t: w.faqmod.is_candidate(t, ["голосов"])  # noqa: E731
         self.assertTrue(c("Сколько стоит онлайн-голосование?"))

@@ -182,6 +182,32 @@ class BrowserSerializer(FrameSerializer):
 
 # ---------------------------------------------------------------- the call in Chatwoot
 
+# How a call ends, decided in code: the model forgets end_call or keeps the line open after "ок, до свидания".
+# A request to end ("стоп" as a short turn, "положите трубку", "не звоните") hangs up at once; after the agent's
+# goodbye, a closing reply ("ок", "спасибо", "до свидания") hangs up at once and only a real turn keeps the call.
+HANGUP = re.compile(r"(повес\w*|полож\w*|клад\w*|брос\w*)\s+трубк|не\s+звони|больше\s+не\s+звон|отключ(ись|итесь)"
+                    r"|заканчива(й|йте)\b|заверш(ай|айте|ите)\s+(звонок|разговор)|отбой", re.I)
+SHORT_STOP = re.compile(r"^\W*(стоп|хватит|всё|все|достаточно|не надо|не нужно)(\W+(стоп|хватит|спасибо|всё|все))*\W*$",
+                        re.I)
+NO_MORE_CALLS = re.compile(r"не\s+звони|больше\s+не\s+звон|^\W*стоп\W*$", re.I)
+FAREWELL = re.compile(r"(всего\s+(доброго|хорошего)|до\s+свидания|хорошего\s+(вам\s+)?(дня|вечера)|до\s+связи"
+                      r"|сау\s+болыңыз)[\s.!)]*$", re.I)
+BYE_WORDS = re.compile(r"свидани|\bпока\b|всего\s+(доброго|хорошего)|до\s+связи|хорошего\s+(дня|вечера)|сау\s+бол", re.I)
+ACK = {"ок", "окей", "о'кей", "ok", "okay", "хорошо", "ладно", "спасибо", "благодарю", "ага", "угу", "да", "нет",
+       "понятно", "понял", "поняла", "давайте", "взаимно", "и", "вам", "тоже", "ну", "всё", "все", "так", "рахмет",
+       "жақсы", "иә"}
+
+
+def is_closing(text):
+    """A reply after the goodbye that ends the call: a farewell anywhere, or only acknowledgements."""
+    words = re.findall(r"[\w']+", (text or "").lower().replace("’", "'"))
+    return bool(BYE_WORDS.search(text or "")) or (bool(words) and all(w in ACK for w in words))
+
+
+def wants_hangup(text):
+    return bool(HANGUP.search(text or "") or SHORT_STOP.match(text or ""))
+
+
 RESULTS = {"voted": "уже проголосовал", "will_vote": "проголосует", "send_link": "прислать ссылку",
            "will_pay": "оплатит", "paid": "говорит, что оплатил", "dispute": "не согласен с суммой, нужна сверка",
            "refused": "отказ", "callback": "перезвонить", "not_owner": "не собственник",
@@ -338,15 +364,33 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
         log.info("call=%s outcome %s", call_id, a.get("result"))
         await params.result_callback({"saved": True})
 
-    async def end_call(params: FunctionCallParams):
-        asked = time.time()
-        await params.result_callback({"ok": True})
-        await asyncio.sleep(5)  # let the goodbye play out
-        # The person said something after the goodbye ("подождите", "вы куда?"): the conversation goes on.
-        if any(x["who"] == "user" and x["t"] > asked for x in transcript):
-            log.info("call=%s end_call skipped: the person spoke after the goodbye", call_id)
+    ending = {"goodbye_at": None, "done": False}
+
+    async def hang_up(why):
+        if not ending["done"]:
+            ending["done"] = True
+            log.info("call=%s hang up: %s", call_id, why)
+            await task.queue_frame(EndFrame())
+
+    async def after_goodbye(at):
+        """The goodbye plays out, then the line closes, unless the person came back with a real turn."""
+        await asyncio.sleep(5)
+        if ending["goodbye_at"] != at or ending["done"]:
             return
-        await task.queue_frame(EndFrame())
+        if any(x["who"] == "user" and x["t"] > at and not is_closing(x["text"]) for x in transcript):
+            log.info("call=%s goodbye withdrawn: the person went on", call_id)
+            ending["goodbye_at"] = None
+            return
+        await hang_up("after the goodbye")
+
+    def goodbye():
+        if ending["goodbye_at"] is None:
+            ending["goodbye_at"] = time.time()
+            asyncio.create_task(after_goodbye(ending["goodbye_at"]))
+
+    async def end_call(params: FunctionCallParams):
+        await params.result_callback({"ok": True})
+        goodbye()
 
     service_tool = FunctionSchema(
         "service_info", "Подробности об услуге e-KNOT со страницы сайта: что входит, тарифы, FAQ.",
@@ -392,7 +436,7 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
 
     async def said(who, text):
         text = re.sub(r"<no speech>|\{pause\}", "", text or "").strip()  # Gemini Live's markers, not speech
-        if not text:
+        if not re.search(r"\w", text):  # "...", "-": a pause, not speech
             return
         transcript.append({"who": who, "text": text, "t": round(time.time(), 1)})
         if door == "browser":
@@ -401,11 +445,23 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
 
     @agg.user().event_handler("on_user_turn_message_added")
     async def _user(_, message):
-        await said("user", message.content)
+        text = message.content or ""
+        await said("user", text)
+        if wants_hangup(text):
+            if campaign and NO_MORE_CALLS.search(text) and not db.execute(
+                    "SELECT 1 FROM outcomes WHERE call_id=?", (call_id,)).fetchone():
+                db.execute("INSERT INTO outcomes (call_id, peer, campaign, result, note, callback, at) "
+                           "VALUES (?,?,?,?,?,?,?)", (call_id, serializer.peer, campaign, "refused",
+                                                      "попросил закончить звонок", None, time.time()))
+            await hang_up("the person asked to end the call")
+        elif ending["goodbye_at"] and is_closing(text):
+            await hang_up("the person answered the goodbye")
 
     @agg.assistant().event_handler("on_assistant_turn_stopped")
     async def _bot(_, message):
         await said("bot", message.content)
+        if FAREWELL.search((message.content or "").strip()[-80:]):
+            goodbye()  # also when the model said goodbye and forgot end_call
 
     @transport.event_handler("on_client_connected")
     async def _connected(_, __):

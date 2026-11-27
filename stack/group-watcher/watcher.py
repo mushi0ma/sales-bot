@@ -635,6 +635,56 @@ def answer_in_group(row):
         _faq_busy.discard(row["id"])
 
 
+_me = []
+
+
+def my_user_id():
+    """The Chatwoot user of CW_API_TOKEN: its public messages in a group are this service's answers."""
+    if not _me:
+        st, b = _http("GET", f"{CW_URL}/api/v1/profile", headers={"api_access_token": CW_TOKEN})
+        _me.append((b or {}).get("id") if st == 200 and isinstance(b, dict) else None)
+    return _me[0]
+
+
+def reply_chain(conv_id, message_id, depth=6, pages=4):
+    """The thread a reply belongs to, oldest first: [{"id", "ours", "text"}], following in_reply_to from
+    message_id up to `depth` messages, within the group's last pages * 20 messages."""
+    by_id, before = {}, None
+    for _ in range(pages):
+        st, b = cw("GET", f"/conversations/{conv_id}/messages" + (f"?before={before}" if before else ""))
+        page = (b or {}).get("payload") or [] if st == 200 and isinstance(b, dict) else []
+        by_id.update({m["id"]: m for m in page})
+        if message_id in by_id or len(page) < 20:
+            break
+        before = min(m["id"] for m in page)
+    chain, cur = [], message_id
+    while cur in by_id and len(chain) < depth:
+        m = by_id[cur]
+        sender = m.get("sender") or {}
+        chain.append({"id": cur, "ours": m.get("message_type") == 1 and not m.get("private")
+                                         and sender.get("type") == "user" and sender.get("id") == my_user_id(),
+                      "text": (m.get("content") or "").strip()})
+        cur = quoted_id(m)
+    return list(reversed(chain))
+
+
+def answer_in_thread(row, reply_to):
+    """A reply in the group: to our message (directly or further down our thread) -> continue the thread; to
+    anyone else's -> the usual question path."""
+    _faq_busy.add(row["id"])
+    try:
+        chain = reply_chain(row["conv_id"], reply_to)
+        if chain and chain[-1]["ours"]:
+            FAQ.thread(row, [("Помощник e-KNOT" if m["ours"] else "Жилец", m["text"]) for m in chain if m["text"]]
+                       + [("Жилец", row["text"])])
+        elif FAQ.wants(row):
+            FAQ.handle(row)
+    except Exception as e:
+        log.warning("faq thread message=%s: %s", row["id"], str(e)[:200])
+    finally:
+        _faq_busy.discard(row["id"])
+
+
 def learn_from_reply(row, quoted_id):
     question = q("SELECT * FROM messages WHERE id=? AND conv_id=?", (quoted_id, row["conv_id"]))
     try:
@@ -657,7 +707,7 @@ def quoted_id(p):
 
 def answered_in_group(message_id):
     return message_id in _faq_busy or bool(q(
-        "SELECT 1 FROM group_answers WHERE message_id=? AND source IN ('cache','model')", (message_id,)))
+        "SELECT 1 FROM group_answers WHERE message_id=? AND source IN ('cache','model','thread')", (message_id,)))
 
 
 def mark_tester(contact_id):
@@ -724,7 +774,9 @@ def intake(p):
     reply_to = quoted_id(p)
     if faqmod.FAQ_MODE == "auto" and reply_to:
         _spawn(learn_from_reply, row, reply_to)
-    if FAQ.wants(row):
+    if reply_to and faqmod.FAQ_MODE == "auto":
+        _spawn(answer_in_thread, row, reply_to)
+    elif FAQ.wants(row):
         _spawn(answer_in_group, row)
     if (sender.get("custom_attributes") or {}).get(TESTER_ATTR) or AUTO_TESTERS:
         x("INSERT OR IGNORE INTO testers (contact_id, at) VALUES (?,?)", (sender["id"], time.time()))
