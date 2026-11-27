@@ -34,6 +34,8 @@ LANGFUSE = E("LANGFUSE_HOST", "").rstrip("/")
 LF_AUTH = base64.b64encode(f'{E("LANGFUSE_PUBLIC_KEY", "")}:{E("LANGFUSE_SECRET_KEY", "")}'.encode()).decode()
 IDLE_MINUTES = int(E("REVIEW_IDLE_MINUTES", "45"))
 LOOKBACK_DAYS = int(E("REVIEW_LOOKBACK_DAYS", "7"))
+# Dialogs quiet since before this moment (unix seconds) are not swept: they show agents before later fixes.
+SINCE = float(E("REVIEW_SINCE", "0") or 0)
 PER_SWEEP = int(E("REVIEW_PER_SWEEP", "5"))
 CATALOG = json.loads(open(E("CATALOG_PATH", "/app/services.json"), encoding="utf-8").read())["services"]
 _cp = E("CAMPAIGNS_PATH", "/app/campaigns.json")
@@ -463,7 +465,8 @@ def sweep():
         convs = ((b or {}).get("data") or {}).get("payload") or [] if st == 200 and isinstance(b, dict) else []
         for c in convs:
             last = c.get("last_activity_at") or 0
-            if c.get("group_type") == "group" or not (now - LOOKBACK_DAYS * 86400 < last < now - IDLE_MINUTES * 60):
+            if c.get("group_type") == "group" or last < SINCE or not (
+                    now - LOOKBACK_DAYS * 86400 < last < now - IDLE_MINUTES * 60):
                 continue
             prev = last_review(c["id"])
             if prev and prev[1] >= last:  # nothing happened since we last looked

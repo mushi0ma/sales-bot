@@ -496,11 +496,15 @@ def opt_out(contact_id, conv_id=None, individual=False):
       (contact_id,))
     cw("PATCH", f"/contacts/{contact_id}", {"custom_attributes": {OPTOUT_ATTR: True}})
     if individual and conv_id:
-        # A public reply from us also makes the agent step aside in this chat (a person answered).
+        # A public reply from us makes the agent step aside in this chat (a person answered): hand it back, so
+        # when the person writes again on their own, the seller answers (it sees salesbot_optout and sells
+        # nothing, seller-prompt.md rule 8). We never write first after «стоп».
         st, _ = cw("POST", f"/conversations/{conv_id}/messages", {
             "content": "Хорошо, больше не побеспокою. Хорошего дня!"})
         if st not in (200, 201):
             log.warning("optout reply conversation=%s HTTP %s", conv_id, st)
+        else:
+            handback(conv_id)
     log.info("optout contact=%s", contact_id)
     emit("optout", contact_id, {"cw_conversation_id": conv_id, "where": "dm" if individual else "group"})
 

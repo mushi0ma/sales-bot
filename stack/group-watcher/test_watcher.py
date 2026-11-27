@@ -160,8 +160,9 @@ class Intake(unittest.TestCase):
             def emit(self, type, contact_id, data=None, **kw):
                 got.append((type, contact_id, (data or {}).get("service"), kw.get("once")))
 
-        old = (w.EVENTS, w._spawn, w.cw)
-        w.EVENTS, w._spawn = Fake(), (lambda fn, *a: None)
+        old = (w.EVENTS, w._spawn, w.cw, w.handback)
+        handed = []
+        w.EVENTS, w._spawn, w.handback = Fake(), (lambda fn, *a: None), handed.append
         w.cw = lambda method, path, body=None: (200, {})
         try:
             w.x("INSERT INTO needs (message_id, conv_id, inbox_id, contact_id, service, confidence, message_at, "
@@ -179,8 +180,9 @@ class Intake(unittest.TestCase):
             p["conversation"]["meta"] = {"sender": {"id": 7, "name": "A"}}
             self.assertEqual(w.intake(p), "lead")
             w.opt_out(7, 77, True)
+            self.assertEqual(handed, [77], "after «стоп» in a DM the seller gets the chat back, to answer later")
         finally:
-            w.EVENTS, w._spawn, w.cw = old
+            w.EVENTS, w._spawn, w.cw, w.handback = old
             w.x("DELETE FROM optout WHERE contact_id=7")
             w.x("DELETE FROM needs WHERE message_id=900")
         self.assertEqual(got, [("dm.replied", 7, "online_voting", "reply:77"),

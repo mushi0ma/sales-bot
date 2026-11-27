@@ -777,7 +777,8 @@ def step_seller():
         "split": {"enabled": True, "maxChars": 280, "typingWpm": 200, "minDelayMs": 800, "maxDelayMs": 3500,
                   "maxChunks": 4},
         # group-watcher writes the offer of this conversation here (watcher.py OFFER_ATTR); shown in the prompt.
-        "attributeContext": {"conversation": ["salesbot_offer"], "contact": [], "task": []},
+        # salesbot_optout: the person wrote «стоп»; the seller still answers when they write first (prompt rule 8).
+        "attributeContext": {"conversation": ["salesbot_offer"], "contact": ["salesbot_optout"], "task": []},
         "guardrails": {"enabled": True, "input": {"enabled": False}, "output": {"enabled": False}, "onFailure": "pass",
                        "factualGrounding": {"enabled": True, "action": "revise", "contextMessages": 6,
                                             "sourceTools": ["search_knowledge"], "provider": LLM_PROVIDER,

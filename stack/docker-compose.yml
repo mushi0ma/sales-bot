@@ -257,6 +257,7 @@ services:
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
       REVIEW_IDLE_MINUTES: ${REVIEW_IDLE_MINUTES:-45}
+      REVIEW_SINCE: ${REVIEW_SINCE:-1795780800}  # 2026-11-27 09:00 UTC, the analyst's start: older dialogs predate fixes
       DB_PATH: /data/processed.db
     volumes:
       - orchestrator_data:/data
