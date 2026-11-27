@@ -212,6 +212,7 @@ services:
     volumes:
       - ./group-watcher/watcher.py:/app/watcher.py:ro
       - ./events/outbox.py:/app/outbox.py:ro
+      - ./voice/campaigns.json:/app/campaigns.json:ro  # the `/call CAMPAIGN` note command
       - ./group-watcher/services.json:/app/services.json:ro
       - ./group-watcher/samples.json:/app/samples.json:ro
       - ./group-watcher/faq.py:/app/faq.py:ro

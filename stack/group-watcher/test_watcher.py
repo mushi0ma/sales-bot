@@ -57,6 +57,19 @@ class Logic(unittest.TestCase):
         self.assertEqual(w.decide({"confidence": 0.5}, utc(12), mode="auto", opted_out=False, last_offer_at=None,
                                   sent_today=0), ("skipped", "low_confidence"))
 
+    def test_tester_policy(self):
+        d = lambda **k: w.decide(NEED, k.pop("at", utc(12)), **{"mode": "auto", "opted_out": False,
+                                                                 "last_offer_at": None, "sent_today": 0, **k})
+        hour_ago = utc(12).timestamp() - 3600
+        self.assertEqual(d(last_offer_at=hour_ago), ("skipped", "cooldown"), "a resident: 7 days")
+        self.assertEqual(d(last_offer_at=hour_ago, tester=True), ("send", ""), "a tester: 30 minutes")
+        self.assertEqual(d(last_offer_at=utc(12).timestamp() - 600, tester=True), ("skipped", "cooldown"))
+        self.assertEqual(d(at=utc(22)), ("held", "quiet_hours"))
+        self.assertEqual(d(at=utc(22), tester=True), ("send", ""), "testers until 23:00")
+        self.assertEqual(d(at=utc(23, 30), tester=True), ("held", "quiet_hours"))
+        self.assertEqual(d(at=utc(8), tester=True), ("send", ""))
+        self.assertEqual(d(opted_out=True, tester=True), ("skipped", "optout"), "«стоп» still wins")
+
     def test_prompt_has_no_names(self):
         rows = [{"id": 1, "contact_id": 77, "text": "лифт не работает"}, {"id": 2, "contact_id": 78, "text": "у нас тоже"}]
         system, user = w.build_prompt([], rows)
@@ -173,6 +186,47 @@ class Intake(unittest.TestCase):
         self.assertEqual(got, [("dm.replied", 7, "online_voting", "reply:77"),
                                ("lead.handoff", 7, "online_voting", "handoff:122"),
                                ("optout", 7, None, None)])
+
+    def test_call_command(self):
+        """/call: only a tester, not after «стоп», a known campaign, in hours, with a free line; then the endpoint."""
+        calls, notes = [], []
+        tester = {"id": 7, "phone_number": "+77000000000", "custom_attributes": {w.TESTER_ATTR: True}}
+        state = {"contact": tester, "voice": {"active": 0, "max_calls": 2, "today": 0, "daily": 40}}
+
+        def cw(method, path, body=None):
+            calls.append((method, path, body))
+            return (200, {"payload": state["contact"]}) if method == "GET" else (201, {"call_id": "x"})
+
+        old = (w.cw, w.note, w._http, w.campaigns, w.quiet_for)
+        w.cw, w.note = cw, (lambda conv, text: notes.append(text))
+        w._http = lambda method, url, body=None, headers=None, timeout=30: (200, state["voice"])
+        w.campaigns = lambda: {"votes": {"title": "сбор голосов"}}
+        w.quiet_for = lambda now, tester: False
+        dm = lambda text, **c: {"id": 500, "content": text, "conversation": {"id": 77, "group_type": "individual",
+                                                                            "meta": {"sender": {"id": 7}}, **c}}
+        try:
+            self.assertEqual(w.call_command(dm("/call votes")), "placed")
+            self.assertEqual(calls[-1], ("POST", "/conversations/77/voice_agent_call",
+                                         {"campaign": "votes", "name": "", "key": "note-500"}))
+            self.assertEqual(w.call_command(dm("/call")), "refused")
+            self.assertIn("/call votes", notes[-1], "without a campaign the note lists them")
+            self.assertEqual(w.call_command(dm("/call votes", group_type="group")), "refused:group")
+            state["contact"] = {**tester, "custom_attributes": {}}
+            self.assertEqual(w.call_command(dm("/call votes")), "refused")
+            self.assertIn("тестировщикам", notes[-1])
+            state["contact"] = {**tester, "custom_attributes": {w.TESTER_ATTR: True, w.OPTOUT_ATTR: True}}
+            self.assertEqual(w.call_command(dm("/call votes")), "refused")
+            self.assertIn("стоп", notes[-1])
+            state["contact"], state["voice"] = tester, {"active": 2, "max_calls": 2, "today": 0, "daily": 40}
+            self.assertEqual(w.call_command(dm("/call votes")), "refused")
+            self.assertIn("заняты", notes[-1])
+            w.quiet_for = lambda now, tester: True
+            state["voice"] = {"active": 0, "max_calls": 2, "today": 0, "daily": 40}
+            self.assertEqual(w.call_command(dm("/call votes")), "refused")
+            self.assertIn("не звоним", notes[-1])
+        finally:
+            w.cw, w.note, w._http, w.campaigns, w.quiet_for = old
+        self.assertEqual(sum(1 for c in calls if c[0] == "POST"), 1, "only the first one rang")
 
 class GroupAnswers(unittest.TestCase):
     def setUp(self):

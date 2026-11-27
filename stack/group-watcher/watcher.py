@@ -51,6 +51,13 @@ MIN_CONFIDENCE = float(E("MIN_CONFIDENCE", "0.7"))
 OFFER_COOLDOWN_DAYS = int(E("OFFER_COOLDOWN_DAYS", "7"))
 DAILY_SEND_CAP = int(E("DAILY_SEND_CAP", "20"))
 QUIET_HOURS = E("QUIET_HOURS", "21-9")  # local hours [start, end): no sends
+# Testers (contacts with TESTER_ATTR) test in the evening and again and again: a longer day and a short cooldown.
+# Real residents keep QUIET_HOURS and OFFER_COOLDOWN_DAYS.
+TESTER_QUIET_HOURS = E("TESTER_QUIET_HOURS", "23-8")
+TESTER_COOLDOWN_MINUTES = int(E("TESTER_COOLDOWN_MINUTES", "30"))
+# `/call CAMPAIGN` in a private note of a person's conversation: the voice agent rings them (campaigns.json of voice).
+VOICE_URL = E("VOICE_URL", "http://voice:8090").rstrip("/")
+CAMPAIGNS_PATH = E("CAMPAIGNS_PATH", "/app/campaigns.json")
 UTC_OFFSET = int(E("UTC_OFFSET", "5"))  # Kazakhstan
 HOLD_MAX_HOURS = int(E("HOLD_MAX_HOURS", "14"))  # a need held for quiet hours expires after this
 HANDBACK_MACRO = E("HANDBACK_MACRO", "🤖 Вернуть боту")
@@ -137,6 +144,7 @@ CREATE TABLE IF NOT EXISTS needs (
   path TEXT, offer_conv_id INTEGER, sent_at REAL
 );
 CREATE TABLE IF NOT EXISTS optout (contact_id INTEGER PRIMARY KEY, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS testers (contact_id INTEGER PRIMARY KEY, at REAL NOT NULL);  -- TESTER_ATTR seen or set
 """
 
 _db_lock = threading.Lock()
@@ -196,13 +204,21 @@ def local_midnight_ts(now_utc):
     return d.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
-def decide(need, now_utc, *, mode, opted_out, last_offer_at, sent_today):
+def cooldown_secs(tester):
+    return TESTER_COOLDOWN_MINUTES * 60 if tester else OFFER_COOLDOWN_DAYS * 86400
+
+
+def quiet_for(now_utc, tester):
+    return in_quiet_hours(now_utc, TESTER_QUIET_HOURS if tester else QUIET_HOURS)
+
+
+def decide(need, now_utc, *, mode, opted_out, last_offer_at, sent_today, tester=False):
     """-> (status, why). Order matters: a person's refusal beats everything, the operator's mode comes last."""
     if opted_out:
         return "skipped", "optout"
     if need["confidence"] < MIN_CONFIDENCE:
         return "skipped", "low_confidence"
-    if last_offer_at and now_utc.timestamp() - last_offer_at < OFFER_COOLDOWN_DAYS * 86400:
+    if last_offer_at and now_utc.timestamp() - last_offer_at < cooldown_secs(tester):
         return "skipped", "cooldown"
     if sent_today >= DAILY_SEND_CAP:
         return "skipped", "daily_cap"
@@ -210,7 +226,7 @@ def decide(need, now_utc, *, mode, opted_out, last_offer_at, sent_today):
         return "skipped", "dry_run"
     if mode == "approve":
         return "awaiting", ""
-    if in_quiet_hours(now_utc):
+    if quiet_for(now_utc, tester):
         return "held", "quiet_hours"
     return "send", ""
 
@@ -443,7 +459,8 @@ def policy_inputs(contact_id, now_utc):
     opted = bool(q("SELECT 1 FROM optout WHERE contact_id=?", (contact_id,)))
     last = q("SELECT MAX(sent_at) AS t FROM needs WHERE contact_id=? AND status='sent'", (contact_id,))[0]["t"]
     today = q("SELECT COUNT(*) AS n FROM needs WHERE status='sent' AND sent_at>=?", (local_midnight_ts(now_utc),))[0]["n"]
-    return {"opted_out": opted, "last_offer_at": last, "sent_today": today}
+    tester = bool(q("SELECT 1 FROM testers WHERE contact_id=?", (contact_id,)))
+    return {"opted_out": opted, "last_offer_at": last, "sent_today": today, "tester": tester}
 
 
 def handle_need(need, mode=None):
@@ -508,6 +525,77 @@ def operator_command(text):
         return
     x("UPDATE needs SET status='pending' WHERE id=?", (need_id,))
     send_offer(need_id)
+
+
+def campaigns():
+    try:
+        with open(CAMPAIGNS_PATH, encoding="utf-8") as f:
+            return {k: v for k, v in json.load(f).items() if not k.startswith("_")}
+    except OSError:
+        return {}
+
+
+def call_refusal(contact, attrs, campaign, known, now_utc, voice):
+    """Why the operator's /call must not ring now, or None. Only testers (who agreed), never after «стоп»."""
+    if campaign not in known:
+        return "повод: " + ", ".join(f"`/call {k}` ({v.get('title', k)})" for k, v in known.items())
+    if not contact.get("id"):
+        return "в этом диалоге нет контакта"
+    if attrs.get(OPTOUT_ATTR) or q("SELECT 1 FROM optout WHERE contact_id=?", (contact["id"],)):
+        return "человек написал «стоп», звонить нельзя"
+    if not attrs.get(TESTER_ATTR):
+        return f"звоним только тестировщикам (атрибут контакта {TESTER_ATTR})"
+    if not (contact.get("phone_number") or "").strip("+"):
+        return "у контакта нет номера"
+    if quiet_for(now_utc, True):
+        start, end = TESTER_QUIET_HOURS.split("-")
+        return f"сейчас не звоним (тестировщикам с {end}:00 до {start}:00 по Астане)"
+    if voice is None:
+        return "голосовой агент недоступен"
+    if voice["active"] >= voice["max_calls"]:
+        return f"все линии заняты ({voice['active']} из {voice['max_calls']}), попробуйте через пару минут"
+    if voice["today"] >= voice["daily"]:
+        return f"дневной лимит звонков исчерпан ({voice['daily']})"
+    return None
+
+
+def call_command(p):
+    """/call CAMPAIGN in a private note of a person's (not a group's) conversation: the voice agent rings them.
+    The answer is a private note in the same conversation; the call's own note follows when it ends."""
+    conv = p.get("conversation") or {}
+    m = re.match(r"^\s*/call(?:\s+([a-z0-9_-]+))?\s*$", p.get("content") or "")
+    conv_id = conv.get("id")
+    if not m or not conv_id:
+        return "ignored"
+    if conv.get("group_type") == "group":
+        note(conv_id, "📞 /call работает в личном диалоге с человеком, не в группе.")
+        return "refused:group"
+    contact = ((conv.get("meta") or {}).get("sender") or {})
+    attrs = {}
+    if contact.get("id"):
+        st, c = cw("GET", f"/contacts/{contact['id']}")
+        c = (c or {}).get("payload") or {} if st == 200 else {}
+        attrs, contact = c.get("custom_attributes") or {}, {**contact, **{k: c[k] for k in ("phone_number", "name") if c.get(k)}}
+    phone = "".join(ch for ch in (contact.get("phone_number") or "") if ch.isdigit())
+    campaign = m.group(1)
+    st, voice = _http("GET", f"{VOICE_URL}/outbound?campaign={campaign or 'none'}&peer={phone}", timeout=10)
+    why = call_refusal(contact, attrs, campaign, campaigns(), datetime.now(timezone.utc),
+                       voice if st == 200 and isinstance(voice, dict) else None)
+    if why:
+        note(conv_id, f"📞 Не звоню: {why}.")
+        log.info("operator /call conversation=%s refused: %s", conv_id, why[:60])
+        return "refused"
+    st, r = cw("POST", f"/conversations/{conv_id}/voice_agent_call",
+               {"campaign": campaign, "name": (contact.get("name") or "")[:60], "key": f"note-{p.get('id')}"})
+    title = campaigns()[campaign].get("title", campaign)
+    if st in (200, 201):
+        note(conv_id, f"📞 Звоню: повод «{title}». Итог и стенограмма придут сюда заметкой после звонка.")
+        log.info("operator /call conversation=%s campaign=%s placed", conv_id, campaign)
+        return "placed"
+    err = r.get("error", "") if isinstance(r, dict) else r
+    note(conv_id, f"📞 Звонок не начался (HTTP {st}: {str(err or '')[:120]}).")
+    log.warning("operator /call conversation=%s HTTP %s", conv_id, st)
+    return "failed"
 
 
 # ---------------------------------------------------------------- webhook intake
@@ -587,6 +675,9 @@ def intake(p):
     sender = p.get("sender") or {}
     text = (p.get("content") or "").strip()
     if p.get("private") and p.get("message_type") == "outgoing" and sender.get("type") == "user":
+        if re.match(r"^\s*/call\b", text):
+            threading.Thread(target=call_command, args=(p,), daemon=True).start()
+            return "command"
         if text.startswith("/"):
             threading.Thread(target=operator_command, args=(text,), daemon=True).start()
             return "command"
@@ -635,6 +726,8 @@ def intake(p):
         _spawn(learn_from_reply, row, reply_to)
     if FAQ.wants(row):
         _spawn(answer_in_group, row)
+    if (sender.get("custom_attributes") or {}).get(TESTER_ATTR) or AUTO_TESTERS:
+        x("INSERT OR IGNORE INTO testers (contact_id, at) VALUES (?,?)", (sender["id"], time.time()))
     if (AUTO_TESTERS and sender["id"] not in _marked
             and not (sender.get("custom_attributes") or {}).get(TESTER_ATTR)):
         _marked.add(sender["id"])
@@ -706,15 +799,15 @@ def process_group(conv_id):
 
 def release_held():
     now = datetime.now(timezone.utc)
-    if in_quiet_hours(now):
-        return
     for n in q("SELECT id, contact_id, found_at FROM needs WHERE status='held'"):
         if time.time() - n["found_at"] > HOLD_MAX_HOURS * 3600:
             x("UPDATE needs SET status='skipped:expired' WHERE id=?", (n["id"],))
             continue
         inputs = policy_inputs(n["contact_id"], now)
+        if quiet_for(now, inputs["tester"]):
+            continue
         if inputs["opted_out"] or inputs["sent_today"] >= DAILY_SEND_CAP or (
-                inputs["last_offer_at"] and time.time() - inputs["last_offer_at"] < OFFER_COOLDOWN_DAYS * 86400):
+                inputs["last_offer_at"] and time.time() - inputs["last_offer_at"] < cooldown_secs(inputs["tester"])):
             x("UPDATE needs SET status='skipped:policy_on_release' WHERE id=?", (n["id"],))
             continue
         x("UPDATE needs SET status='pending' WHERE id=?", (n["id"],))

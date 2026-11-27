@@ -12,7 +12,7 @@ Per person, from the voice agent's records (GET /outbound):
   - no answer, hung up without an outcome, or `callback`: call again, but not sooner than RETRY_HOURS after the last
     attempt and at most MAX_ATTEMPTS times in all. The time someone asked for is printed for the operator: the agent
     does not parse «после шести» into a schedule.
-Calls are placed only while no other call is on (the second slot stays for incoming calls), 09:00-21:00 Astana, and
+Calls are placed only while no other call is on (the second slot stays for incoming calls), 08:00-23:00 Astana (dial.sh CALL_HOURS), and
 below the agent's daily cap. Each call is waited out before the next. The printout masks phone numbers.
 """
 import csv, json, os, re, subprocess, sys, time, urllib.parse, urllib.request
