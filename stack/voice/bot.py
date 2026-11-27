@@ -386,6 +386,22 @@ async def health():
     return {"ok": True, "active": active}
 
 
+@app.get("/outbound")
+async def outbound(campaign: str, peer: str):
+    """For obzvon.py: the slots and today's count, and this person's earlier calls in the campaign with their outcomes."""
+    peer = re.sub(r"\D", "", peer)
+    rows = db.execute("SELECT id, started_at, transcript != '[]' FROM calls WHERE door='wa-out' AND campaign=? AND peer=?"
+                      " ORDER BY id", (campaign, peer)).fetchall()
+    attempts = []
+    for call_id, at, talked in rows:
+        o = db.execute("SELECT result, callback FROM outcomes WHERE call_id=? ORDER BY id DESC LIMIT 1",
+                       (call_id,)).fetchone()
+        attempts.append({"call_id": call_id, "at": at, "talked": bool(talked),
+                         "result": o[0] if o else None, "callback": o[1] if o else None})
+    return {"active": active, "max_calls": MAX_CALLS, "today": calls_today(), "daily": DAILY_CALLS,
+            "attempts": attempts}
+
+
 @app.websocket("/wa")
 async def wa(ws: WebSocket):
     campaign = ws.query_params.get("campaign") or None
