@@ -13,9 +13,11 @@ Doors:
 
 Knowledge: the e-KNOT catalog (services.json) in the prompt, page snapshots (kb/pages) through the service_info
 tool. Leads go to SQLite (/data/voice.db) with the call's transcript.
+After every WhatsApp call a private note goes to the person's conversation in Chatwoot (CW_* env): the kind of call,
+the outcome or lead, the transcript; labels `call` (+ `lead`). Without a token the note is skipped.
 Limits (the mentor's "no runaway spend"): MAX_CALLS at once, MAX_CALL_SECS per call, DAILY_CALLS per day.
 """
-import asyncio, base64, json, logging, os, re, sqlite3, sys, time
+import asyncio, base64, json, logging, os, re, sqlite3, sys, time, urllib.error, urllib.request
 from pathlib import Path
 
 from loguru import logger
@@ -46,6 +48,10 @@ MAX_CALL_SECS = int(E("MAX_CALL_SECS", "600"))
 DAILY_CALLS = int(E("DAILY_CALLS", "40"))
 DB_PATH = E("DB_PATH", "/data/voice.db")
 HERE = Path(__file__).resolve().parent
+CW_URL = E("CW_URL", "http://cw-rails:3000").rstrip("/")
+CW_ACCOUNT_ID = E("CW_ACCOUNT_ID", "1")
+CW_TOKEN = E("CW_API_TOKEN", "")
+CW_INBOX_ID = int(E("CW_INBOX_ID", "2"))  # the WhatsApp inbox the test number lives in
 CATALOG = json.loads(Path(E("CATALOG_PATH", "/app/services.json")).read_text(encoding="utf-8"))
 SERVICES = {s["id"]: s for s in CATALOG["services"]}
 KB_DIR = Path(E("KB_DIR", "/app/kb"))
@@ -147,6 +153,86 @@ class BrowserSerializer(FrameSerializer):
         if isinstance(data, (bytes, bytearray)):
             return InputAudioRawFrame(audio=bytes(data), sample_rate=16000, num_channels=1)
         return None
+
+
+# ---------------------------------------------------------------- the call in Chatwoot
+
+RESULTS = {"voted": "уже проголосовал", "will_vote": "проголосует", "send_link": "прислать ссылку",
+           "will_pay": "оплатит", "paid": "говорит, что оплатил", "dispute": "не согласен с суммой, нужна сверка",
+           "refused": "отказ", "callback": "перезвонить", "not_owner": "не собственник",
+           "wrong_person": "не тот человек"}
+
+
+def cw(method, path, body=None):
+    req = urllib.request.Request(f"{CW_URL}/api/v1/accounts/{CW_ACCOUNT_ID}{path}", method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"api_access_token": CW_TOKEN, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        return e.code, None
+
+
+def conversation_for(phone):
+    """The person's WhatsApp conversation id: their latest one in CW_INBOX_ID, else a new one; a new contact too."""
+    st, b = cw("GET", f"/contacts/search?q={phone}")
+    contact = next((c for c in (b or {}).get("payload", []) if re.sub(r"\D", "", c.get("phone_number") or "") == phone),
+                   None)
+    if contact is None:
+        st, b = cw("POST", "/contacts", {"name": "+" + phone, "phone_number": "+" + phone, "inbox_id": CW_INBOX_ID})
+        contact = ((b or {}).get("payload") or {}).get("contact") if st < 300 else None
+        if not contact:
+            raise RuntimeError(f"create contact HTTP {st}")
+    st, b = cw("GET", f"/contacts/{contact['id']}/conversations")
+    convs = [c for c in (b or {}).get("payload", []) if c.get("inbox_id") == CW_INBOX_ID]
+    if convs:
+        return max(convs, key=lambda c: c.get("last_activity_at") or 0)["id"]
+    st, b = cw("GET", f"/contacts/{contact['id']}/contactable_inboxes")
+    src = next((e.get("source_id") for e in (b or {}).get("payload", []) if (e.get("inbox") or {}).get("id") == CW_INBOX_ID),
+               None)
+    st, c = cw("POST", "/conversations", {"inbox_id": CW_INBOX_ID, "contact_id": contact["id"], "source_id": src})
+    if st >= 300 or not (c or {}).get("id"):
+        raise RuntimeError(f"create conversation HTTP {st}")
+    return c["id"]
+
+
+def call_note(call_id):
+    door, campaign, started, ended, transcript = db.execute(
+        "SELECT door, campaign, started_at, ended_at, transcript FROM calls WHERE id=?", (call_id,)).fetchone()
+    turns = json.loads(transcript)
+    secs = int((ended or started) - started)
+    kind = (f"Исходящий звонок помощника (повод: {CAMPAIGNS[campaign]['title']})" if campaign
+            else "Входящий звонок помощнику")
+    lines = [f"📞 {kind}, {secs // 60} мин {secs % 60} с" if turns else f"📞 {kind}: не дозвонились"]
+    for result, note, callback in db.execute("SELECT result, note, callback FROM outcomes WHERE call_id=? ORDER BY id",
+                                             (call_id,)):
+        lines.append("Итог: " + RESULTS.get(result, result) + (f"; когда: {callback}" if callback else "")
+                     + (f"; для председателя: {note}" if note else ""))
+    for (data,) in db.execute("SELECT data FROM leads WHERE call_id=? ORDER BY id", (call_id,)):
+        d = json.loads(data)
+        lines.append("Заявка: " + ", ".join(str(d[k]) for k in ("role", "house", "apartments", "wants", "name")
+                                              if d.get(k)))
+    if turns:
+        lines.append("")
+        lines += [("Помощник: " if t["who"] == "bot" else "Собеседник: ") + t["text"] for t in turns]
+    return "\n".join(lines)[:4000], bool(db.execute("SELECT 1 FROM leads WHERE call_id=?", (call_id,)).fetchone())
+
+
+def to_chatwoot(call_id, peer):
+    phone = re.sub(r"\D", "", peer or "")
+    if not CW_TOKEN or not (10 <= len(phone) <= 15):
+        return
+    try:
+        conv = conversation_for(phone)
+        note, lead = call_note(call_id)
+        st, _ = cw("POST", f"/conversations/{conv}/messages", {"content": note, "private": True})
+        _, b = cw("GET", f"/conversations/{conv}/labels")
+        labels = sorted(set((b or {}).get("payload", [])) | {"call"} | ({"lead"} if lead else set()))
+        st2, _ = cw("POST", f"/conversations/{conv}/labels", {"labels": labels})
+        log.info("call=%s note in conversation=%s HTTP %s, labels HTTP %s", call_id, conv, st, st2)
+    except Exception as e:  # the call is in voice.db either way
+        log.warning("call=%s chatwoot note failed: %s", call_id, str(e)[:160])
 
 
 # ---------------------------------------------------------------- one call
@@ -283,6 +369,8 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
         db.execute("UPDATE calls SET ended_at=?, peer=?, transcript=? WHERE id=?",
                    (time.time(), serializer.peer, json.dumps(transcript, ensure_ascii=False), call_id))
         log.info("call=%s ended: %s turns", call_id, len(transcript))
+        if door != "browser":
+            asyncio.get_running_loop().run_in_executor(None, to_chatwoot, call_id, serializer.peer)
 
 
 app = FastAPI()

@@ -27,8 +27,6 @@ x-cw-env: &cw-env
   DISABLE_TELEMETRY: "true"
   # Agent Bot webhooks to the agents service on the private docker network.
   SAFE_FETCH_PRIVATE_TARGETS: agents:3000,tg-userbot:8080,group-watcher:8080
-  # Telegram setWebhook carries this secret_token; Caddy refuses webhook calls without it.
-  TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:?}
   # Native WhatsApp connector (whatsmeow), embedded in Sidekiq.
   WHATSAPP_CONNECTOR_ENABLED: "true"
   # WhatsApp calls to the test number go to the voice agent (stack/voice, patch chatwoot-whatsapp-voice-agent):
@@ -247,6 +245,10 @@ services:
       MAX_CALLS: ${VOICE_MAX_CALLS:-2}
       MAX_CALL_SECS: ${VOICE_MAX_CALL_SECS:-600}
       DAILY_CALLS: ${VOICE_DAILY_CALLS:-40}
+      # Call notes in Chatwoot: the group-watcher's API user (an automation that writes private notes).
+      CW_ACCOUNT_ID: ${GW_CW_ACCOUNT_ID:-1}
+      CW_API_TOKEN: ${GW_CW_TOKEN:-}
+      CW_INBOX_ID: ${VOICE_CW_INBOX_ID:-2}
     volumes:
       - ./group-watcher/services.json:/app/services.json:ro
       - ./kb/pages:/app/kb:ro
@@ -264,7 +266,7 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # Public HTTPS entry (Let's Encrypt for PUBLIC_DOMAIN) in front of Chatwoot: UI, WhatsApp Cloud and Telegram webhooks.
+  # Public HTTPS entry (Let's Encrypt for PUBLIC_DOMAIN) in front of Chatwoot: UI and the WhatsApp Cloud webhook.
   caddy:
     image: caddy:2.11.8-alpine@sha256:f6228111e5fafa1a5238258d0858e103f10599b8d1659a146e7726681a002bb9
     networks: [default]
@@ -274,7 +276,6 @@ services:
       - "443:443/udp"
     environment:
       PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:?}
-      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:?}
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
