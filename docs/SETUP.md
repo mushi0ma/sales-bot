@@ -21,11 +21,12 @@
 | `stack/render-env.sh` | на ВМ собирает `stack/.env` (600) из Secret Manager через сервисный аккаунт ВМ, печатает только имена |
 | `stack/bootstrap.py` | настройка Chatwoot и agents по шагам (`python3 -I bootstrap.py` без аргументов печатает список) |
 | `stack/litellm/config.yaml` | модели Gemini и жёсткие лимиты rpm/rpd на каждую |
-| `stack/caddy/Caddyfile` | HTTPS (Let's Encrypt) только для Chatwoot, проверка `secret_token` вебхука Telegram |
+| `stack/caddy/Caddyfile` | HTTPS (Let's Encrypt) только для Chatwoot |
 | `stack/group-watcher/` | потребности в WhatsApp-группах → предложение в личку (путь A), каталог услуг, датасет |
 | `stack/agent/` | промпты: бот поддержки (`system-prompt.md`, `knowledge.md`) и продавец (`seller-prompt.md`) |
+| `stack/voice/` | голосовой агент: звонки в WhatsApp и обзвон от имени председателя ОСИ (`dial.sh`, `campaigns.json`) |
 | `stack/tickets/`, `stack/stt/`, `stack/tg-userbot/` | тестовая диспетчерская, распознавание голосовых, Telegram-userbot |
-| `stack/patches/` | наши патчи к vendor (эмбеддинги, логи и вебхук Telegram) |
+| `stack/patches/` | наши патчи к vendor: эмбеддинги agents, звонки WhatsApp голосовому агенту, исходящий звонок со `stream` |
 | `stack/tests/` | сценарии через настоящий конвейер agents: бот поддержки и `--seller` |
 
 ## Что нужно на ноутбуке
@@ -152,8 +153,8 @@ group-watcher.
 
 ## WhatsApp
 
-- Коннектор **whatsmeow** (`fazer-ai/whatsapp-connector`), встроен в `cw-sidekiq`, бинарник из закреплённого
-  образа. Подключение: Chatwoot → Settings → Inboxes → Add Inbox → WhatsApp → **WhatsApp (native)** → номер → QR.
+- Коннектор **whatsmeow** (`fazer-ai/whatsapp-connector`), встроен в `cw-sidekiq`. Бинарник собираем сами из
+  `vendor/whatsapp-connector` с нашим патчем (образ `salesbot/whatsapp-connector:0.9.0-stream`, раздел «Голос»). Подключение: Chatwoot → Settings → Inboxes → Add Inbox → WhatsApp → **WhatsApp (native)** → номер → QR.
   Затем `python3 -I bootstrap.py bind-cw <inbox_id> [seller]`.
 - **Группы:** `WHATSAPP_GROUPS_ENABLED=true` в compose. Коннектор запоминает флаг групп при подключении сессии,
   поэтому после включения сессию нужно переподключить (в rails console:
@@ -241,7 +242,9 @@ group-watcher.
 
 - **Канал Telegram: userbot** (решение ментора): бот читает группы и пишет в личку от обычного аккаунта, как в
   WhatsApp. Bot API не используется: 26.11 бота @oknewsales_bot подключили по ошибке и в тот же день убрали
-  (вебхук снят, входящие удалены, секрет `telegram-bot-token` и шаг `bootstrap.py telegram` удалены).
+  (вебхук снят, входящие удалены; 27.11 убраны и остатки: секрет `telegram-bot-token`, шаг `bootstrap.py telegram`,
+  проверка вебхука в Caddy, два патча Chatwoot. Секрет `webhook-secret` ментора остался в Secret Manager, стек его
+  не читает).
 - **Userbot** (`stack/tg-userbot/`, профиль compose `tg-userbot`): спайк S2 на Telethon, заморожен до 06.12.
   Telethon архивирован, замена на Kurigram в бэклоге.
 
@@ -264,7 +267,10 @@ deploy/ssh.sh 'cd /srv/salesbot/stack && docker compose exec -T group-watcher py
 Сервис `voice` (`stack/voice`): Pipecat 1.15 + Gemini Live (`gemini-3.8-live`, Vertex AI, регион `eu`, голос Kore,
 ru-RU). Тот же промпт по смыслу, что у продавца, но для речи: короткие фразы, числа словами, ссылки не диктует.
 Инструменты: `service_info` (страница услуги со снимка eknot.me), `save_lead` (заявка менеджеру), `end_call`.
-Звонки и стенограммы в `voice.db` (том `voice_data`); логи без текста разговора.
+Звонки и стенограммы в `voice.db` (том `voice_data`); логи без текста разговора. После каждого звонка в WhatsApp
+агент кладёт приватную заметку в диалог этого человека в Chatwoot (диалог и контакт создаются, если их нет): входящий
+или исходящий и повод, длительность, итог обзвона или заявка, стенограмма. Метки `call` и, если есть заявка, `lead`.
+Пишет от API-пользователя group-watcher (`GW_CW_TOKEN`); без токена заметки не будет, звонок останется в `voice.db`.
 
 Два входа в один и тот же разговор:
 
@@ -337,15 +343,18 @@ group-watcher уже умеет оба пути, нужен только inbox.
 ## Внешние обращения стека
 
 - agents: `FAZER_AI_HUB_URL=""`, к app.fazer.ai не ходит. Chatwoot: `DISABLE_TELEMETRY=true`.
-- Наружу ходят: LiteLLM в Vertex AI, коннектор в WhatsApp, Chatwoot в api.telegram.org, Caddy в Let's Encrypt.
+- Наружу ходят: LiteLLM в Vertex AI, коннектор в WhatsApp (и UDP 40000 для голоса), tg-userbot в Telegram (MTProto,
+  когда профиль запущен), Caddy в Let's Encrypt.
 - Установщик fazer.ai (`install.sh`) не используется: он требует OAuth-входа на app.fazer.ai.
 
 ## Открытые задачи
 
 - [x] A-запись `sales-bot.eknot.kz` (зона eknot.kz у ps.kz) → сертификат, публичная ссылка.
 - [ ] Путь B (WhatsApp Cloud API): приложение Meta, тестовый номер, шаблоны ru/kk, inbox `whatsapp_cloud`.
-- [ ] Голос: заявки и итоги обзвона из `voice.db` в Chatwoot (диалог контакта, метка); список обзвона из файла,
-  повторный звонок по `callback`; два звонка одновременно на одном аккаунте WhatsApp не проверены.
+- [x] Голос: итоги обзвона, заявки и стенограммы в Chatwoot (приватная заметка, метки `call`, `lead`).
+- [ ] Голос: два звонка одновременно на одном аккаунте WhatsApp не проверены; список обзвона из файла, повторный
+  звонок по `callback`.
+- [ ] Telegram-userbot: вход отдельным тестовым аккаунтом, затем `bootstrap.py tg-userbot`.
 - [ ] Проверить восстановление из бэкапа на пустой копии.
 - [ ] Окно приёма показаний 20–25 инструмент не проверяет.
-- [ ] Upstream: маска токена Telegram в логах (fazer-ai/chatwoot), `dimensions` эмбеддингов (fazer-ai/agents).
+- [ ] Upstream: `dimensions` эмбеддингов (fazer-ai/agents), `call.start` со `stream` (fazer-ai/whatsapp-connector).

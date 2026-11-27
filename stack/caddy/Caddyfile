@@ -11,14 +11,6 @@
 		-Server
 	}
 
-	# Telegram webhook: only calls that carry our secret_token (Secret Manager: webhook-secret).
-	@telegram path /webhooks/telegram/*
-	handle @telegram {
-		@forged not header X-Telegram-Bot-Api-Secret-Token {$TELEGRAM_WEBHOOK_SECRET}
-		respond @forged 403
-		reverse_proxy cw-rails:3000
-	}
-
 	handle {
 		reverse_proxy cw-rails:3000
 	}
