@@ -133,6 +133,17 @@ def private_allowed(user_id):
     return allowed(user_id) or seen_in_allowed_group(user_id)
 
 
+def contact_source(p):
+    """The contact inbox source_id of a webhook payload's conversation. Chatwoot serializes
+    conversation.contact_inbox as a GlobalID string there; the embedded message carries it as a dict."""
+    conv = p.get("conversation") or {}
+    for ci in [conv.get("contact_inbox")] + [((m or {}).get("conversation") or {}).get("contact_inbox")
+                                             for m in conv.get("messages") or []]:
+        if isinstance(ci, dict) and ci.get("source_id"):
+            return ci["source_id"]
+    return None
+
+
 def tg_identifier(ident):
     """'tg:123' -> 123 (a user), 'tg:-100123' -> -100123 (a group); None for anything else."""
     v = ident[3:] if ident.startswith("tg:") else ""
@@ -420,9 +431,10 @@ async def run():
                         sender = await msg.get_sender()
                         if store_group(g["chat_id"], g["title"], msg, sender):
                             missing.append((msg, sender))
+                    # Our own sends never come back as events: only someone else's missing message is news.
+                    missing = [(m, s) for m, s in missing if not m.out]
                     for msg, sender in reversed(missing):  # oldest first: a reply finds what it answers
-                        if not msg.out:
-                            await to_chatwoot(g["chat_id"], g["title"], msg, sender)
+                        await to_chatwoot(g["chat_id"], g["title"], msg, sender)
                 except Exception as e:
                     log.error("backfill chat=%s failed: %s", g["chat_id"], type(e).__name__)
                 if missing:
@@ -551,10 +563,11 @@ async def run():
             return
         if first_contact:
             allow(user_id, "outreach", "")
-            conv = (p.get("conversation") or {}).get("id")
-            src = ((p.get("conversation") or {}).get("contact_inbox") or {}).get("source_id")
-            if conv and src:
-                cw._remember(user_id, src, conv)
+        # The person's answer belongs where we wrote last: an offer of group-watcher opens a conversation of its own,
+        # and the seller must see it there (with the offer), not in an older or a new one.
+        conv, src = (p.get("conversation") or {}).get("id"), contact_source(p)
+        if conv and src:
+            cw._remember(user_id, src, conv)
         log.info("private out: user=%s len=%d attachments=%d%s", user_id, len(content), len(attachments),
                  " (first contact)" if first_contact else "")
 

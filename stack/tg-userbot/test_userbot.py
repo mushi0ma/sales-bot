@@ -44,6 +44,13 @@ class Rules(unittest.TestCase):
         u.allow(-200, "group", "Дом 7")
         self.assertGreater(u.bridge_since(-200), first, "allowing again starts the bridge again")
 
+    def test_contact_source(self):
+        gid = {"conversation": {"id": 13, "contact_inbox": "#<GlobalID gid://chatwoot/ContactInbox/16>",
+                                "messages": [{"conversation": {"contact_inbox": {"source_id": "tg:42"}}}]}}
+        self.assertEqual(u.contact_source(gid), "tg:42", "the GlobalID string is skipped")
+        self.assertEqual(u.contact_source({"conversation": {"contact_inbox": {"source_id": "abc"}}}), "abc")
+        self.assertIsNone(u.contact_source({"conversation": {"messages": []}}))
+
     def test_msg_map(self):
         u.map_msg(-100, 7, 501)
         u.map_msg(-100, 8, 502)

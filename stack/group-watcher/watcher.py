@@ -328,8 +328,10 @@ def choose_path(contact_id, mode=None, cloud_inbox=None, inbox_id=None):
 
 
 def first_name(need):
+    """A greeting name: the first word of the author's name when it is a name (letters, a hyphen), not a number
+    or a nickname like «whoisthat?» (Telegram display names often are)."""
     first = (need.get("author") or "").split()[0] if need.get("author") else ""
-    return first if first and not first.lstrip("+").isdigit() else ""
+    return first if re.fullmatch(r"[^\W\d_]{2,}(-[^\W\d_]+)?", first) else ""
 
 
 def offer_template(need, catalog=CATALOG):
