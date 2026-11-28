@@ -30,6 +30,7 @@ CHAT_TTL_DAYS = int(os.environ.get("FAQ_CHAT_TTL_DAYS", "30"))
 MODEL_PER_HOUR = int(os.environ.get("FAQ_MODEL_PER_HOUR", "6"))  # new answers generated per group per hour (cost)
 POSTS_PER_HOUR = int(os.environ.get("FAQ_POSTS_PER_HOUR", "40"))  # all answers per group per hour (flood guard)
 REPEAT_HOURS = int(os.environ.get("FAQ_REPEAT_HOURS", "12"))  # the same person, the same answer
+THREAD_PER_HOUR = int(os.environ.get("FAQ_THREAD_PER_HOUR", "20"))  # follow-ups in reply threads, per group per hour
 BACKFILL_HOURS = float(os.environ.get("FAQ_BACKFILL_HOURS", "3"))  # earlier askers answered once the chat answers
 KB_DIR = os.environ.get("KB_DIR", "/app/kb")
 
@@ -135,6 +136,21 @@ SYSTEM = (
     "stable=true, если ответ верен минимум месяц (цены, тарифы, описание услуги); false, если зависит от даты, "
     "акции или чего-то, что меняется чаще.\nlang: ru или kk."
 )
+THREAD_SYSTEM = (
+    "Ты помощник e-KNOT в общем чате жильцов дома в Казахстане. Человек ответил реплаем на твоё сообщение в чате (или "
+    "на ответ в этой ветке), то есть обращается к тебе. Продолжи разговор в этой ветке.\n"
+    "Отвечай только по МАТЕРИАЛАМ: что умеет услуга, как это работает, как подключить, тарифы. Ничего не додумывай. "
+    "Если нужно то, чего в материалах нет, или вопрос про конкретный дом (суммы, долги, реквизиты, решения ОСИ), или "
+    "человек хочет подключить услугу или оставить заявку: коротко ответь, что можешь и что знаешь, и предложи написать "
+    "этому номеру в личные сообщения, там помощник разберёт ситуацию дома и передаст менеджеру.\n"
+    "reply=false, если отвечать не нужно: «спасибо», «понятно», «ок», эмодзи, реплика соседу, а не тебе, или «стоп».\n"
+    "Как писать answer: как живой человек в чате, 1-3 коротких предложения, на языке человека (русский или казахский), "
+    "без markdown, списков, приветствий и шаблонных фраз. Не повторяй то, что уже сказано в ветке. Результатов не "
+    "обещай. lang: ru или kk."
+)
+THREAD_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["reply", "lang", "answer"],
+                 "properties": {"reply": {"type": "boolean"}, "lang": {"type": "string", "enum": ["ru", "kk"]},
+                                "answer": {"type": "string"}}}
 ANSWER_SCHEMA = {"type": "object", "additionalProperties": False,
                  "required": ["answerable", "stable", "lang", "answer"],
                  "properties": {"answerable": {"type": "boolean"}, "stable": {"type": "boolean"},
@@ -284,6 +300,35 @@ class Faq:
             self.log.info("faq message=%s: %s", row["id"], source)
             return False
         return self.post(row, answer, faq_id, source, now)
+
+    def thread(self, row, chain):
+        """A reply to our message in the group: continue that thread. chain: [(who, text)] oldest first, the
+        person's new message last. Returns True when an answer was posted."""
+        now = time.time()
+        if FAQ_MODE != "auto":
+            return False
+        if len(self.posts_since(row["conv_id"], now - 3600, ("thread",))) >= THREAD_PER_HOUR:
+            source, out = "none:thread_cap", {}
+        else:
+            text, _ = self.material()
+            convo = "\n".join(f"{who}: {t[:800]}" for who, t in chain)
+            st, b = self.llm("/chat/completions", {
+                "model": FAQ_MODEL, "temperature": 0.2,
+                "messages": [{"role": "system", "content": THREAD_SYSTEM + "\n\nМАТЕРИАЛЫ:\n" + text},
+                             {"role": "user", "content": "Ветка в чате дома, последнее сообщение адресовано тебе:\n"
+                                                         + convo}],
+                "response_format": {"type": "json_schema",
+                                    "json_schema": {"name": "thread", "schema": THREAD_SCHEMA, "strict": True}}})
+            if st != 200:
+                raise RuntimeError(f"thread HTTP {st}: {str(b)[:160]}")
+            out = json.loads(b["choices"][0]["message"]["content"] or "{}")
+            source = "thread" if out.get("reply") and (out.get("answer") or "").strip() else "none:thread_no_reply"
+        if source != "thread":
+            self.x("INSERT OR IGNORE INTO group_answers (message_id, conv_id, faq_id, source, latency, at, contact_id)"
+                   " VALUES (?,?,?,?,?,?,?)", (row["id"], row["conv_id"], None, source, None, now, row.get("contact_id")))
+            self.log.info("faq thread message=%s: %s", row["id"], source)
+            return False
+        return self.post(row, out["answer"].strip()[:1200], None, "thread", now)
 
     def post(self, row, answer, faq_id, source, now):
         """Reply in the group under the asker's message, and record it."""

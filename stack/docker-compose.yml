@@ -5,6 +5,10 @@
 # of the VM or stays inside docker networks (the agents console: deploy/ssh.sh -- -N -L 3100:127.0.0.1:3100).
 name: salesbot
 
+# Twenty (cards, funnel), Hatchet (events), Langfuse (traces): see platform.yml.
+include:
+  - platform.yml
+
 x-cw-env: &cw-env
   RAILS_ENV: production
   NODE_ENV: production
@@ -168,6 +172,9 @@ services:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?}
       LITELLM_LOG: WARNING
       LITELLM_TELEMETRY: "False"
+      LANGFUSE_HOST: http://langfuse-web:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:?}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:?}
       DISABLE_SCHEMA_UPDATE: "true"
     volumes:
       - ./litellm/config.yaml:/app/config.yaml:ro
@@ -199,10 +206,15 @@ services:
       DAILY_SEND_CAP: ${GW_DAILY_SEND_CAP:-20}
       SEND_PATH: ${GW_SEND_PATH:-A}  # A | B | SPLIT (B needs GW_CLOUD_INBOX_ID and approved templates)
       CLOUD_INBOX_ID: ${GW_CLOUD_INBOX_ID:-0}
+      TESTER_QUIET_HOURS: ${GW_TESTER_QUIET_HOURS:-23-8}  # 0-0: testers any time
       AUTO_TESTERS: ${GW_AUTO_TESTERS:-true}  # test env: group members become testers (see watcher.py)
+      TG_INBOX_ID: ${CW_TGU_INBOX_ID:-0}  # tg-userbot's inbox: Telegram groups, offers in Telegram private chats
       DB_PATH: /data/watcher.db
+      ORCH_TOKEN: ${ORCH_TOKEN:-}  # events to the orchestrator (events/outbox.py, queue in /data/outbox.db)
     volumes:
       - ./group-watcher/watcher.py:/app/watcher.py:ro
+      - ./events/outbox.py:/app/outbox.py:ro
+      - ./voice/campaigns.json:/app/campaigns.json:ro  # the `/call CAMPAIGN` note command
       - ./group-watcher/services.json:/app/services.json:ro
       - ./group-watcher/samples.json:/app/samples.json:ro
       - ./group-watcher/faq.py:/app/faq.py:ro
@@ -211,9 +223,54 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    mem_limit: 128m
+    mem_limit: 192m
     depends_on:
       litellm: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # The event bus between the roles (orchestrator/main.py): producers POST events to :8080/events (ORCH_TOKEN), the
+  # worker runs the roles on Hatchet. Role «card»: the resident's card and the funnel stage in Twenty.
+  orchestrator:
+    build:
+      context: ./orchestrator
+    image: salesbot/orchestrator:local
+    networks: [default]
+    environment:
+      ORCH_TOKEN: ${ORCH_TOKEN:?}
+      HATCHET_CLIENT_TOKEN: ${HATCHET_CLIENT_TOKEN:-}
+      HATCHET_CLIENT_HOST_PORT: hatchet:7077
+      HATCHET_CLIENT_SERVER_URL: http://hatchet:8888
+      HATCHET_CLIENT_TLS_STRATEGY: none
+      TWENTY_URL: http://twenty:3000
+      TWENTY_API_KEY: ${TWENTY_API_KEY:-}
+      CW_PUBLIC_URL: https://${PUBLIC_DOMAIN:?}
+      CW_ACCOUNT_ID: ${GW_CW_ACCOUNT_ID:-1}
+      # the analyst (review.py): Chatwoot as group-watcher's automation user, the judge through LiteLLM, Langfuse
+      CW_URL: http://cw-rails:3000
+      CW_API_TOKEN: ${GW_CW_TOKEN:-}
+      LLM_URL: http://litellm:4000/v1
+      LLM_KEY: ${LITELLM_MASTER_KEY:?}
+      LANGFUSE_HOST: http://langfuse-web:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      REVIEW_IDLE_MINUTES: ${REVIEW_IDLE_MINUTES:-45}
+      REVIEW_SINCE: ${REVIEW_SINCE:-1795780800}  # 2026-11-27 09:00 UTC, the analyst's start: older dialogs predate fixes
+      DB_PATH: /data/processed.db
+    volumes:
+      - orchestrator_data:/data
+      - ./group-watcher/services.json:/app/services.json:ro  # the judge's facts about e-KNOT
+      - ./voice/campaigns.json:/app/campaigns.json:ro
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    depends_on:
+      hatchet: { condition: service_started }
+      twenty: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
       interval: 15s
@@ -249,10 +306,16 @@ services:
       CW_ACCOUNT_ID: ${GW_CW_ACCOUNT_ID:-1}
       CW_API_TOKEN: ${GW_CW_TOKEN:-}
       CW_INBOX_ID: ${VOICE_CW_INBOX_ID:-2}
+      ORCH_TOKEN: ${ORCH_TOKEN:-}  # call.ended to the orchestrator (events/outbox.py, queue in /data/outbox.db)
+      # Each call as a trace in the self-hosted Langfuse (Pipecat OpenTelemetry; never the cloud).
+      LANGFUSE_HOST: http://langfuse-web:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
     volumes:
       - ./group-watcher/services.json:/app/services.json:ro
       - ./kb/pages:/app/kb:ro
       - ./voice/campaigns.json:/app/campaigns.json:ro
+      - ./events/outbox.py:/app/outbox.py:ro
       - voice_data:/data
     read_only: true
     tmpfs: [/tmp]
@@ -312,8 +375,9 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # Telegram userbot (a real account, MTProto) <-> Chatwoot API inbox; groups -> /data queue (plan v2, spike S2).
-  # Default deny: only chats allowed with `/salesbot allow` from the account itself. Session = secret (volume).
+  # Telegram userbot (a real account, MTProto) <-> Chatwoot API inbox: private chats to the seller, allowed groups as
+  # group conversations for group-watcher (patch chatwoot-api-group-messages). Default deny: only chats allowed with
+  # `/salesbot allow` from the account itself, and private chats of their members. Session = secret (volume).
   tg-userbot:
     build: ./tg-userbot
     image: salesbot/tg-userbot:local
@@ -327,6 +391,7 @@ services:
       CW_INBOX_IDENTIFIER: ${CW_TGU_INBOX_IDENTIFIER:-}
       CW_WEBHOOK_SECRET: ${CW_TGU_WEBHOOK_SECRET:-}
       CW_OPERATOR_TOKEN: ${CW_TGU_OPERATOR_TOKEN:-}
+      CW_INBOX_ID: ${CW_TGU_INBOX_ID:-}
     volumes:
       - tgu_data:/data
     read_only: true
@@ -398,4 +463,5 @@ volumes:
   caddy_data:
   caddy_config:
   gw_data:
+  orchestrator_data:
   voice_data:

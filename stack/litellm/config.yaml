@@ -11,6 +11,8 @@ model_list:
   - model_name: gemini-3.8-flash          # replies of the agents, vision
     # reasoning_effort low: default thinking spent ~850 tokens and 5-7 s per call (3 calls per reply); low is 2.5-3 s
     litellm_params: { <<: *vertex, model: vertex_ai/gemini-3.8-flash, reasoning_effort: low, rpm: 40, rpd: 1000 }
+  - model_name: gemini-3.8-flash-judge    # the analyst (orchestrator/review.py): its own caps, never the agents' quota
+    litellm_params: { <<: *vertex, model: vertex_ai/gemini-3.8-flash, rpm: 10, rpd: 300 }
   - model_name: gemini-3.5-flash-lite     # need detection, fact checking, bulk scenario runs
     litellm_params: { <<: *vertex, model: vertex_ai/gemini-3.5-flash-lite, rpm: 50, rpd: 3000 }
   - model_name: gemini-4-argon            # Pro class, expensive: offline only (dataset gold labels, calibrating the Flash judge, failure analysis); never in a live reply
@@ -25,7 +27,12 @@ router_settings:
 
 litellm_settings:
   drop_params: true                 # OpenAI-only knobs (e.g. reasoning effort) are dropped, not rejected
-  turn_off_message_logging: true    # no prompt or reply text in LiteLLM logs
+  # Every call, its text, tokens and latency -> our Langfuse (stack/platform.yml, on this VM). The switch below
+  # also applies to callbacks, so it stays off; LiteLLM's own log is WARNING and prints no text.
+  turn_off_message_logging: false
+  # Langfuse v4 takes OpenTelemetry only (events_only mode); the endpoint is LANGFUSE_HOST + /api/public/otel.
+  # Without LANGFUSE_HOST the integration would send to Langfuse Cloud: compose sets it to our container.
+  callbacks: ["langfuse_otel"]
   telemetry: false
 
 general_settings:

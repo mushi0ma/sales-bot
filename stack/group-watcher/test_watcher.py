@@ -57,6 +57,19 @@ class Logic(unittest.TestCase):
         self.assertEqual(w.decide({"confidence": 0.5}, utc(12), mode="auto", opted_out=False, last_offer_at=None,
                                   sent_today=0), ("skipped", "low_confidence"))
 
+    def test_tester_policy(self):
+        d = lambda **k: w.decide(NEED, k.pop("at", utc(12)), **{"mode": "auto", "opted_out": False,
+                                                                 "last_offer_at": None, "sent_today": 0, **k})
+        hour_ago = utc(12).timestamp() - 3600
+        self.assertEqual(d(last_offer_at=hour_ago), ("skipped", "cooldown"), "a resident: 7 days")
+        self.assertEqual(d(last_offer_at=hour_ago, tester=True), ("send", ""), "a tester: 30 minutes")
+        self.assertEqual(d(last_offer_at=utc(12).timestamp() - 600, tester=True), ("skipped", "cooldown"))
+        self.assertEqual(d(at=utc(22)), ("held", "quiet_hours"))
+        self.assertEqual(d(at=utc(22), tester=True), ("send", ""), "testers until 23:00")
+        self.assertEqual(d(at=utc(23, 30), tester=True), ("held", "quiet_hours"))
+        self.assertEqual(d(at=utc(8), tester=True), ("send", ""))
+        self.assertEqual(d(opted_out=True, tester=True), ("skipped", "optout"), "«стоп» still wins")
+
     def test_prompt_has_no_names(self):
         rows = [{"id": 1, "contact_id": 77, "text": "лифт не работает"}, {"id": 2, "contact_id": 78, "text": "у нас тоже"}]
         system, user = w.build_prompt([], rows)
@@ -89,6 +102,15 @@ class Logic(unittest.TestCase):
         self.assertEqual(w.choose_path(7, "A", 5), "A")
         self.assertEqual(w.choose_path(8, "B", 5), "B")
         self.assertEqual([w.choose_path(i, "SPLIT", 5) for i in (7, 8, 7)], ["B", "A", "B"], "stable per contact")
+        old, w.TG_INBOX_ID = w.TG_INBOX_ID, 9
+        try:
+            self.assertEqual(w.choose_path(7, "B", 5, inbox_id=9), "A", "a Telegram group: private in Telegram")
+            self.assertEqual(w.choose_path(7, "B", 5, inbox_id=4), "B")
+            self.assertEqual(w.channel_of(9), {"channel": "telegram"})
+            self.assertEqual(w.channel_of(4), {})
+        finally:
+            w.TG_INBOX_ID = old
+        self.assertEqual(w.channel_of(0), {}, "no Telegram inbox configured")
 
     def test_offer_template(self):
         n = {"service": "dispatcher", "author": "Айгерим Б.", "lang": "kk", "quote": "лифт"}
@@ -139,6 +161,84 @@ class Intake(unittest.TestCase):
         self.assertEqual(calls, [("PATCH", "/contacts/8", {"custom_attributes": {w.TESTER_ATTR: True}})])
 
 
+    def test_card_events(self):
+        """The hooks for the orchestrator: a reply to our offer (once), the seller's handoff note, an opt-out."""
+        got = []
+
+        class Fake:
+            def emit(self, type, contact_id, data=None, **kw):
+                got.append((type, contact_id, (data or {}).get("service"), kw.get("once")))
+
+        old = (w.EVENTS, w._spawn, w.cw, w.handback)
+        handed = []
+        w.EVENTS, w._spawn, w.handback = Fake(), (lambda fn, *a: None), handed.append
+        w.cw = lambda method, path, body=None: (200, {})
+        try:
+            w.x("INSERT INTO needs (message_id, conv_id, inbox_id, contact_id, service, confidence, message_at, "
+                "found_at, status, offer_conv_id) VALUES (900, 50, 2, 7, 'online_voting', 0.9, 0, 0, 'sent', 77)")
+            dm = dict(group_type="individual")
+            p = self.payload(id=120, **dm)
+            p["conversation"]["id"] = 77
+            self.assertEqual(w.intake(p), "ignored:individual:replied")
+            p = self.payload(id=121, **dm)
+            p["conversation"]["id"] = 78  # no offer of ours there
+            self.assertEqual(w.intake(p), "ignored:individual")
+            p = self.payload(id=122, private=True, message_type="outgoing", content="Председатель, Астана, 100 кв.",
+                             sender={"id": 1, "type": "agent_bot"}, **dm)
+            p["conversation"]["id"] = 77
+            p["conversation"]["meta"] = {"sender": {"id": 7, "name": "A"}}
+            self.assertEqual(w.intake(p), "lead")
+            w.opt_out(7, 77, True)
+            self.assertEqual(handed, [77], "after «стоп» in a DM the seller gets the chat back, to answer later")
+        finally:
+            w.EVENTS, w._spawn, w.cw, w.handback = old
+            w.x("DELETE FROM optout WHERE contact_id=7")
+            w.x("DELETE FROM needs WHERE message_id=900")
+        self.assertEqual(got, [("dm.replied", 7, "online_voting", "reply:77"),
+                               ("lead.handoff", 7, "online_voting", "handoff:122"),
+                               ("optout", 7, None, None)])
+
+    def test_call_command(self):
+        """/call: only a tester, not after «стоп», a known campaign, in hours, with a free line; then the endpoint."""
+        calls, notes = [], []
+        tester = {"id": 7, "phone_number": "+77000000000", "custom_attributes": {w.TESTER_ATTR: True}}
+        state = {"contact": tester, "voice": {"active": 0, "max_calls": 2, "today": 0, "daily": 40}}
+
+        def cw(method, path, body=None):
+            calls.append((method, path, body))
+            return (200, {"payload": state["contact"]}) if method == "GET" else (201, {"call_id": "x"})
+
+        old = (w.cw, w.note, w._http, w.campaigns, w.quiet_for)
+        w.cw, w.note = cw, (lambda conv, text: notes.append(text))
+        w._http = lambda method, url, body=None, headers=None, timeout=30: (200, state["voice"])
+        w.campaigns = lambda: {"votes": {"title": "сбор голосов"}}
+        w.quiet_for = lambda now, tester: False
+        dm = lambda text, **c: {"id": 500, "content": text, "conversation": {"id": 77, "group_type": "individual",
+                                                                            "meta": {"sender": {"id": 7}}, **c}}
+        try:
+            self.assertEqual(w.call_command(dm("/call votes")), "placed")
+            self.assertEqual(calls[-1], ("POST", "/conversations/77/voice_agent_call",
+                                         {"campaign": "votes", "name": "", "key": "note-500"}))
+            self.assertEqual(w.call_command(dm("/call")), "refused")
+            self.assertIn("/call votes", notes[-1], "without a campaign the note lists them")
+            self.assertEqual(w.call_command(dm("/call votes", group_type="group")), "refused:group")
+            state["contact"] = {**tester, "custom_attributes": {}}
+            self.assertEqual(w.call_command(dm("/call votes")), "refused")
+            self.assertIn("тестировщикам", notes[-1])
+            state["contact"] = {**tester, "custom_attributes": {w.TESTER_ATTR: True, w.OPTOUT_ATTR: True}}
+            self.assertEqual(w.call_command(dm("/call votes")), "refused")
+            self.assertIn("стоп", notes[-1])
+            state["contact"], state["voice"] = tester, {"active": 2, "max_calls": 2, "today": 0, "daily": 40}
+            self.assertEqual(w.call_command(dm("/call votes")), "refused")
+            self.assertIn("заняты", notes[-1])
+            w.quiet_for = lambda now, tester: True
+            state["voice"] = {"active": 0, "max_calls": 2, "today": 0, "daily": 40}
+            self.assertEqual(w.call_command(dm("/call votes")), "refused")
+            self.assertIn("не звоним", notes[-1])
+        finally:
+            w.cw, w.note, w._http, w.campaigns, w.quiet_for = old
+        self.assertEqual(sum(1 for c in calls if c[0] == "POST"), 1, "only the first one rang")
+
 class GroupAnswers(unittest.TestCase):
     def setUp(self):
         w.x("DELETE FROM faq"); w.x("DELETE FROM group_answers"); w.x("DELETE FROM messages")
@@ -165,6 +265,50 @@ class GroupAnswers(unittest.TestCase):
             w.x("INSERT INTO messages (id, conv_id, inbox_id, contact_id, author, text, created_at) VALUES (?,?,?,?,?,?,?)",
                 (r["id"], conv, 1, r["contact_id"], author, text, r["created_at"]))
         return r
+
+    def test_thread_follow_up(self):
+        """A reply to our answer continues the thread in the group; «спасибо» gets no answer; a cap per hour."""
+        seen = []
+
+        def llm(path, body):
+            seen.append(body["messages"][1]["content"])
+            last = body["messages"][1]["content"].rsplit("Жилец: ", 1)[-1]
+            reply = not last.lower().startswith("спасибо")
+            return 200, {"choices": [{"message": {"content": json.dumps(
+                {"reply": reply, "lang": "ru", "answer": "Председатель подаёт заявку, дальше всё в приложении."})}}]}
+
+        self.f.llm = llm
+        chain = [("Жилец", "Хотим переизбрать председателя, как собрать собрание?"),
+                 ("Помощник e-KNOT", "По закону нужно 10% собственников."), ("Жилец", "Как это работает?")]
+        self.assertTrue(self.f.thread(self.row(119, "Как это работает?"), chain))
+        self.assertEqual(self.posts[-1]["content_attributes"], {"in_reply_to": 119})
+        self.assertIn("Помощник e-KNOT: По закону", seen[-1], "the model sees the whole thread")
+        self.assertTrue(w.answered_in_group(119), "the need path skips a message answered in the thread")
+        self.assertFalse(self.f.thread(self.row(121, "Спасибо!"), chain[:2] + [("Жилец", "Спасибо!")]))
+        old = w.faqmod.THREAD_PER_HOUR
+        w.faqmod.THREAD_PER_HOUR = 1
+        try:
+            self.assertFalse(self.f.thread(self.row(122, "А сколько стоит?"), chain), "the hourly cap")
+        finally:
+            w.faqmod.THREAD_PER_HOUR = old
+
+    def test_reply_chain(self):
+        me = w.my_user_id
+        msgs = {"payload": [
+            {"id": 116, "message_type": 0, "sender": {"type": "contact", "id": 7}, "content": "Как собрать собрание?"},
+            {"id": 117, "message_type": 1, "sender": {"type": "user", "id": 2}, "content": "Нужно 10%.",
+             "content_attributes": {"in_reply_to": 116}},
+            {"id": 118, "message_type": 1, "private": True, "sender": {"type": "user", "id": 2}, "content": "💡 карточка"},
+            {"id": 120, "message_type": 0, "sender": {"type": "contact", "id": 8}, "content": "У нас так же",
+             "content_attributes": {"in_reply_to": 116}}]}
+        old = w.cw
+        w.cw, w.my_user_id = (lambda m, p, b=None: (200, msgs)), (lambda: 2)
+        try:
+            chain = w.reply_chain(50, 117)
+            self.assertEqual([(m["id"], m["ours"]) for m in chain], [(116, False), (117, True)])
+            self.assertFalse(w.reply_chain(50, 120)[-1]["ours"], "a reply to a neighbour is not our thread")
+        finally:
+            w.cw, w.my_user_id = old, me
 
     def test_candidates(self):
         c = lambda t: w.faqmod.is_candidate(t, ["голосов"])  # noqa: E731

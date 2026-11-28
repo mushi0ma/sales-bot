@@ -1,0 +1,233 @@
+# The platform under the agents (included by docker-compose.yml): one card per resident and the sales funnel
+# (Twenty CRM), the event bus between the roles (Hatchet), traces and evaluations of every model call (Langfuse).
+# The agents talk to them by HTTP inside the docker network; the UIs bind to the VM's loopback only:
+#   deploy/ssh.sh -- -N -L 3200:127.0.0.1:3200 -L 3300:127.0.0.1:3300 -L 8888:127.0.0.1:8888
+#   Langfuse http://localhost:3200, Twenty http://localhost:3300, Hatchet http://localhost:8888
+# Logins: ~/secrets/platform-admin.env on the VM (bootstrap.py platform). Tags are at least two weeks old.
+
+services:
+  # One Postgres for the three tools, a database and a role each (platform/pg-init.sh on the first start).
+  platform-postgres:
+    image: pgvector/pgvector:pg17@sha256:b513c48566e4777cd3370451400000c78eda6a08131d68f4c31d4a76f27bd8fd
+    command: [postgres, -c, max_connections=300]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PLATFORM_PG_PASSWORD:?}
+      LANGFUSE_DB_PASSWORD: ${LANGFUSE_DB_PASSWORD:?}
+      TWENTY_DB_PASSWORD: ${TWENTY_DB_PASSWORD:?}
+      HATCHET_DB_PASSWORD: ${HATCHET_DB_PASSWORD:?}
+    volumes:
+      - platform_postgres:/var/lib/postgresql/data
+      - ./platform/pg-init.sh:/docker-entrypoint-initdb.d/10-apps.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: 1g
+    restart: unless-stopped
+
+  # BullMQ queues of Langfuse (db 0) and Twenty (db 1): noeviction, or queued jobs vanish under memory pressure.
+  platform-redis:
+    image: redis:7-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
+    command: ["sh", "-c", "exec redis-server --appendonly yes --maxmemory-policy noeviction --requirepass \"$$REDIS_PASSWORD\""]
+    environment:
+      REDIS_PASSWORD: ${PLATFORM_REDIS_PASSWORD:?}
+    volumes:
+      - platform_redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: 256m
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- Langfuse: traces, evaluations, datasets
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.3.62.3@sha256:de3e47c64078aa196dae2349e048fc98ba81947f651f5c20e06e46baea8ae40a
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: 3g
+    restart: unless-stopped
+
+  # Langfuse's event and media blobs (S3 API). Inside the network only.
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:b9b1cce81a4a6cc9bf250e68d621cc0b9fb8ed15aefe18fcd1840525eab6a81a
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: langfuse
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:?}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: 512m
+    restart: unless-stopped
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:4.79.0@sha256:35e1ff6578a7d43458bf45c92eb46fcefa753967008d58bd98c961a09b1b3f03
+    environment: &langfuse-env
+      NEXTAUTH_URL: http://localhost:3200
+      DATABASE_URL: postgresql://langfuse:${LANGFUSE_DB_PASSWORD:?}@platform-postgres:5432/langfuse
+      SALT: ${LANGFUSE_SALT:?}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:?}
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:?}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:?}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      REDIS_HOST: platform-redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: ${PLATFORM_REDIS_PASSWORD:?}
+    depends_on: &langfuse-deps
+      platform-postgres: { condition: service_healthy }
+      platform-redis: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    mem_limit: 1g
+    restart: unless-stopped
+
+  langfuse-web:
+    image: langfuse/langfuse:4.79.0@sha256:ab20d54ee3304ffc9f73965d9dde665eed64111ae32fca96b7449fc90d246bbe
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:?}
+      AUTH_DISABLE_SIGNUP: "true"
+      # The organization, the project with its API keys and the admin, created on the first start.
+      LANGFUSE_INIT_ORG_ID: salesbot
+      LANGFUSE_INIT_ORG_NAME: sales-bot
+      LANGFUSE_INIT_PROJECT_ID: salesbot
+      LANGFUSE_INIT_PROJECT_NAME: sales-bot
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:?}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:?}
+      LANGFUSE_INIT_USER_EMAIL: ${PLATFORM_ADMIN_EMAIL:-admin@sales-bot.eknot.kz}
+      LANGFUSE_INIT_USER_NAME: admin
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_ADMIN_PASSWORD:?}
+    ports:
+      - "127.0.0.1:3200:3000"
+    depends_on: *langfuse-deps
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO /dev/null http://$$HOSTNAME:3000/api/public/health || exit 1"]  # Next binds to $HOSTNAME
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    mem_limit: 1536m
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- Twenty: resident cards and the funnel
+  twenty:
+    image: twentycrm/twenty:v2.57.1@sha256:c18a4fb9d3cb6cb12d0ed580203c0eff1bd6500d11127b4df55ec47d4a7e24ba
+    stop_grace_period: 120s
+    environment: &twenty-env
+      NODE_PORT: "3000"
+      SERVER_URL: http://localhost:3300
+      PG_DATABASE_URL: postgres://twenty:${TWENTY_DB_PASSWORD:?}@platform-postgres:5432/twenty
+      REDIS_URL: redis://default:${PLATFORM_REDIS_PASSWORD:?}@platform-redis:6379/1
+      STORAGE_TYPE: local
+      ENCRYPTION_KEY: ${TWENTY_ENCRYPTION_KEY:?}
+      APP_SECRET: ${TWENTY_APP_SECRET:?}
+      TELEMETRY_ENABLED: "false"
+      ANALYTICS_ENABLED: "false"
+      ALLOW_REQUESTS_TO_TWENTY_ICONS: "false"
+      IS_BILLING_ENABLED: "false"
+    volumes:
+      - twenty_storage:/app/packages/twenty-server/.local-storage
+    ports:
+      - "127.0.0.1:3300:3000"
+    depends_on:
+      platform-postgres: { condition: service_healthy }
+      platform-redis: { condition: service_healthy }
+    healthcheck:
+      test: curl --fail http://localhost:3000/healthz
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    mem_limit: 1536m
+    restart: unless-stopped
+
+  twenty-worker:
+    image: twentycrm/twenty:v2.57.1@sha256:c18a4fb9d3cb6cb12d0ed580203c0eff1bd6500d11127b4df55ec47d4a7e24ba
+    command: ["yarn", "worker:prod"]
+    environment:
+      <<: *twenty-env
+      DISABLE_DB_MIGRATIONS: "true"  # the server runs them
+      DISABLE_CRON_JOBS_REGISTRATION: "true"
+    volumes:
+      - twenty_storage:/app/packages/twenty-server/.local-storage
+    depends_on:
+      twenty: { condition: service_healthy }
+    mem_limit: 1g
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- Hatchet: events and durable tasks
+  # Lite: engine, API and dashboard in one container, Postgres as the queue. Workers reach gRPC at hatchet:7077.
+  hatchet:
+    image: ghcr.io/hatchet-dev/hatchet/hatchet-lite:v0.114.2@sha256:a205018e4ec2c35af4df9c86cf1e36d4b74b36ebbc849c3b33ca18815cf22d6b
+    environment:
+      DATABASE_URL: postgresql://hatchet:${HATCHET_DB_PASSWORD:?}@platform-postgres:5432/hatchet?sslmode=disable
+      SERVER_URL: http://localhost:8888
+      SERVER_AUTH_COOKIE_DOMAIN: localhost
+      SERVER_AUTH_COOKIE_INSECURE: "t"
+      SERVER_AUTH_SET_EMAIL_VERIFIED: "t"
+      SERVER_ALLOW_SIGNUP: "false"
+      SERVER_GRPC_BIND_ADDRESS: 0.0.0.0
+      SERVER_GRPC_INSECURE: "t"
+      SERVER_GRPC_PORT: "7077"
+      SERVER_GRPC_BROADCAST_ADDRESS: hatchet:7077
+      SERVER_INTERNAL_CLIENT_INTERNAL_GRPC_BROADCAST_ADDRESS: hatchet:7077
+      ADMIN_EMAIL: ${PLATFORM_ADMIN_EMAIL:-admin@sales-bot.eknot.kz}
+      ADMIN_PASSWORD: ${HATCHET_ADMIN_PASSWORD:?}
+      DEFAULT_TENANT_NAME: sales-bot
+    ports:
+      - "127.0.0.1:8888:8888"
+    volumes:
+      - hatchet_config:/config
+    depends_on:
+      platform-postgres: { condition: service_healthy }
+    mem_limit: 1g
+    restart: unless-stopped
+
+volumes:
+  platform_postgres:
+  platform_redis:
+  clickhouse_data:
+  clickhouse_logs:
+  minio_data:
+  twenty_storage:
+  hatchet_config:

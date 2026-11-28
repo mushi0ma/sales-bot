@@ -1,0 +1,41 @@
+diff --git a/app/controllers/api/v1/accounts/conversations/voice_agent_calls_controller.rb b/app/controllers/api/v1/accounts/conversations/voice_agent_calls_controller.rb
+new file mode 100644
+index 0000000..d7e9747
+--- /dev/null
++++ b/app/controllers/api/v1/accounts/conversations/voice_agent_calls_controller.rb
+@@ -0,0 +1,23 @@
++# salesbot: the voice agent rings the conversation's contact (an outbound call with a media stream, as
++# stack/voice/dial.sh does from a shell). Who may be called and when is the caller's policy (group-watcher's
++# `/call` note command); this only places the call. Params: campaign (required), name, key (idempotency).
++class Api::V1::Accounts::Conversations::VoiceAgentCallsController < Api::V1::Accounts::Conversations::BaseController
++  def create
++    base = ENV.fetch('WHATSAPP_VOICE_AGENT_URL', '')
++    campaign = params[:campaign].to_s
++    phone = @conversation.contact&.phone_number.to_s.delete('^0-9')
++    service = @conversation.inbox.channel.try(:provider_service)
++    return render(json: { error: 'no voice agent' }, status: :unprocessable_entity) if base.blank?
++    return render(json: { error: 'campaign required' }, status: :unprocessable_entity) unless campaign.match?(/\A[a-z0-9_-]{1,40}\z/)
++    return render(json: { error: 'contact has no phone' }, status: :unprocessable_entity) unless phone.length.between?(10, 15)
++    return render(json: { error: 'inbox cannot place calls' }, status: :unprocessable_entity) unless service.respond_to?(:start_call_with_stream)
++
++    query = { campaign: campaign, name: params[:name].to_s[0, 60].presence }.compact.to_query
++    key = params[:key].presence || "#{@conversation.id}-#{SecureRandom.hex(8)}"
++    result = service.start_call_with_stream(phone, "#{base}?#{query}", key)
++    render json: { call_id: result.is_a?(Hash) ? result['call_id'] : nil }, status: :created
++  rescue StandardError => e
++    Rails.logger.warn("[voice agent] call for conversation #{@conversation&.display_id} failed: #{e.class}: #{e.message}")
++    render json: { error: "#{e.class}: #{e.message.to_s[0, 200]}" }, status: :bad_gateway
++  end
++end
+diff --git a/config/routes.rb b/config/routes.rb
+index 2f6bda5..48f5433 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -213,6 +213,7 @@ Rails.application.routes.draw do
+               resource :contact_info_request, only: [:show, :create]
+               resources :assignments, only: [:create]
+               resources :labels, only: [:create, :index]
++              resource :voice_agent_call, only: [:create] # salesbot: stack/patches/chatwoot-voice-agent-dial.patch
+               resource :participants, only: [:show, :create, :update, :destroy]
+               resource :direct_uploads, only: [:create]
+               resource :draft_messages, only: [:show, :update, :destroy]

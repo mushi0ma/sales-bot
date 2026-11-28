@@ -43,6 +43,8 @@ PROJECT = E("GCP_PROJECT", "")
 LOCATION = E("VOICE_LOCATION", "eu")
 MODEL = E("VOICE_MODEL", "google/gemini-3.8-live")
 VOICE = E("VOICE_NAME", "Kore")
+# Below the default 1.0: at full temperature the native-audio model drifts mid-call (another timbre, an Indonesian word).
+TEMPERATURE = float(E("VOICE_TEMPERATURE", "0.6"))
 MAX_CALLS = int(E("MAX_CALLS", "2"))
 MAX_CALL_SECS = int(E("MAX_CALL_SECS", "600"))
 DAILY_CALLS = int(E("DAILY_CALLS", "40"))
@@ -52,6 +54,12 @@ CW_URL = E("CW_URL", "http://cw-rails:3000").rstrip("/")
 CW_ACCOUNT_ID = E("CW_ACCOUNT_ID", "1")
 CW_TOKEN = E("CW_API_TOKEN", "")
 CW_INBOX_ID = int(E("CW_INBOX_ID", "2"))  # the WhatsApp inbox the test number lives in
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # outbox.py is mounted next to bot.py
+try:
+    from outbox import Outbox  # stack/events/outbox.py: call.ended to the orchestrator (the card in Twenty)
+    EVENTS = Outbox(str(Path(E("DB_PATH", "/data/voice.db")).with_name("outbox.db")), "voice").start()
+except ImportError:
+    EVENTS = None
 CATALOG = json.loads(Path(E("CATALOG_PATH", "/app/services.json")).read_text(encoding="utf-8"))
 SERVICES = {s["id"]: s for s in CATALOG["services"]}
 KB_DIR = Path(E("KB_DIR", "/app/kb"))
@@ -62,6 +70,25 @@ CAMPAIGNS = {k: v for k, v in (json.loads(_cp.read_text(encoding="utf-8")) if _c
 # Pipecat logs the system prompt, tool arguments and transcripts at DEBUG; the transcript lives in voice.db only.
 logger.remove()
 logger.add(sys.stderr, level=E("PIPECAT_LOG_LEVEL", "INFO"))
+
+
+def setup_tracing():
+    """Every call as one trace in the self-hosted Langfuse (OTLP/HTTP): Pipecat's conversation > turn > Gemini Live
+    spans with setup, tool calls and results. Off without the Langfuse keys or the OpenTelemetry packages."""
+    pk, sk, host = E("LANGFUSE_PUBLIC_KEY", ""), E("LANGFUSE_SECRET_KEY", ""), E("LANGFUSE_HOST", "").rstrip("/")
+    if not (pk and sk and host):
+        return False
+    try:
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from pipecat.utils.tracing.setup import setup_tracing as pipecat_tracing
+    except ImportError:
+        return False
+    auth = base64.b64encode(f"{pk}:{sk}".encode()).decode()
+    return pipecat_tracing("voice", exporter=OTLPSpanExporter(endpoint=f"{host}/api/public/otel/v1/traces",
+                                                              headers={"Authorization": f"Basic {auth}"}))
+
+
+TRACING = setup_tracing()
 log = logging.getLogger("voice")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 db = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
@@ -157,6 +184,42 @@ class BrowserSerializer(FrameSerializer):
 
 # ---------------------------------------------------------------- the call in Chatwoot
 
+# How a call ends, decided in code: the model forgets end_call or keeps the line open after "ок, до свидания".
+# A request to end ("стоп" as a short turn, "положите трубку", "не звоните") hangs up at once; after the agent's
+# goodbye, a closing reply ("ок", "спасибо", "до свидания") hangs up at once and only a real turn keeps the call.
+HANGUP = re.compile(r"(повес\w*|полож\w*|клад\w*|брос\w*)\s+трубк|не\s+звони|больше\s+не\s+звон|отключ(ись|итесь)"
+                    r"|заканчива(й|йте)\b|заверш(ай|айте|ите)\s+(звонок|разговор)|отбой", re.I)
+SHORT_STOP = re.compile(r"^\W*(стоп|хватит|всё|все|достаточно|не надо|не нужно)(\W+(стоп|хватит|спасибо|всё|все))*\W*$",
+                        re.I)
+NO_MORE_CALLS = re.compile(r"не\s+звони|больше\s+не\s+звон|^\W*стоп\W*$", re.I)
+FAREWELL = re.compile(r"(всего\s+(доброго|хорошего)|до\s+свидания|хорошего\s+(вам\s+)?(дня|вечера)|до\s+связи"
+                      r"|сау\s+болыңыз)[\s.!)]*$", re.I)
+BYE_WORDS = re.compile(r"свидани|\bпока\b|всего\s+(доброго|хорошего)|до\s+связи|хорошего\s+(дня|вечера)|сау\s+бол", re.I)
+ACK = {"ок", "окей", "о'кей", "ok", "okay", "хорошо", "ладно", "спасибо", "благодарю", "ага", "угу", "да", "нет",
+       "понятно", "понял", "поняла", "давайте", "взаимно", "и", "вам", "тоже", "ну", "всё", "все", "так", "рахмет",
+       "жақсы", "иә"}
+
+
+def is_closing(text):
+    """A reply after the goodbye that ends the call: a farewell anywhere, or only acknowledgements."""
+    words = re.findall(r"[\w']+", (text or "").lower().replace("’", "'"))
+    return bool(BYE_WORDS.search(text or "")) or (bool(words) and all(w in ACK for w in words))
+
+
+# Gemini Live now and then writes the tool call as text instead of calling it: "<metadata>{command: "end_call"}</metadata>".
+TEXT_CALL = re.compile(r"<metadata>.*?</metadata>|\{\s*command\s*:[^}]*\}", re.S | re.I)
+
+
+def spoken(text):
+    """(what was said, whether the text carried an end_call)."""
+    text = text or ""
+    return TEXT_CALL.sub("", text).strip(), bool(re.search(r"end_call", text))
+
+
+def wants_hangup(text):
+    return bool(HANGUP.search(text or "") or SHORT_STOP.match(text or ""))
+
+
 RESULTS = {"voted": "уже проголосовал", "will_vote": "проголосует", "send_link": "прислать ссылку",
            "will_pay": "оплатит", "paid": "говорит, что оплатил", "dispute": "не согласен с суммой, нужна сверка",
            "refused": "отказ", "callback": "перезвонить", "not_owner": "не собственник",
@@ -175,7 +238,8 @@ def cw(method, path, body=None):
 
 
 def conversation_for(phone):
-    """The person's WhatsApp conversation id: their latest one in CW_INBOX_ID, else a new one; a new contact too."""
+    """(conversation id, contact) of the person in CW_INBOX_ID: their latest conversation, else a new one; a new
+    contact too."""
     st, b = cw("GET", f"/contacts/search?q={phone}")
     contact = next((c for c in (b or {}).get("payload", []) if re.sub(r"\D", "", c.get("phone_number") or "") == phone),
                    None)
@@ -187,14 +251,14 @@ def conversation_for(phone):
     st, b = cw("GET", f"/contacts/{contact['id']}/conversations")
     convs = [c for c in (b or {}).get("payload", []) if c.get("inbox_id") == CW_INBOX_ID]
     if convs:
-        return max(convs, key=lambda c: c.get("last_activity_at") or 0)["id"]
+        return max(convs, key=lambda c: c.get("last_activity_at") or 0)["id"], contact
     st, b = cw("GET", f"/contacts/{contact['id']}/contactable_inboxes")
     src = next((e.get("source_id") for e in (b or {}).get("payload", []) if (e.get("inbox") or {}).get("id") == CW_INBOX_ID),
                None)
     st, c = cw("POST", "/conversations", {"inbox_id": CW_INBOX_ID, "contact_id": contact["id"], "source_id": src})
     if st >= 300 or not (c or {}).get("id"):
         raise RuntimeError(f"create conversation HTTP {st}")
-    return c["id"]
+    return c["id"], contact
 
 
 def call_note(call_id):
@@ -224,15 +288,52 @@ def to_chatwoot(call_id, peer):
     if not CW_TOKEN or not (10 <= len(phone) <= 15):
         return
     try:
-        conv = conversation_for(phone)
+        conv, contact = conversation_for(phone)
         note, lead = call_note(call_id)
         st, _ = cw("POST", f"/conversations/{conv}/messages", {"content": note, "private": True})
         _, b = cw("GET", f"/conversations/{conv}/labels")
         labels = sorted(set((b or {}).get("payload", [])) | {"call"} | ({"lead"} if lead else set()))
         st2, _ = cw("POST", f"/conversations/{conv}/labels", {"labels": labels})
         log.info("call=%s note in conversation=%s HTTP %s, labels HTTP %s", call_id, conv, st, st2)
+        call_event(call_id, conv, contact, phone)
     except Exception as e:  # the call is in voice.db either way
         log.warning("call=%s chatwoot note failed: %s", call_id, str(e)[:160])
+
+
+LEAD_SERVICE = [("online_voting", ("голосован", "опрос")), ("online_meetings", ("собрани", "zoom")),
+                ("convening_assembly", ("созыв",)), ("debt_collection", ("долг", "должник")),
+                ("dispatcher", ("диспетчер", "заявк")), ("accounting", ("бухгалтер",)),
+                ("payments", ("платеж", "платёж", "оплат")), ("legal_auditor", ("аудитор", "юрист", "закон"))]
+
+
+def call_event(call_id, conv, contact, phone):
+    """call.ended to the orchestrator: the resident's card in Twenty (outcome, lead, transcript on the timeline)."""
+    if EVENTS is None:
+        return
+    door, campaign, started, ended, transcript = db.execute(
+        "SELECT door, campaign, started_at, ended_at, transcript FROM calls WHERE id=?", (call_id,)).fetchone()
+    turns = json.loads(transcript)
+    o = db.execute("SELECT result, note, callback FROM outcomes WHERE call_id=? ORDER BY id DESC LIMIT 1",
+                   (call_id,)).fetchone()
+    lead = db.execute("SELECT data FROM leads WHERE call_id=? ORDER BY id DESC LIMIT 1", (call_id,)).fetchone()
+    lead = json.loads(lead[0]) if lead else None
+    c = CAMPAIGNS.get(campaign) or {}
+    data = {"direction": "out" if door == "wa-out" else "in", "campaign": campaign, "campaign_title": c.get("title"),
+            "secs": int((ended or started) - started), "answered": bool(turns), "cw_conversation_id": conv,
+            "call_id": call_id, "outcome": o[0] if o else ("no_answer" if not turns else None),
+            "outcome_label": RESULTS.get(o[0], o[0]) if o else ("не дозвонились" if not turns else None),
+            "note": o[1] if o else None, "callback": o[2] if o else None, "lead": lead,
+            "transcript": "\n".join(("Помощник: " if t["who"] == "bot" else "Собеседник: ") + t["text"]
+                                     for t in turns)[:6000] or None}
+    if lead:  # which e-KNOT service the lead is about, so the card of that service moves (funnel: same service)
+        want = " ".join(str(lead.get(k) or "") for k in ("wants", "service")).lower()
+        data["service"] = next((sid for sid, words in LEAD_SERVICE if any(w in want for w in words)), None)
+    if lead and lead.get("role"):
+        role = lead["role"].lower()
+        data["role"] = ("CHAIRMAN" if "председ" in role else "UK" if "управля" in role or role == "ук"
+                        else "COUNCIL" if "совет" in role else "OWNER" if "собствен" in role else None)
+    EVENTS.emit("call.ended", contact.get("id"), data, name=contact.get("name"), phone=phone,
+                house=(lead or {}).get("house") or c.get("house"), once=f"call:{call_id}", at=started)
 
 
 # ---------------------------------------------------------------- one call
@@ -275,15 +376,38 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
         log.info("call=%s outcome %s", call_id, a.get("result"))
         await params.result_callback({"saved": True})
 
-    async def end_call(params: FunctionCallParams):
-        asked = time.time()
-        await params.result_callback({"ok": True})
-        await asyncio.sleep(5)  # let the goodbye play out
-        # The person said something after the goodbye ("подождите", "вы куда?"): the conversation goes on.
-        if any(x["who"] == "user" and x["t"] > asked for x in transcript):
-            log.info("call=%s end_call skipped: the person spoke after the goodbye", call_id)
+    ending = {"goodbye_at": None, "done": False}
+
+    async def hang_up(why, now=False):
+        """now: the line closes at once, cutting whatever the model is still saying (CancelFrame also sends the
+        hangup). Otherwise what is already said plays out first (EndFrame goes behind the audio)."""
+        if not ending["done"]:
+            ending["done"] = True
+            log.info("call=%s hang up%s: %s", call_id, " now" if now else "", why)
+            if now:
+                await task.cancel(reason=why)
+            else:
+                await task.queue_frame(EndFrame())
+
+    async def after_goodbye(at):
+        """The goodbye plays out, then the line closes, unless the person came back with a real turn."""
+        await asyncio.sleep(5)
+        if ending["goodbye_at"] != at or ending["done"]:
             return
-        await task.queue_frame(EndFrame())
+        if any(x["who"] == "user" and x["t"] > at and not is_closing(x["text"]) for x in transcript):
+            log.info("call=%s goodbye withdrawn: the person went on", call_id)
+            ending["goodbye_at"] = None
+            return
+        await hang_up("after the goodbye")
+
+    def goodbye():
+        if ending["goodbye_at"] is None:
+            ending["goodbye_at"] = time.time()
+            asyncio.create_task(after_goodbye(ending["goodbye_at"]))
+
+    async def end_call(params: FunctionCallParams):
+        await params.result_callback({"ok": True})
+        goodbye()
 
     service_tool = FunctionSchema(
         "service_info", "Подробности об услуге e-KNOT со страницы сайта: что входит, тарифы, FAQ.",
@@ -301,18 +425,20 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
     else:
         tools = ToolsSchema(standard_tools=[
             service_tool,
-            FunctionSchema("save_lead", "Записать заявку для менеджера e-KNOT, когда председатель или УК заинтересованы.",
+            FunctionSchema("save_lead", "Записать заявку для менеджера e-KNOT, когда председатель или УК заинтересованы. "
+                                        "Человек исправил данные: вызвать ещё раз, менеджер увидит последнюю.",
                            {"service": {"type": "string"}, "role": {"type": "string", "description": "председатель, УК, "
                                                                     "член совета, жилец"},
-                            "house": {"type": "string", "description": "город и дом или ЖК"},
+                            "house": {"type": "string", "description": "город, улица и дом или ЖК"},
                             "apartments": {"type": "string"}, "wants": {"type": "string"},
-                            "name": {"type": "string", "description": "как представился, если представился"}},
+                            "name": {"type": "string", "description": "имя собеседника"}},
                            ["service", "role", "wants"], save_lead),
             end_tool])
     llm = GeminiLiveVertexLLMService(
         project_id=PROJECT, location=LOCATION,
         system_instruction=prompt_outbound(campaign, name) if campaign else prompt(), tools=tools,
-        settings=GeminiLiveVertexLLMService.Settings(model=MODEL, voice=VOICE, language="ru-RU"))
+        settings=GeminiLiveVertexLLMService.Settings(model=MODEL, voice=VOICE, language="ru-RU",
+                                                     temperature=TEMPERATURE))
     context = LLMContext([{"role": "user", "content": "(человек взял трубку)" if campaign else "(звонок принят)"}],
                          tools)
     agg = LLMContextAggregatorPair(context)
@@ -321,11 +447,15 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
         session_timeout=MAX_CALL_SECS))
     task = PipelineTask(Pipeline([transport.input(), agg.user(), llm, transport.output(), agg.assistant()]),
                         params=PipelineParams(audio_in_sample_rate=16000, audio_out_sample_rate=out_rate),
-                        idle_timeout_secs=120)
+                        idle_timeout_secs=120, enable_tracing=TRACING, conversation_id=f"call-{call_id}",
+                        additional_span_attributes={"langfuse.session.id": f"call-{call_id}",
+                                                    "langfuse.trace.name": f"call {door}"
+                                                                           + (f" {campaign}" if campaign else ""),
+                                                    "langfuse.trace.tags": ["voice", door]})
 
     async def said(who, text):
-        text = re.sub(r"<no speech>|\{pause\}", "", text or "").strip()  # Gemini Live's markers, not speech
-        if not text:
+        text = re.sub(r"<no speech>|\{pause\}", "", spoken(text)[0]).strip()  # Gemini Live's markers, not speech
+        if not re.search(r"\w", text):  # "...", "-": a pause, not speech
             return
         transcript.append({"who": who, "text": text, "t": round(time.time(), 1)})
         if door == "browser":
@@ -334,11 +464,29 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
 
     @agg.user().event_handler("on_user_turn_message_added")
     async def _user(_, message):
-        await said("user", message.content)
+        text = message.content or ""
+        await said("user", text)
+        if wants_hangup(text):
+            if campaign and NO_MORE_CALLS.search(text) and not db.execute(
+                    "SELECT 1 FROM outcomes WHERE call_id=?", (call_id,)).fetchone():
+                db.execute("INSERT INTO outcomes (call_id, peer, campaign, result, note, callback, at) "
+                           "VALUES (?,?,?,?,?,?,?)", (call_id, serializer.peer, campaign, "refused",
+                                                      "попросил закончить звонок", None, time.time()))
+            await hang_up("the person asked to end the call", now=True)
+        elif ending["goodbye_at"] and is_closing(text):
+            await hang_up("the person answered the goodbye", now=True)  # no second goodbye
 
     @agg.assistant().event_handler("on_assistant_turn_stopped")
     async def _bot(_, message):
-        await said("bot", message.content)
+        text, called = spoken(message.content)
+        await said("bot", text)
+        if not (FAREWELL.search(text[-80:]) or called):
+            return
+        last = next((x for x in reversed(transcript) if x["who"] == "user"), None)
+        if last and BYE_WORDS.search(last["text"]) and "?" not in last["text"]:
+            await hang_up("the person said goodbye first")  # the farewell plays out, then the line closes
+        else:
+            goodbye()  # also when the model said goodbye and forgot end_call
 
     @transport.event_handler("on_client_connected")
     async def _connected(_, __):
@@ -373,7 +521,7 @@ async def run_call(ws: WebSocket, door: str, serializer, out_rate: int, campaign
             asyncio.get_running_loop().run_in_executor(None, to_chatwoot, call_id, serializer.peer)
 
 
-app = FastAPI()
+app = FastAPI(telemetry={"tracing": False})  # FastAPI 0.165 traces every request (healthz too): only calls go to Langfuse
 
 
 @app.get("/")

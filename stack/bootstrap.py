@@ -10,9 +10,10 @@ Steps (idempotent where possible; secrets go to ~/secrets/*.env with mode 600 an
   stt        local speech-to-text (whisper in the VM) for voice notes: vault entry + agent stt settings
   operator   Chatwoot: macro «🤖 Вернуть боту» + contact attribute «Тестировщик бота»
   testers    testers <contact_id>...: tick «Тестировщик бота» (the bot answers only them)
-  tg-userbot API inbox «Telegram (userbot)» for the tg-userbot service (a real account, plan v2 spike S2):
-             writes CW_TGU_* (inbox identifier, webhook secret, account id, operator token) to stack/.env,
-             binds the agent; operator user «Оператор (телефон Telegram)» = owner's phone messages
+  tg-userbot API inbox «Telegram (userbot)» for the tg-userbot service (a real account, the Telegram channel):
+             writes CW_TGU_* (inbox identifier and id, webhook secret, account id, operator token) to stack/.env,
+             binds the seller (private chats), reruns 'group-watcher' (its user joins the inbox: Telegram groups);
+             operator user «Оператор (телефон Telegram)» = groups into Chatwoot and the owner's phone messages
   tg-outreach TG_USER_ID TEXT   first message from Chatwoot to a member of an allowed group (via tg-userbot),
              then the hand-back macro: the agent answers the resident's reply
   return-to-bot CONV_ID   apply the hand-back macro to a Chatwoot conversation
@@ -777,7 +778,8 @@ def step_seller():
         "split": {"enabled": True, "maxChars": 280, "typingWpm": 200, "minDelayMs": 800, "maxDelayMs": 3500,
                   "maxChunks": 4},
         # group-watcher writes the offer of this conversation here (watcher.py OFFER_ATTR); shown in the prompt.
-        "attributeContext": {"conversation": ["salesbot_offer"], "contact": [], "task": []},
+        # salesbot_optout: the person wrote «стоп»; the seller still answers when they write first (prompt rule 8).
+        "attributeContext": {"conversation": ["salesbot_offer"], "contact": ["salesbot_optout"], "task": []},
         "guardrails": {"enabled": True, "input": {"enabled": False}, "output": {"enabled": False}, "onFailure": "pass",
                        "factualGrounding": {"enabled": True, "action": "revise", "contextMessages": 6,
                                             "sourceTools": ["search_knowledge"], "provider": LLM_PROVIDER,
@@ -963,9 +965,13 @@ def step_tg_userbot():
     op = json.loads(m.group(1))
     print(f"  chatwoot: operator user {op['user_id']} ({TGU_OPERATOR_EMAIL}), agent of inbox {inbox['id']} only")
     set_stack_env({"CW_TGU_INBOX_IDENTIFIER": full["inbox_identifier"], "CW_TGU_WEBHOOK_SECRET": full["secret"],
-                   "CW_TGU_ACCOUNT_ID": cw["CW_ACCOUNT_ID"], "CW_TGU_OPERATOR_TOKEN": op["token"]})
-    bind_cw_inbox(inbox["id"])
-    print("  next: docker compose --profile tg-userbot up -d --build tg-userbot (login once first, see SETUP.md)")
+                   "CW_TGU_ACCOUNT_ID": cw["CW_ACCOUNT_ID"], "CW_TGU_OPERATOR_TOKEN": op["token"],
+                   "CW_TGU_INBOX_ID": str(inbox["id"])})
+    # Private chats go to the seller, as WhatsApp's; group-watcher joins the inbox to read and answer its groups.
+    bind_cw_inbox(inbox["id"], SELLER_NAME)
+    step_group_watcher()
+    print("  next: docker compose up -d group-watcher && docker compose --profile tg-userbot up -d --build "
+          "tg-userbot (login once first, see SETUP.md)")
 
 
 def step_tg_outreach(tg_user_id, text):
